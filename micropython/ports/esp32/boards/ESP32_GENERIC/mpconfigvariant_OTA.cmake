@@ -1,0 +1,7 @@
+list(APPEND SDKCONFIG_DEFAULTS
+    boards/ESP32_GENERIC/sdkconfig.ota
+)
+
+list(APPEND MICROPY_DEF_BOARD
+    MICROPY_HW_BOARD_NAME="Generic ESP32 module with OTA"
+)

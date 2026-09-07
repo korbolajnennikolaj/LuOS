@@ -1,0 +1,15 @@
+0
+1
+raised ValueError()
+ret was: None
+raised OSError()
+raised <class 'ValueError'> generator already executing
+raised <class 'ValueError'> generator already executing
+0
+ignore CancelledError
+1
+raised CancelledError()
+None
+CancelledError()
+CancelledError()
+1

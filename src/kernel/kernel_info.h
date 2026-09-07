@@ -1,0 +1,3 @@
+#define KERNEL_VERSION "0.9.0"
+#define KERNEL_COMPILATION_DATE __DATE__ " " __TIME__
+#define KERNEL_COMPILER "GCC " __VERSION__

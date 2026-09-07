@@ -1,0 +1,10 @@
+set(PICO_BOARD "pimoroni_picolipo_16mb")
+
+# Override the MicroPython board name
+list(APPEND MICROPY_DEF_BOARD
+    MICROPY_HW_BOARD_NAME="Pimoroni Pico LiPo 16MB"
+)
+
+if(NOT DEFINED MICROPY_HW_FLASH_STORAGE_BYTES)
+    set(MICROPY_HW_FLASH_STORAGE_BYTES 15728640)  # PICO_FLASH_SIZE_BYTES - (1 * 1024 * 1024) = 16MB - 1MB
+endif()

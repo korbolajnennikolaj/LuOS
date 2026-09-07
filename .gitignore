@@ -1,0 +1,9 @@
+build/
+kernel.bin
+*.iso
+isodir_limine/
+disk.img
+nvme_disk.img
+*.log
+*.bxrc
+.vscode/

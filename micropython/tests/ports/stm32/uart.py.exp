@@ -1,0 +1,18 @@
+ValueError -1
+ValueError 0
+ValueError 100
+ValueError doesnotexist
+UART(, baudrate=9600, bits=8, parity=None, stop=1, flow=0, timeout=0, timeout_char=3, rxbuf=64)
+UART(, baudrate=2400, bits=8, parity=None, stop=1, flow=0, timeout=0, timeout_char=7, rxbuf=64)
+0
+3
+4
+None
+1
+4
+None
+None
+UART(, baudrate=9600, bits=8, parity=None, stop=1, flow=0, timeout=0, timeout_char=3, rxbuf=8)
+UART(, baudrate=9600, bits=8, parity=None, stop=1, flow=0, timeout=0, timeout_char=3, rxbuf=0)
+UART(, baudrate=9600, bits=8, parity=None, stop=1, flow=0, timeout=0, timeout_char=3, rxbuf=4)
+UART(, baudrate=9600, bits=8, parity=None, stop=1, flow=0, timeout=0, timeout_char=3, rxbuf=0)
