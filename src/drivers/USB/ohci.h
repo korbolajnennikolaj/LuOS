@@ -1,6 +1,7 @@
 #ifndef OHCI_H
 #define OHCI_H
 
+#include "kernel/sched/spinlock.h"
 #include "usb_controller.h"
 
 #include <stdint.h>
@@ -51,6 +52,7 @@ typedef struct ohci_controller {
     uint32_t next_td_index;
 
     uint8_t is_low_speed;
+    spinlock_t lock;
 } ohci_controller;
 
 typedef struct ohci_driver {

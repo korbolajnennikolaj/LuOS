@@ -5,6 +5,7 @@
 #include "block_device.h"
 #include "components/drivers.h"
 #include "components/pci.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -121,6 +122,7 @@ typedef struct {
     bool present;
     uint64_t sector_count;
     uint32_t sector_size;
+    spinlock_t lock;
 } ahci_port_t;
 
 typedef struct ahci_driver {

@@ -112,14 +112,16 @@ static struct ps2_keyboard_state kbd_state = {0};
 static uint8_t dma_led_buffer __attribute__((aligned(64)));
 
 bool usb_kbd_has_key(void) {
-    return buffer_head != buffer_tail;
+    return buffer_tail != __atomic_load_n(&buffer_head, __ATOMIC_ACQUIRE);
 }
 
 uint8_t usb_kbd_get_key(void) {
-    if (buffer_head == buffer_tail) return 0;
-    uint8_t sc = key_buffer[buffer_tail];
-    last_dequeued_mods = mod_buffer[buffer_tail];
-    buffer_tail = (buffer_tail + 1) % USB_KBD_BUFFER_SIZE;
+    uint16_t tail = buffer_tail;
+    uint16_t head = __atomic_load_n(&buffer_head, __ATOMIC_ACQUIRE);
+    if (tail == head) return 0;
+    uint8_t sc = key_buffer[tail];
+    last_dequeued_mods = mod_buffer[tail];
+    __atomic_store_n(&buffer_tail, (tail + 1) % USB_KBD_BUFFER_SIZE, __ATOMIC_RELEASE);
     return sc;
 }
 
@@ -131,13 +133,15 @@ bool usb_kbd_is_key_pressed(uint8_t sc) {
 }
 
 bool usb_kbd_has_extended_key(void) {
-    return ext_tail != ext_head;
+    return ext_tail != __atomic_load_n(&ext_head, __ATOMIC_ACQUIRE);
 }
 
 uint16_t usb_kbd_get_extended_key(void) {
-    if (ext_tail == ext_head) return 0;
-    uint16_t key = ext_buffer[ext_tail];
-    ext_tail = (ext_tail + 1) % USB_KBD_EXT_SIZE;
+    uint8_t tail = ext_tail;
+    uint8_t head = __atomic_load_n(&ext_head, __ATOMIC_ACQUIRE);
+    if (tail == head) return 0;
+    uint16_t key = ext_buffer[tail];
+    __atomic_store_n(&ext_tail, (tail + 1) % USB_KBD_EXT_SIZE, __ATOMIC_RELEASE);
     return key;
 }
 
@@ -169,10 +173,11 @@ static bool push_extended_if_special(uint8_t hid) {
     for (int i = 0; hid_to_ext[i].hid != 0; i++) {
         if (hid_to_ext[i].hid != hid) continue;
         if (hid_to_ext[i].ext == 0) return true;
-        uint8_t next = (ext_head + 1) % USB_KBD_EXT_SIZE;
-        if (next != ext_tail) {
-            ext_buffer[ext_head] = PS2_EXTKEY(hid_to_ext[i].ext);
-            ext_head = next;
+        uint8_t head = ext_head;
+        uint8_t next = (head + 1) % USB_KBD_EXT_SIZE;
+        if (next != __atomic_load_n(&ext_tail, __ATOMIC_ACQUIRE)) {
+            ext_buffer[head] = PS2_EXTKEY(hid_to_ext[i].ext);
+            __atomic_store_n(&ext_head, next, __ATOMIC_RELEASE);
         }
         return true;
     }
@@ -235,11 +240,12 @@ static void process_report(struct usb_keyboard_instance *kbd, const uint8_t *rep
 
         if (push_extended_if_special(key)) continue;
 
-        uint16_t next = (buffer_head + 1) % USB_KBD_BUFFER_SIZE;
-        if (next != buffer_tail) {
-            key_buffer[buffer_head] = key;
-            mod_buffer[buffer_head] = m;
-            buffer_head = next;
+        uint16_t head = buffer_head;
+        uint16_t next = (head + 1) % USB_KBD_BUFFER_SIZE;
+        if (next != __atomic_load_n(&buffer_tail, __ATOMIC_ACQUIRE)) {
+            key_buffer[head] = key;
+            mod_buffer[head] = m;
+            __atomic_store_n(&buffer_head, next, __ATOMIC_RELEASE);
         }
     }
 

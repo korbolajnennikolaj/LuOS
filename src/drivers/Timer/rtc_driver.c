@@ -1,10 +1,13 @@
 #include "rtc_driver.h"
 
 #include "drivers/Timer/timer.h"
+#include "kernel/sched/spinlock.h"
 #include <kernel/limine.h>
 
 #include <ports.h>
 #include <stddef.h>
+
+static spinlock_t rtc_lock = SPINLOCK_INIT;
 
 #define CMOS_ADDRESS 0x70
 #define CMOS_DATA 0x71
@@ -76,11 +79,13 @@ static int read_and_validate_rtc(struct system_time *time) {
 }
 
 static void init_rtc_once(void) {
-    if (rtc_initialized) return;
+    spin_lock(&rtc_lock);
+    if (rtc_initialized) { spin_unlock(&rtc_lock); return; }
 
     for (int i = 0; i < 5; i++) {
         if (read_and_validate_rtc(&cached_time)) {
             rtc_initialized = 1;
+            spin_unlock(&rtc_lock);
             return;
         }
         for (int j = 0; j < 100000; j++) asm volatile("pause");
@@ -106,6 +111,7 @@ static void init_rtc_once(void) {
     }
 
     rtc_initialized = 1;
+    spin_unlock(&rtc_lock);
 }
 
 struct system_time* get_rtc_time(void) {
@@ -113,11 +119,14 @@ struct system_time* get_rtc_time(void) {
 
     init_rtc_once();
 
+    spin_lock(&rtc_lock);
     if (read_and_validate_rtc(&current_time)) {
         cached_time = current_time;
+        spin_unlock(&rtc_lock);
         return &current_time;
     }
 
+    spin_unlock(&rtc_lock);
     return &cached_time;
 }
 

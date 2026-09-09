@@ -1,6 +1,7 @@
 #include "drivers/Storage/partition.h"
 
 #include "components/Memory/heap.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -239,6 +240,7 @@ typedef struct partition_device {
 static partition_device_t g_partition_storage[MAX_BLOCK_DEVICES];
 static struct block_device g_partition_blkdevs[MAX_BLOCK_DEVICES];
 static int g_partition_count = 0;
+static spinlock_t partition_lock = SPINLOCK_INIT;
 
 static int part_read_sectors(struct block_device *self, uint64_t lba, uint32_t count, void *buf) {
     partition_device_t *p = (partition_device_t *)self->priv;
@@ -267,6 +269,7 @@ int partition_unregister_all(struct block_device *disk) {
     if (!disk) return 0;
 
     int removed = 0;
+    spin_lock(&partition_lock);
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
         if (g_partition_storage[i].parent != disk) continue;
 
@@ -278,15 +281,19 @@ int partition_unregister_all(struct block_device *disk) {
         if (g_partition_count > 0) g_partition_count--;
         removed++;
     }
+    spin_unlock(&partition_lock);
     return removed;
 }
 
 int partition_register_all(struct block_device *disk) {
     if (!disk) return 0;
 
+    spin_lock(&partition_lock);
+
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
         if (g_partition_storage[i].parent == disk) {
             PLOG("partitions for '%s' already registered\n", disk->name);
+            spin_unlock(&partition_lock);
             return 0;
         }
     }
@@ -295,6 +302,7 @@ int partition_register_all(struct block_device *disk) {
     int n = 0;
     if (partition_scan(disk, infos, PART_MAX_PER_DISK, &n) != 0 || n == 0) {
         PLOG("no partition table found on '%s' — use the disk directly\n", disk->name);
+        spin_unlock(&partition_lock);
         return 0;
     }
 
@@ -329,5 +337,6 @@ int partition_register_all(struct block_device *disk) {
              infos[i].is_gpt ? "GPT" : "MBR");
     }
 
+    spin_unlock(&partition_lock);
     return registered;
 }

@@ -19,6 +19,7 @@ typedef struct idt_ptr {
 } __attribute__((packed)) idt_ptr;
 
 void init_idt(void);
+void load_idt(void);
 
 void idt_set_gate(uint8_t vector, void *handler, uint8_t type_attr);
 

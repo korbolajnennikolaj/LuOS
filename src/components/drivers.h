@@ -2,6 +2,7 @@
 #define DRIVERS_H
 
 #include "components/pci.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdint.h>
 
@@ -57,6 +58,7 @@ typedef struct driver {
 
 extern struct driver* driver_table[AMOUNT_DRIVERS_TYPE][MAX_DRIVERS_PER_TYPE];
 extern void* device_table[AMOUNT_DEVICES_TYPE][MAX(MAX_DEVICES_PER_TYPE, MAX_PCI_DEVICES)];
+extern spinlock_t driver_lock;
 
 void init_drivers(void);
 

@@ -3,6 +3,7 @@
 #include <components/drivers.h>
 #include "gop_font.h"
 #include "kernel/limine.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -38,6 +39,8 @@ static uint32_t max_chars_x = 0;
 static uint32_t max_chars_y = 0;
 static uint32_t current_bg_color = 0x00000000;
 static bool cursor_enabled = true;
+
+static spinlock_t video_lock = SPINLOCK_INIT;
 
 static inline void sse2_memcpy(void* dst, const void* src, size_t bytes)
 {
@@ -183,11 +186,18 @@ static void draw_char_buf(uint8_t* buf, char c, uint32_t color, uint16_t cx, uin
     }
 }
 
-static void limine_video_char_at(char c, uint32_t color, uint16_t cx, uint16_t cy)
+static void limine_video_char_at_raw(char c, uint32_t color, uint16_t cx, uint16_t cy)
 {
     draw_char_buf(backbuffer, c, color, cx, cy);
     if (scroll_cache)
         draw_char_buf(scroll_cache, c, color, cx, cy);
+}
+
+static void limine_video_char_at(char c, uint32_t color, uint16_t cx, uint16_t cy)
+{
+    spin_lock(&video_lock);
+    limine_video_char_at_raw(c, color, cx, cy);
+    spin_unlock(&video_lock);
 }
 
 static void draw_cursor_shape(uint32_t color) {
@@ -199,6 +209,8 @@ static void draw_cursor_shape(uint32_t color) {
 
 static void limine_video_clear(uint32_t color)
 {
+    spin_lock(&video_lock);
+
     current_bg_color = color;
     size_t total_px = (size_t)(screen_height * phys_pitch) >> 2;
 
@@ -210,6 +222,8 @@ static void limine_video_clear(uint32_t color)
     }
 
     cursor_x = cursor_y = 0;
+
+    spin_unlock(&video_lock);
 }
 
 static void limine_video_scroll(void)
@@ -244,6 +258,8 @@ static void limine_video_scroll(void)
 
 static void limine_video_printf(const char* string, uint32_t color)
 {
+    spin_lock(&video_lock);
+
     draw_cursor_shape(current_bg_color);
     while (*string) {
         switch (*string) {
@@ -252,10 +268,10 @@ static void limine_video_printf(const char* string, uint32_t color)
             case '\b':
                 if (cursor_x > 0) cursor_x--;
                 else if (cursor_y > 0) { cursor_y--; cursor_x = max_chars_x - 1; }
-                limine_video_char_at(' ', current_bg_color, cursor_x, cursor_y);
+                limine_video_char_at_raw(' ', current_bg_color, cursor_x, cursor_y);
                 break;
             default:
-                limine_video_char_at(*string, color, cursor_x, cursor_y);
+                limine_video_char_at_raw(*string, color, cursor_x, cursor_y);
                 if (++cursor_x >= max_chars_x) { cursor_x = 0; cursor_y++; }
                 break;
         }
@@ -266,28 +282,38 @@ static void limine_video_printf(const char* string, uint32_t color)
         string++;
     }
     draw_cursor_shape(color);
+
+    spin_unlock(&video_lock);
 }
 
 static void limine_video_set_cursor_visible(bool visible) {
+    spin_lock(&video_lock);
     if (!visible) draw_cursor_shape(current_bg_color);
     cursor_enabled = visible;
+    spin_unlock(&video_lock);
 }
 
 static void limine_video_set_cursor_pos(uint32_t x, uint32_t y) {
+    spin_lock(&video_lock);
     draw_cursor_shape(current_bg_color);
     if (x < max_chars_x) cursor_x = x;
     if (y < max_chars_y) cursor_y = y;
     draw_cursor_shape(LIMINE_COLOR_WHITE);
+    spin_unlock(&video_lock);
 }
 
 static void limine_video_get_display_resolution(uint64_t* w, uint64_t* h) {
+    spin_lock(&video_lock);
     if (w) *w = phys_width;
     if (h) *h = phys_height;
+    spin_unlock(&video_lock);
 }
 
 static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
     if (!width || width > phys_width) return false;
     if (!height || height > phys_height) return false;
+
+    spin_lock(&video_lock);
 
     screen_width = width;
     screen_height = height;
@@ -296,6 +322,8 @@ static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
     cursor_x = cursor_y = 0;
 
     scroll_cache_init();
+
+    spin_unlock(&video_lock);
     return true;
 }
 

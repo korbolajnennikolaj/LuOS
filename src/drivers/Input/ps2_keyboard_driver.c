@@ -69,6 +69,25 @@ static void keyboard_set_leds(bool caps, bool num, bool scroll) {
     kbd_state.is_scroll_lock = scroll;
 }
 
+static bool key_buffer_push(uint8_t key) {
+    uint16_t head = buffer_head;
+    uint16_t tail = __atomic_load_n(&buffer_tail, __ATOMIC_ACQUIRE);
+    uint16_t next = (head + 1) % PS2_KEYBOARD_BUFFER_SIZE;
+    if (next == tail) return false;
+    key_buffer[head] = key;
+    __atomic_store_n(&buffer_head, next, __ATOMIC_RELEASE);
+    return true;
+}
+
+static bool ext_buffer_push(uint16_t key) {
+    uint8_t head = ext_head;
+    uint8_t tail = __atomic_load_n(&ext_tail, __ATOMIC_ACQUIRE);
+    uint8_t next = (head + 1) % EXT_BUFFER_SIZE;
+    if (next == tail) return false;
+    ext_buffer[head] = key;
+    __atomic_store_n(&ext_head, next, __ATOMIC_RELEASE);
+    return true;
+}
 static void ps2_keyboard_irq_wrapper(struct registers *r) {
     (void)r;
     ps2_keyboard_handler();
@@ -113,25 +132,15 @@ void ps2_keyboard_handler(void) {
             if (key == PS2_EXT_KP_ENTER) {
                 bool was_held = ext_held[PS2_KEY_ENTER & 0x7F];
                 ext_held[PS2_KEY_ENTER & 0x7F] = pressed;
-                if (pressed && !was_held) {
-                    uint16_t next = (buffer_head + 1) % PS2_KEYBOARD_BUFFER_SIZE;
-                    if (next != buffer_tail) {
-                        key_buffer[buffer_head] = PS2_KEY_ENTER;
-                        buffer_head = next;
-                    }
-                }
+                if (pressed && !was_held)
+                    key_buffer_push(PS2_KEY_ENTER);
                 continue;
             }
 
             bool was_ext_held = ext_held[key & 0x7F];
             ext_held[key & 0x7F] = pressed;
-            if (pressed && !was_ext_held) {
-                uint8_t next = (ext_head + 1) % EXT_BUFFER_SIZE;
-                if (next != ext_tail) {
-                    ext_buffer[ext_head] = PS2_EXTKEY(key);
-                    ext_head = next;
-                }
-            }
+            if (pressed && !was_ext_held)
+                ext_buffer_push(PS2_EXTKEY(key));
             continue;
         }
 
@@ -172,36 +181,35 @@ void ps2_keyboard_handler(void) {
         if (key < 128) {
             bool was_held = key_held[key];
             key_held[key] = pressed;
-            if (pressed && !was_held) {
-                uint16_t next = (buffer_head + 1) % PS2_KEYBOARD_BUFFER_SIZE;
-                if (next != buffer_tail) {
-                    key_buffer[buffer_head] = key;
-                    buffer_head = next;
-                }
-            }
+            if (pressed && !was_held)
+                key_buffer_push(key);
         }
     }
 }
 
 static uint8_t keyboard_get_key(void) {
-    if (buffer_tail == buffer_head) return 0;
-    uint8_t key = key_buffer[buffer_tail];
-    buffer_tail = (buffer_tail + 1) % PS2_KEYBOARD_BUFFER_SIZE;
+    uint16_t tail = buffer_tail;
+    uint16_t head = __atomic_load_n(&buffer_head, __ATOMIC_ACQUIRE);
+    if (tail == head) return 0;
+    uint8_t key = key_buffer[tail];
+    __atomic_store_n(&buffer_tail, (tail + 1) % PS2_KEYBOARD_BUFFER_SIZE, __ATOMIC_RELEASE);
     return key;
 }
 
 static bool keyboard_has_key(void) {
-    return buffer_tail != buffer_head;
+    return buffer_tail != __atomic_load_n(&buffer_head, __ATOMIC_ACQUIRE);
 }
 
 static bool keyboard_has_extended_key(void) {
-    return ext_tail != ext_head;
+    return ext_tail != __atomic_load_n(&ext_head, __ATOMIC_ACQUIRE);
 }
 
 static uint16_t keyboard_get_extended_key(void) {
-    if (ext_tail == ext_head) return 0;
-    uint16_t key = ext_buffer[ext_tail];
-    ext_tail = (ext_tail + 1) % EXT_BUFFER_SIZE;
+    uint8_t tail = ext_tail;
+    uint8_t head = __atomic_load_n(&ext_head, __ATOMIC_ACQUIRE);
+    if (tail == head) return 0;
+    uint16_t key = ext_buffer[tail];
+    __atomic_store_n(&ext_tail, (tail + 1) % EXT_BUFFER_SIZE, __ATOMIC_RELEASE);
     return key;
 }
 

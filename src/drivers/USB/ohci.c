@@ -153,7 +153,7 @@ void ohci_irq(void) {
     }
 }
 
-static int ohci_control_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *setup, uint16_t setup_len, void *data, uint16_t data_len, uint8_t in)
+static int ohci_control_transfer_impl(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *setup, uint16_t setup_len, void *data, uint16_t data_len, uint8_t in)
 {
     (void)setup_len;
     int res_idx = -1;
@@ -264,7 +264,16 @@ static int ohci_control_transfer(struct ohci_controller *o, uint8_t addr, uint8_
     return -1;
 }
 
-static int ohci_interrupt_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *data, uint16_t data_len, uint8_t direction)
+static int ohci_control_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *setup, uint16_t setup_len, void *data, uint16_t data_len, uint8_t in)
+{
+    if (!o) return -1;
+    spin_lock(&o->lock);
+    int ret = ohci_control_transfer_impl(o, addr, ep, setup, setup_len, data, data_len, in);
+    spin_unlock(&o->lock);
+    return ret;
+}
+
+static int ohci_interrupt_transfer_impl(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!o || !o->initialized) return -1;
 
@@ -416,6 +425,15 @@ static int ohci_interrupt_transfer(struct ohci_controller *o, uint8_t addr, uint
     return -2;
 }
 
+static int ohci_interrupt_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *data, uint16_t data_len, uint8_t direction)
+{
+    if (!o) return -1;
+    spin_lock(&o->lock);
+    int ret = ohci_interrupt_transfer_impl(o, addr, ep, data, data_len, direction);
+    spin_unlock(&o->lock);
+    return ret;
+}
+
 static int ohci_reset_port(struct ohci_controller *o, uint8_t port) {
     uint32_t reg = REG_RH_PORT_STATUS + (port - 1) * 4;
 
@@ -522,7 +540,7 @@ typedef struct ohci_bulk_pending {
 
 static struct ohci_bulk_pending s_ohci_bulk_pending[MAX_OHCI_CONTROLLERS];
 
-static int ohci_bulk_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *data, uint16_t data_len, uint8_t direction)
+static int ohci_bulk_transfer_impl(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!o || !o->initialized) return -1;
 
@@ -632,6 +650,15 @@ static int ohci_bulk_transfer(struct ohci_controller *o, uint8_t addr, uint8_t e
     pend->cookie = pend->device;
 
     return -2;
+}
+
+static int ohci_bulk_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep, void *data, uint16_t data_len, uint8_t direction)
+{
+    if (!o) return -1;
+    spin_lock(&o->lock);
+    int ret = ohci_bulk_transfer_impl(o, addr, ep, data, data_len, direction);
+    spin_unlock(&o->lock);
+    return ret;
 }
 
 #define OHCI_ISO_MAX_FRAMES 8

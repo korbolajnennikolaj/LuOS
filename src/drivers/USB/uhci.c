@@ -547,16 +547,24 @@ static int uhci_queued_transfer(struct uhci_controller *u, uint8_t dev_addr, uin
 static int uhci_bulk_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
                               void *data, uint16_t data_len, uint8_t direction)
 {
-    return uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_BULK);
+    if (!u) return -1;
+    spin_lock(&u->lock);
+    int ret = uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_BULK);
+    spin_unlock(&u->lock);
+    return ret;
 }
 
 static int uhci_interrupt_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
                                    void *data, uint16_t data_len, uint8_t direction)
 {
-    return uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_INTERRUPT);
+    if (!u) return -1;
+    spin_lock(&u->lock);
+    int ret = uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_INTERRUPT);
+    spin_unlock(&u->lock);
+    return ret;
 }
 
-static int uhci_control_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
+static int uhci_control_transfer_impl(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
                                  void *setup_packet, uint16_t setup_len, void *data,
                                  uint16_t data_len, uint8_t direction)
 {
@@ -646,6 +654,17 @@ static int uhci_control_transfer(struct uhci_controller *u, uint8_t dev_addr, ui
     return success ? 0 : -1;
 }
 
+static int uhci_control_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
+                                 void *setup_packet, uint16_t setup_len, void *data,
+                                 uint16_t data_len, uint8_t direction)
+{
+    if (!u) return -1;
+    spin_lock(&u->lock);
+    int ret = uhci_control_transfer_impl(u, dev_addr, endpoint, setup_packet, setup_len, data, data_len, direction);
+    spin_unlock(&u->lock);
+    return ret;
+}
+
 typedef struct {
     uint8_t active;
     uint8_t n_frames;
@@ -665,7 +684,7 @@ typedef struct {
 static struct uhci_iso_pending_holder { uhci_iso_pending v; } s_uhci_iso_holder[MAX_UHCI_CONTROLLERS];
 #define s_uhci_iso(idx) (s_uhci_iso_holder[(idx)].v)
 
-static int uhci_iso_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
+static int uhci_iso_transfer_impl(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
                              void *data, uint16_t total_len, uint8_t n_frames,
                              const uint16_t *frame_lens, uint8_t direction)
 {
@@ -735,6 +754,17 @@ static int uhci_iso_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_
     s_uhci_iso(res_idx).cookie = NULL;
 
     return 0;
+}
+
+static int uhci_iso_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
+                             void *data, uint16_t total_len, uint8_t n_frames,
+                             const uint16_t *frame_lens, uint8_t direction)
+{
+    if (!u) return -1;
+    spin_lock(&u->lock);
+    int ret = uhci_iso_transfer_impl(u, dev_addr, endpoint, data, total_len, n_frames, frame_lens, direction);
+    spin_unlock(&u->lock);
+    return ret;
 }
 
 void uhci_poll_iso(struct uhci_controller *u) {

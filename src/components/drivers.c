@@ -23,6 +23,7 @@
 
 void* device_table[AMOUNT_DEVICES_TYPE][MAX(MAX_DEVICES_PER_TYPE, MAX_PCI_DEVICES)] = {0};
 struct driver* driver_table[AMOUNT_DRIVERS_TYPE][MAX_DRIVERS_PER_TYPE] = {0};
+spinlock_t driver_lock = SPINLOCK_INIT;
 
 void register_driver(struct driver* drv) {
     struct limine_video_driver* video_main_driver = get_self_driver(LIMINE_VIDEO_DRIVER, 0);
@@ -35,7 +36,10 @@ void register_driver(struct driver* drv) {
 
     for (int i = 0; i < drv->dependency_count; i++){
         struct dependency* dep = drv->dependencies[i];
-        if (driver_table[dep->type][dep->sub_type] == 0) {
+        spin_lock(&driver_lock);
+        int dep_met = driver_table[dep->type][dep->sub_type] != 0;
+        spin_unlock(&driver_lock);
+        if (!dep_met) {
             if (video_main_driver != NULL) {
                 video_main_driver->printf("Failed to register driver ", LIMINE_COLOR_LIGHT_RED);
                 video_main_driver->printf(drv->name, LIMINE_COLOR_LIGHT_CYAN);
@@ -44,7 +48,10 @@ void register_driver(struct driver* drv) {
             return;
         }
     }
+
+    spin_lock(&driver_lock);
     if (driver_table[drv->type][drv->sub_type]) {
+        spin_unlock(&driver_lock);
         if (video_main_driver != NULL) {
             video_main_driver->printf("Failed to register driver ", LIMINE_COLOR_LIGHT_RED);
             video_main_driver->printf(drv->name, LIMINE_COLOR_LIGHT_CYAN);
@@ -53,6 +60,8 @@ void register_driver(struct driver* drv) {
         return;
     }
     driver_table[drv->type][drv->sub_type] = drv;
+    spin_unlock(&driver_lock);
+
     if (drv->init) drv->init();
     drv->status = DRIVER_STATUS_READY;
     if (video_main_driver != NULL) {
@@ -65,7 +74,9 @@ void register_driver(struct driver* drv) {
 }
 
 void *get_self_driver(enum DRIVER_TYPE type, int sub_type) {
+    spin_lock(&driver_lock);
     struct driver* meta = driver_table[type][sub_type];
+    spin_unlock(&driver_lock);
     if (!meta) return NULL;
     return meta->self;
 }

@@ -4,6 +4,7 @@
 #include "block_device.h"
 #include "components/drivers.h"
 #include "components/pci.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -109,6 +110,7 @@ typedef struct {
     volatile uint32_t *sq_doorbell;
     volatile uint32_t *cq_doorbell;
     uint16_t next_cid;
+    spinlock_t lock;
 } nvme_queue_t;
 
 typedef struct {

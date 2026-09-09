@@ -42,6 +42,7 @@ void init_idt(void) {
     idt_set_gate(32, isr32, 0x8E);
     idt_set_gate(33, isr33, 0x8E);
     idt_set_gate(64, isr64, 0x8E);
+    idt_set_gate(65, isr65, 0x8E);
 
     extern void isr34(void); extern void isr35(void); extern void isr36(void);
     extern void isr37(void); extern void isr38(void); extern void isr39(void);
@@ -93,5 +94,9 @@ void init_idt(void) {
 
     idt_set_gate(255, isr_spurious, 0x8E);
 
+    asm volatile("lidt %0" : : "m"(idtp));
+}
+
+void load_idt(void) {
     asm volatile("lidt %0" : : "m"(idtp));
 }

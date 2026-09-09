@@ -2,6 +2,7 @@
 #define EHCI_H
 
 #include "drivers/Timer/tsc_driver.h"
+#include "kernel/sched/spinlock.h"
 #include "usb_controller.h"
 
 #include <stdint.h>
@@ -59,6 +60,7 @@ typedef struct ehci_controller {
     uint8_t initialized;
     struct ehci_qh async_qh;
     uint32_t next_qtd_index;
+    spinlock_t lock;
 } ehci_controller;
 
 typedef struct ehci_driver {

@@ -56,11 +56,14 @@ static int s_bulk_handler_count = 0;
 static struct handler_entry s_iso_handlers[USB_EVENT_MAX_HANDLERS];
 static int s_iso_handler_count = 0;
 
+static spinlock_t handlers_lock = SPINLOCK_INIT;
+
 void usb_event_ring_init(usb_event_ring_t *ring) {
     ring->head = 0;
     ring->tail = 0;
     ring->seq_counter = 0;
     ring->drop_count = 0;
+    spin_lock_init(&ring->lock);
     for (uint32_t i = 0; i < ring->capacity; i++) {
         usb_event_t *e = &ring->entries[i];
         e->type = USB_EVENT_NONE;
@@ -91,9 +94,11 @@ void usb_all_rings_init(void) {
 }
 
 bool usb_event_enqueue(usb_event_ring_t *ring, const usb_event_t *evt) {
+    spin_lock(&ring->lock);
     uint32_t next = (ring->head + 1) & ring->mask;
     if (next == ring->tail) {
         ring->drop_count++;
+        spin_unlock(&ring->lock);
         return false;
     }
     ring->entries[ring->head] = *evt;
@@ -106,16 +111,22 @@ bool usb_event_enqueue(usb_event_ring_t *ring, const usb_event_t *evt) {
     }
     asm volatile("mfence" ::: "memory");
     ring->head = next;
+    spin_unlock(&ring->lock);
     return true;
 }
 
 bool usb_event_dequeue(usb_event_ring_t *ring, usb_event_t *out) {
-    if (ring->tail == ring->head) return false;
+    spin_lock(&ring->lock);
+    if (ring->tail == ring->head) {
+        spin_unlock(&ring->lock);
+        return false;
+    }
     *out = ring->entries[ring->tail];
     if (out->data_len > 0 && out->data_len <= 8)
         out->data = out->inline_data;
     asm volatile("mfence" ::: "memory");
     ring->tail = (ring->tail + 1) & ring->mask;
+    spin_unlock(&ring->lock);
     return true;
 }
 
@@ -126,12 +137,14 @@ uint32_t usb_event_pending(const usb_event_ring_t *ring) {
 }
 
 void usb_event_register_handler(usb_event_handler_t fn, void *ctx) {
-    if (s_intr_handler_count >= USB_EVENT_MAX_HANDLERS) return;
+    spin_lock(&handlers_lock);
+    if (s_intr_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
     struct handler_entry *e = &s_intr_handlers[s_intr_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
     e->xfer_type = USB_XFER_INTERRUPT;
     e->has_device_filter = false;
+    spin_unlock(&handlers_lock);
 }
 
 void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint, usb_transfer_type_t xfer_type)
@@ -146,12 +159,14 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
     default:
         table = s_intr_handlers; count = &s_intr_handler_count; break;
     }
-    if (*count >= USB_EVENT_MAX_HANDLERS) return;
+    spin_lock(&handlers_lock);
+    if (*count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
     struct handler_entry *e = &table[(*count)++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
     e->xfer_type = xfer_type;
     e->has_device_filter = true;
+    spin_unlock(&handlers_lock);
 
     if (device) {
         struct usb_device *dev = (struct usb_device *)device;
@@ -160,41 +175,49 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
 }
 
 void usb_bulk_register_handler(usb_event_handler_t fn, void *ctx) {
-    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) return;
+    spin_lock(&handlers_lock);
+    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
     struct handler_entry *e = &s_bulk_handlers[s_bulk_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
     e->xfer_type = USB_XFER_BULK;
     e->has_device_filter = false;
+    spin_unlock(&handlers_lock);
 }
 
 void usb_bulk_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint)
 {
-    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) return;
+    spin_lock(&handlers_lock);
+    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
     struct handler_entry *e = &s_bulk_handlers[s_bulk_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
     e->xfer_type = USB_XFER_BULK;
     e->has_device_filter = true;
+    spin_unlock(&handlers_lock);
 }
 
 void usb_iso_register_handler(usb_event_handler_t fn, void *ctx) {
-    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) return;
+    spin_lock(&handlers_lock);
+    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
     struct handler_entry *e = &s_iso_handlers[s_iso_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
     e->xfer_type = USB_XFER_ISO;
     e->has_device_filter = false;
+    spin_unlock(&handlers_lock);
 }
 
 void usb_iso_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint)
 {
-    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) return;
+    spin_lock(&handlers_lock);
+    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
     struct handler_entry *e = &s_iso_handlers[s_iso_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
     e->xfer_type = USB_XFER_ISO;
     e->has_device_filter = true;
+    spin_unlock(&handlers_lock);
 }
 
 static void dispatch_to_table(struct handler_entry *table, int count, const usb_event_t *evt)
@@ -232,16 +255,20 @@ static int remove_matching(struct handler_entry *table, int count, void *device)
 
 void usb_event_unregister_for_device(void *device) {
     if (!device) return;
+    spin_lock(&handlers_lock);
     s_intr_handler_count = remove_matching(s_intr_handlers, s_intr_handler_count, device);
     s_bulk_handler_count = remove_matching(s_bulk_handlers, s_bulk_handler_count, device);
     s_iso_handler_count = remove_matching(s_iso_handlers, s_iso_handler_count, device);
+    spin_unlock(&handlers_lock);
 }
 
 void usb_event_dispatch_all(void) {
     usb_event_t evt;
     while (usb_pop_event(&evt)) {
         if (evt.type == USB_EVENT_NONE) continue;
+        spin_lock(&handlers_lock);
         dispatch_to_table(s_intr_handlers, s_intr_handler_count, &evt);
+        spin_unlock(&handlers_lock);
     }
 }
 
@@ -249,7 +276,9 @@ void usb_bulk_dispatch_all(void) {
     usb_event_t evt;
     while (usb_pop_bulk_event(&evt)) {
         if (evt.type == USB_EVENT_NONE) continue;
+        spin_lock(&handlers_lock);
         dispatch_to_table(s_bulk_handlers, s_bulk_handler_count, &evt);
+        spin_unlock(&handlers_lock);
     }
 }
 
@@ -257,6 +286,8 @@ void usb_iso_dispatch_all(void) {
     usb_event_t evt;
     while (usb_pop_iso_event(&evt)) {
         if (evt.type == USB_EVENT_NONE) continue;
+        spin_lock(&handlers_lock);
         dispatch_to_table(s_iso_handlers, s_iso_handler_count, &evt);
+        spin_unlock(&handlers_lock);
     }
 }

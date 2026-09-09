@@ -2,6 +2,7 @@
 
 #include "components/drivers.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stddef.h>
 
@@ -11,6 +12,7 @@
 #define USB_LOG_MAX_COLS 240
 #define USB_LOG_MIN_COLS 60
 
+static spinlock_t log_lock = SPINLOCK_INIT;
 static struct limine_video_driver *s_v = NULL;
 static uint16_t s_grid_cols = 0;
 
@@ -125,6 +127,7 @@ static uint16_t strwidth(const char *s) {
 }
 
 void usb_logrow_begin(usb_log_tag tag, usb_log_level lvl) {
+    spin_lock(&log_lock);
     if ((unsigned)tag >= USB_LOG_TAG_COUNT) tag = USB_LOG_CORE;
     s_row_col = 0;
     s_row_muted = ((unsigned)lvl < (unsigned)s_min_level);
@@ -179,10 +182,11 @@ void usb_logrow_pad(uint16_t col) {
 }
 
 void usb_logrow_end(void) {
-    if (s_row_muted) { s_row_muted = 0; s_row_col = 0; return; }
+    if (s_row_muted) { s_row_muted = 0; s_row_col = 0; spin_unlock(&log_lock); return; }
     struct limine_video_driver *v = get_v();
     if (v && v->printf) v->printf("\n", s_row_color);
     s_row_col = 0;
+    spin_unlock(&log_lock);
 }
 
 void usb_log(usb_log_tag tag, usb_log_level lvl, const char *msg) {

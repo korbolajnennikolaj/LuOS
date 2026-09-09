@@ -4,6 +4,7 @@
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "kernel/limine.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdint.h>
 
@@ -41,15 +42,19 @@ static inline void ehci_write_op(struct ehci_controller* c, uint32_t reg, uint32
 
 static const struct ehci_controller *s_configflag_done[MAX_EHCI_CONTROLLERS];
 static int s_configflag_done_count = 0;
+static spinlock_t configflag_lock = SPINLOCK_INIT;
 
 static void ehci_ensure_configflag(struct ehci_controller *c) {
-    for (int i = 0; i < s_configflag_done_count; i++)
-        if (s_configflag_done[i] == c) return;
+    spin_lock(&configflag_lock);
+    for (int i = 0; i < s_configflag_done_count; i++) {
+        if (s_configflag_done[i] == c) { spin_unlock(&configflag_lock); return; }
+    }
 
     ehci_write_op(c, EHCI_CONFIGFLAG, 1);
 
     if (s_configflag_done_count < MAX_EHCI_CONTROLLERS)
         s_configflag_done[s_configflag_done_count++] = c;
+    spin_unlock(&configflag_lock);
 }
 
 uint32_t ehci_hub_exec(struct ehci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port, uint32_t val) {

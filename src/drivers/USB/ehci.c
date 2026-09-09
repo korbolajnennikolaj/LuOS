@@ -261,7 +261,7 @@ static void ehci_reset_qh_overlay(struct ehci_qh *qh) {
     asm volatile("mfence" ::: "memory");
 }
 
-static int ehci_control_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *setup_packet, uint16_t setup_len, void *data, uint16_t data_len, uint8_t direction)
+static int ehci_control_transfer_impl(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *setup_packet, uint16_t setup_len, void *data, uint16_t data_len, uint8_t direction)
 {
     (void)setup_len;
     if (!e || !e->initialized) return -1;
@@ -412,7 +412,16 @@ static int ehci_control_transfer(struct ehci_controller *e, uint8_t dev_addr, ui
     return (timeout <= 0) ? -4 : 0;
 }
 
-static int ehci_interrupt_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
+static int ehci_control_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *setup_packet, uint16_t setup_len, void *data, uint16_t data_len, uint8_t direction)
+{
+    if (!e) return -1;
+    spin_lock(&e->lock);
+    int ret = ehci_control_transfer_impl(e, dev_addr, endpoint, setup_packet, setup_len, data, data_len, direction);
+    spin_unlock(&e->lock);
+    return ret;
+}
+
+static int ehci_interrupt_transfer_impl(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!e || !e->initialized) return -1;
 
@@ -540,6 +549,15 @@ static int ehci_interrupt_transfer(struct ehci_controller *e, uint8_t dev_addr, 
     return -2;
 }
 
+static int ehci_interrupt_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
+{
+    if (!e) return -1;
+    spin_lock(&e->lock);
+    int ret = ehci_interrupt_transfer_impl(e, dev_addr, endpoint, data, data_len, direction);
+    spin_unlock(&e->lock);
+    return ret;
+}
+
 void ehci_irq(void) {
     for (int i = 0; i < ehci_controller_count; i++) {
         struct ehci_controller *e = &ehci_resources[i].ctrl;
@@ -642,7 +660,7 @@ static struct ehci_bulk_pending s_ehci_bulk_pending[MAX_EHCI_CONTROLLERS];
 #define EHCI_DT_EP_DIRS 32
 static uint8_t ehci_bulk_dt[MAX_EHCI_CONTROLLERS][128][EHCI_DT_EP_DIRS];
 
-static int ehci_bulk_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
+static int ehci_bulk_transfer_impl(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!e || !e->initialized) return -1;
 
@@ -800,6 +818,15 @@ static int ehci_bulk_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8
     return -2;
 }
 
+static int ehci_bulk_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
+{
+    if (!e) return -1;
+    spin_lock(&e->lock);
+    int ret = ehci_bulk_transfer_impl(e, dev_addr, endpoint, data, data_len, direction);
+    spin_unlock(&e->lock);
+    return ret;
+}
+
 #define EHCI_ISO_MAX_FRAMES 8
 #define EHCI_ITD_POOL_SIZE 32
 
@@ -842,7 +869,7 @@ static void free_itd(int ri, struct ehci_itd *itd) {
         s_ehci_iso[ri].itd_used[idx] = 0;
 }
 
-static int ehci_iso_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
+static int ehci_iso_transfer_impl(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
 {
     if (!e || !e->initialized) return -1;
     if (!n_frames || n_frames > EHCI_ISO_MAX_FRAMES) return -1;
@@ -921,6 +948,15 @@ static int ehci_iso_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_
     s_ehci_iso[ri].pending.cookie = NULL;
 
     return 0;
+}
+
+static int ehci_iso_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
+{
+    if (!e) return -1;
+    spin_lock(&e->lock);
+    int ret = ehci_iso_transfer_impl(e, dev_addr, endpoint, data, total_len, n_frames, frame_lens, direction);
+    spin_unlock(&e->lock);
+    return ret;
 }
 
 void ehci_poll_iso(struct ehci_controller *e) {

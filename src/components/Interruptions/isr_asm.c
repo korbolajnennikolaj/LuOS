@@ -66,6 +66,14 @@ __attribute__((naked)) void isr64(void) {
     );
 }
 
+__attribute__((naked)) void isr65(void) {
+    asm volatile(
+        "push $0\n\t"
+        "push $65\n\t"
+        "jmp isr_common_stub\n\t"
+    );
+}
+
 __attribute__((naked)) void isr34(void) {
     asm volatile(
         "push $0\n\t"

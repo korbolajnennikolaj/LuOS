@@ -35,6 +35,7 @@ typedef struct apic_driver {
 void apic_send_eoi(void);
 uint8_t apic_get_lapic_id(void);
 void apic_timer_handler(void);
+void apic_enable_this_core(void);
 
 struct apic_driver *return_apic_driver(void);
 struct driver *return_meta_apic_driver(void);

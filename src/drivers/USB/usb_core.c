@@ -63,11 +63,18 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
 static int usb_bulk_transfer(struct usb_device *dev, uint8_t endpoint, void *data, uint16_t len, uint8_t direction);
 static int usb_iso_transfer(struct usb_device *dev, uint8_t endpoint, void *data, uint16_t len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction);
 
-static int usb_find_free_slot(void) {
-    for (int i = 0; i < usb_device_count; i++)
-        if (!usb_device_pool[i].valid) return i;
-    if (usb_device_count < MAX_USB_DEVICES) return usb_device_count;
-    return -1;
+static spinlock_t usb_core_lock = SPINLOCK_INIT;
+
+static int usb_reserve_slot(void) {
+    spin_lock(&usb_core_lock);
+    int slot = -1;
+    for (int i = 0; i < usb_device_count; i++) {
+        if (!usb_device_pool[i].valid) { slot = i; break; }
+    }
+    if (slot < 0 && usb_device_count < MAX_USB_DEVICES) slot = usb_device_count;
+    if (slot >= 0) usb_device_pool[slot].valid = 1;
+    spin_unlock(&usb_core_lock);
+    return slot;
 }
 
 void usb_core_remove_device(struct usb_device *dev) {
@@ -114,8 +121,10 @@ void usb_core_remove_device(struct usb_device *dev) {
         }
     }
 
+    spin_lock(&usb_core_lock);
     dev->valid = 0;
     device_table[USB_DEVICE][slot] = NULL;
+    spin_unlock(&usb_core_lock);
     s_poll_pending[slot] = false;
     s_bulk_poll_pending[slot] = false;
     s_iso_poll_pending[slot] = false;
@@ -826,12 +835,13 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                            uint8_t root_port, uint8_t hub_depth,
                            uint32_t route_string, uint8_t parent_hub_slot,
                            uint8_t speed_id) {
-    int slot = usb_find_free_slot();
+    int slot = usb_reserve_slot();
     if (slot < 0) return;
     struct usb_device *dev = &usb_device_pool[slot];
 
     uint8_t *p = (uint8_t *)dev;
     for (size_t i = 0; i < sizeof(struct usb_device); i++) p[i] = 0;
+    dev->valid = 1;
 
     dev->port = port;
     dev->ctrl = (struct usb_controller *)ctrl_ptr;
@@ -842,7 +852,7 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     if (is_xhci) {
         struct xhci_driver *x_drv = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
         int slot_id = x_drv->enable_slot((struct xhci_controller *)ctrl_ptr);
-        if (slot_id <= 0) return;
+        if (slot_id <= 0) goto fail;
 
         uint32_t my_route = route_string;
         if (hub_depth > 0 && hub_depth <= 5)
@@ -862,7 +872,7 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
 
             if (x_drv->disable_slot)
                 x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
-            return;
+            goto fail;
         }
         dev->address = slot_id;
         delay_ms(100);
@@ -873,14 +883,14 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
             dev->address, 0, &setup, 8, desc_tmp, 18, 1) != 0) {
             if (x_drv->disable_slot)
                 x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
-            return;
+            goto fail;
         }
         for (int i = 0; i < 18; i++) ((uint8_t *)&dev->desc)[i] = desc_tmp[i];
 
         if (usb_validate_device_descriptor(&dev->desc) != 0) {
             if (x_drv->disable_slot)
                 x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
-            return;
+            goto fail;
         }
 
         usb_debug("USB: VID:PID=", ((uint32_t)dev->desc.idVendor << 16) | dev->desc.idProduct, 1);
@@ -916,20 +926,20 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
             usb_debug("USB: FAIL got_desc=0 last_ret=", (uint32_t)(last_xfer_ret & 0xFFFFFFFF), 1);
             usb_debug("USB: b8[0]=", b8[0], 1);
             usb_debug("USB: b8[1]=", b8[1], 1);
-            return;
+            goto fail;
         }
 
         delay_ms(20);
         if (usb_next_address > 127) {
             usb_debug("USB: FAIL out of USB addresses", 0, 1);
-            return;
+            goto fail;
         }
         uint8_t new_addr = usb_next_address++;
         usb_debug("USB: SET_ADDR ", new_addr, 1);
         int sa_ret = usb_control_transfer(dev, 0x00, 0x05, new_addr, 0, 0, NULL);
         if (sa_ret != 0) {
             usb_debug("USB: FAIL SET_ADDR ret=", (uint32_t)(sa_ret & 0xFFFFFFFF), 1);
-            return;
+            goto fail;
         }
         dev->address = new_addr;
         delay_ms(50);
@@ -957,7 +967,7 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         int gd_ret = usb_control_transfer(dev, 0x80, 0x06, 0x0100, 0, 18, desc_full);
         if (gd_ret != 0) {
             usb_debug("USB: FAIL GET_DESC18 ret=", (uint32_t)(gd_ret & 0xFFFFFFFF), 1);
-            return;
+            goto fail;
         }
         for (int i = 0; i < 18; i++) ((uint8_t *)&dev->desc)[i] = desc_full[i];
         usb_debug("USB: desc bcdUSB=", dev->desc.bcdUSB, 1);
@@ -967,7 +977,7 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         if (usb_validate_device_descriptor(&dev->desc) != 0) {
             usb_debug("USB: FAIL validate bLen=", dev->desc.bLength, 1);
             usb_debug("USB: FAIL validate mps=", dev->desc.bMaxPacketSize0, 1);
-            return;
+            goto fail;
         }
 
         usb_debug("USB: VID:PID=", ((uint32_t)dev->desc.idVendor << 16) | dev->desc.idProduct, 1);
@@ -1056,9 +1066,11 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     s_iso_poll_pending[slot] = false;
     for (int i = 0; i < POLL_BULK_BUF_SIZE; i++) s_bulk_poll_buf[slot][i] = 0;
 
+    spin_lock(&usb_core_lock);
     dev->valid = 1;
     device_table[USB_DEVICE][slot] = dev;
     if (slot == usb_device_count) usb_device_count++;
+    spin_unlock(&usb_core_lock);
 
     usb_event_t conn_evt = {
         .type = USB_EVENT_DEVICE_CONN,
@@ -1076,6 +1088,12 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
 
         usb_debug("USB: HUB downstream enumeration done", 0, 0);
     }
+    return;
+
+fail:
+    spin_lock(&usb_core_lock);
+    dev->valid = 0;
+    spin_unlock(&usb_core_lock);
 }
 
 void usb_scan_all(void) {

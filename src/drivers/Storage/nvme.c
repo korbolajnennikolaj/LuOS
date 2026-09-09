@@ -115,6 +115,8 @@ static volatile uint32_t *nvme_doorbell(nvme_controller_t *ctrl, uint32_t qid, b
 }
 
 static int nvme_submit_poll(nvme_queue_t *q, nvme_sqe_t *sqe) {
+    spin_lock(&q->lock);
+
     uint16_t cid = q->next_cid++;
     sqe->cdw0 = (sqe->cdw0 & 0x0000FFFFu) | ((uint32_t)cid << 16);
 
@@ -136,6 +138,7 @@ static int nvme_submit_poll(nvme_queue_t *q, nvme_sqe_t *sqe) {
     }
     if (t <= 0) {
         UERR("nvme_submit_poll: completion timeout");
+        spin_unlock(&q->lock);
         return BLOCK_ERR_TIMEOUT;
     }
 
@@ -153,9 +156,11 @@ static int nvme_submit_poll(nvme_queue_t *q, nvme_sqe_t *sqe) {
         nvme_puts("[NVME] ERR cmd failed SCT=", NCOL_INFO); nvme_hex32(sct, NCOL_DATA);
         nvme_puts(" SC=", NCOL_INFO); nvme_hex32(sc, NCOL_DATA);
         nvme_puts(" status=", NCOL_INFO); nvme_hex32(status, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
+        spin_unlock(&q->lock);
         return BLOCK_ERR_IO;
     }
 
+    spin_unlock(&q->lock);
     return BLOCK_OK;
 }
 

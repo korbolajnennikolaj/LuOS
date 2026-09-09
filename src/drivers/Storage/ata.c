@@ -6,10 +6,13 @@
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/sched/spinlock.h"
 
 #include <ports.h>
 #include <stddef.h>
 #include <string.h>
+
+static spinlock_t ata_lock = SPINLOCK_INIT;
 
 static void ata_puts(const char *s, uint32_t color) {
     struct limine_video_driver *v = get_self_driver(LIMINE_VIDEO_DRIVER, 0);
@@ -620,12 +623,18 @@ static struct ata_driver drv_ata;
 
 static int ata_read(int disk, uint64_t lba, uint32_t count, void *buf) {
     if (disk < 0 || disk >= drv_ata.disk_count) return BLOCK_ERR_PARAM;
-    return ata_issue_cmd(&drv_ata.drives[disk], false, lba, count, buf);
+    spin_lock(&ata_lock);
+    int ret = ata_issue_cmd(&drv_ata.drives[disk], false, lba, count, buf);
+    spin_unlock(&ata_lock);
+    return ret;
 }
 
 static int ata_write(int disk, uint64_t lba, uint32_t count, void *buf) {
     if (disk < 0 || disk >= drv_ata.disk_count) return BLOCK_ERR_PARAM;
-    return ata_issue_cmd(&drv_ata.drives[disk], true, lba, count, buf);
+    spin_lock(&ata_lock);
+    int ret = ata_issue_cmd(&drv_ata.drives[disk], true, lba, count, buf);
+    spin_unlock(&ata_lock);
+    return ret;
 }
 
 static int ata_get_disk_count(void) {

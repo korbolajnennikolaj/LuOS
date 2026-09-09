@@ -9,6 +9,7 @@
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/sched/spinlock.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,6 +21,7 @@ extern unsigned int xhci_read_current_usbsts(void);
 
 static usb_msc_device_t msc_devs[USB_MSC_MAX_DEVICES];
 static int msc_dev_count = 0;
+static spinlock_t msc_lock = SPINLOCK_INIT;
 
 static void (*delay_ms)(uint64_t) = NULL;
 
@@ -717,6 +719,8 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
 
     if (d->sector_size == 0) return MSC_ERR_IO;
 
+    spin_lock(&msc_lock);
+
     uint8_t *dst = (uint8_t *)buf;
     uint32_t done = 0;
 
@@ -730,7 +734,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
         uint64_t cur_lba = lba + done;
         uint32_t byte_len = n * d->sector_size;
         if (byte_len > MSC_DMA_CHUNK) {
-
+            spin_unlock(&msc_lock);
             return MSC_ERR_PARAM;
         }
 
@@ -747,6 +751,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
         int ret = msc_execute(d, cdb, 10, g_dma_buf, byte_len, CBW_FLAGS_IN);
         if (ret != 0) {
             msc_scsi_request_sense(d);
+            spin_unlock(&msc_lock);
             return ret;
         }
         memcpy(dst, g_dma_buf, byte_len);
@@ -755,6 +760,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
         done += n;
     }
 
+    spin_unlock(&msc_lock);
     return MSC_OK;
 }
 
@@ -765,6 +771,8 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
     if (count == 0) return MSC_OK;
 
     if (d->sector_size == 0) return MSC_ERR_IO;
+
+    spin_lock(&msc_lock);
 
     uint8_t *src = (uint8_t *)buf;
     uint32_t done = 0;
@@ -777,7 +785,10 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
 
         uint64_t cur_lba = lba + done;
         uint32_t byte_len = n * d->sector_size;
-        if (byte_len > MSC_DMA_CHUNK) return MSC_ERR_PARAM;
+        if (byte_len > MSC_DMA_CHUNK) {
+            spin_unlock(&msc_lock);
+            return MSC_ERR_PARAM;
+        }
         memcpy(g_dma_buf, src, byte_len);
 
         uint8_t cdb[10] = {
@@ -793,6 +804,7 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
         int ret = msc_execute(d, cdb, 10, g_dma_buf, byte_len, CBW_FLAGS_OUT);
         if (ret != 0) {
             msc_scsi_request_sense(d);
+            spin_unlock(&msc_lock);
             return ret;
         }
 
@@ -800,6 +812,7 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
         done += n;
     }
 
+    spin_unlock(&msc_lock);
     return MSC_OK;
 }
 

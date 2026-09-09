@@ -1,6 +1,8 @@
 #ifndef USB_EVENT_H
 #define USB_EVENT_H
 
+#include "kernel/sched/spinlock.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -72,6 +74,7 @@ typedef struct {
     volatile uint32_t tail;
     uint32_t seq_counter;
     uint32_t drop_count;
+    spinlock_t lock;
 } usb_event_ring_t;
 
 extern usb_event_ring_t g_usb_event_ring;

@@ -1,5 +1,7 @@
 #ifndef XHCI_H
 #define XHCI_H
+#include "kernel/sched/spinlock.h"
+
 #include <stdint.h>
 
 struct usb_setup_packet;
@@ -61,6 +63,7 @@ typedef struct xhci_controller {
     volatile uint8_t transfer_in_progress;
     uint8_t initialized;
     uint8_t use_polling;
+    spinlock_t lock;
 } xhci_controller;
 
 typedef struct xhci_driver {

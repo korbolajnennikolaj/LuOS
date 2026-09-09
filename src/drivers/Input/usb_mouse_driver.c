@@ -5,6 +5,7 @@
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/USB/xhci.h"
+#include "kernel/sched/spinlock.h"
 #include "mouse_driver.h"
 
 #include <stdbool.h>
@@ -36,9 +37,11 @@ typedef struct usb_mouse_instance {
 static struct usb_mouse_instance mice[MAX_USB_MICE];
 static int mouse_count = 0;
 static struct usb_mouse_state shared_state = {0};
+static spinlock_t usb_mouse_lock = SPINLOCK_INIT;
 
 static void process_mouse_report(const uint8_t *buf, uint16_t len) {
     if (len < 3) return;
+    spin_lock(&usb_mouse_lock);
     shared_state.btn_left = (buf[0] & (1 << 0)) != 0;
     shared_state.btn_right = (buf[0] & (1 << 1)) != 0;
     shared_state.btn_middle = (buf[0] & (1 << 2)) != 0;
@@ -46,6 +49,7 @@ static void process_mouse_report(const uint8_t *buf, uint16_t len) {
 
     shared_state.y += (int8_t)buf[2];
     if (len >= 4) shared_state.wheel += (int8_t)buf[3];
+    spin_unlock(&usb_mouse_lock);
 }
 
 static void usb_mouse_event_handler(const usb_event_t *evt, void *ctx) {
@@ -156,7 +160,9 @@ void usb_mouse_handler_poll(void) {
 
 static struct usb_mouse_state *mouse_get_state(void) { return &shared_state; }
 static void mouse_reset_deltas(void) {
+    spin_lock(&usb_mouse_lock);
     shared_state.x = 0; shared_state.y = 0; shared_state.wheel = 0;
+    spin_unlock(&usb_mouse_lock);
 }
 static int mouse_get_count(void) { return mouse_count; }
 

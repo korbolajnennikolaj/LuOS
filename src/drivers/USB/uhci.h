@@ -1,6 +1,7 @@
 #ifndef UHCI_H
 #define UHCI_H
 
+#include "kernel/sched/spinlock.h"
 #include "usb_controller.h"
 
 #include <stdint.h>
@@ -49,6 +50,7 @@ typedef struct uhci_controller {
     uint32_t* frame_list;
     struct uhci_td* td_pool;
     uint32_t next_td_index;
+    spinlock_t lock;
 } uhci_controller;
 
 typedef struct uhci_driver {

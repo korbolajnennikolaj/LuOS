@@ -3,6 +3,7 @@
 #include "components/drivers.h"
 #include "components/Interruptions/isr.h"
 #include "drivers/Timer/timer.h"
+#include "kernel/sched/sched.h"
 
 #include <ports.h>
 #include <stdbool.h>
@@ -90,8 +91,8 @@ static void apic_calibrate(struct pit_driver *pit) {
 }
 
 static void apic_timer_isr(struct registers *regs) {
-    (void)regs;
     apic_milliseconds++;
+    sched_tick(regs);
 }
 
 void apic_timer_handler(void) {
@@ -110,6 +111,13 @@ struct apic_driver apic_driver_loaded = {
     .send_eoi = apic_send_eoi,
     .is_apic_available = apic_supported
 };
+
+void apic_enable_this_core(void) {
+    apic_enable();
+    apic_write(APIC_REG_LVT_TIMER, APIC_TIMER_VECTOR | APIC_TIMER_PERIODIC);
+    apic_write(APIC_REG_TIMER_DIV, 0x3);
+    apic_write(APIC_REG_TIMER_INIT, ticks_per_ms ? ticks_per_ms : 10000);
+}
 
 struct apic_driver *return_apic_driver(void) {
     struct pit_driver *pit_local = get_self_driver(TIMER_DRIVER, PIT_TIMER);

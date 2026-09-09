@@ -22,6 +22,7 @@ void isr14(void);
 void isr32(void);
 void isr33(void);
 void isr64(void);
+void isr65(void);
 
 void isr48(void);
 void isr49(void);

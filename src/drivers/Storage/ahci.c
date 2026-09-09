@@ -102,6 +102,8 @@ static int port_find_free_slot(volatile hba_port_t *port)
 
 static int port_issue_cmd(ahci_port_t *ap, bool write, uint64_t lba, uint32_t sectors, void *buf)
 {
+    spin_lock(&ap->lock);
+
     volatile hba_port_t *port = ap->regs;
 
     int t = AHCI_TIMEOUT_MS;
@@ -109,12 +111,14 @@ static int port_issue_cmd(ahci_port_t *ap, bool write, uint64_t lba, uint32_t se
     if (t <= 0) {
         ahci_puts("[AHCI] ERR cmd: BSY/DRQ timeout TFD=", AHCI_COL_INFO);
         ahci_hex32(port->tfd, AHCI_COL_DATA); ahci_puts("\n", AHCI_COL_INFO);
+        spin_unlock(&ap->lock);
         return BLOCK_ERR_TIMEOUT;
     }
 
     int slot = port_find_free_slot(port);
     if (slot < 0) {
         UERR("port_issue_cmd: no free command slot");
+        spin_unlock(&ap->lock);
         return BLOCK_ERR_TIMEOUT;
     }
 
@@ -170,6 +174,7 @@ static int port_issue_cmd(ahci_port_t *ap, bool write, uint64_t lba, uint32_t se
             ahci_puts("[AHCI] ERR cmd TFES IS=", AHCI_COL_INFO); ahci_hex32(port->is, AHCI_COL_DATA);
             ahci_puts(" TFD=", AHCI_COL_INFO); ahci_hex32(port->tfd, AHCI_COL_DATA);
             ahci_puts(" SERR=", AHCI_COL_INFO); ahci_hex32(port->serr, AHCI_COL_DATA); ahci_puts("\n", AHCI_COL_INFO);
+            spin_unlock(&ap->lock);
             return BLOCK_ERR_IO;
         }
     }
@@ -177,14 +182,17 @@ static int port_issue_cmd(ahci_port_t *ap, bool write, uint64_t lba, uint32_t se
         ahci_puts("[AHCI] ERR cmd timeout IS=", AHCI_COL_INFO); ahci_hex32(port->is, AHCI_COL_DATA);
         ahci_puts(" TFD=", AHCI_COL_INFO); ahci_hex32(port->tfd, AHCI_COL_DATA);
         ahci_puts(" CI=", AHCI_COL_INFO); ahci_hex32(port->ci, AHCI_COL_DATA); ahci_puts("\n", AHCI_COL_INFO);
+        spin_unlock(&ap->lock);
         return BLOCK_ERR_TIMEOUT;
     }
     if (port->is & HBA_IS_TFES) {
         ahci_puts("[AHCI] ERR cmd TFES (late) IS=", AHCI_COL_INFO); ahci_hex32(port->is, AHCI_COL_DATA);
         ahci_puts(" TFD=", AHCI_COL_INFO); ahci_hex32(port->tfd, AHCI_COL_DATA); ahci_puts("\n", AHCI_COL_INFO);
+        spin_unlock(&ap->lock);
         return BLOCK_ERR_IO;
     }
 
+    spin_unlock(&ap->lock);
     return BLOCK_OK;
 }
 

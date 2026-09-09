@@ -3,12 +3,14 @@
 #include "components/drivers.h"
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
+#include "kernel/sched/spinlock.h"
 #include "mouse_driver.h"
 
 #include <ports.h>
 #include <stddef.h>
 
 static struct ps2_mouse_state mouse_state = {0};
+static spinlock_t mouse_lock = SPINLOCK_INIT;
 
 #define PACKET_SIZE_STD 3
 #define PACKET_SIZE_WHEEL 4
@@ -57,12 +59,16 @@ void ps2_mouse_handler(void) {
 
     uint8_t flags = packet_buf[0];
 
+    spin_lock(&mouse_lock);
+
     mouse_state.btn_left = (flags & MOUSE_PACKET_BTN_LEFT) != 0;
     mouse_state.btn_right = (flags & MOUSE_PACKET_BTN_RIGHT) != 0;
     mouse_state.btn_middle = (flags & MOUSE_PACKET_BTN_MIDDLE) != 0;
 
-    if ((flags & MOUSE_PACKET_X_OVERFLOW) || (flags & MOUSE_PACKET_Y_OVERFLOW))
+    if ((flags & MOUSE_PACKET_X_OVERFLOW) || (flags & MOUSE_PACKET_Y_OVERFLOW)) {
+        spin_unlock(&mouse_lock);
         return;
+    }
 
     int32_t dx = (int8_t)packet_buf[1];
     int32_t dy = (int8_t)packet_buf[2];
@@ -75,6 +81,8 @@ void ps2_mouse_handler(void) {
         if (dw & 0x08) dw |= 0xF0;
         mouse_state.wheel += dw;
     }
+
+    spin_unlock(&mouse_lock);
 }
 
 static void ps2_mouse_irq_wrapper(struct registers *r) {
@@ -120,9 +128,11 @@ static struct ps2_mouse_state *mouse_get_state(void) {
 }
 
 static void mouse_reset_deltas(void) {
+    spin_lock(&mouse_lock);
     mouse_state.x = 0;
     mouse_state.y = 0;
     mouse_state.wheel = 0;
+    spin_unlock(&mouse_lock);
 }
 
 static struct ps2_mouse_driver drv_ps2_mouse = {
