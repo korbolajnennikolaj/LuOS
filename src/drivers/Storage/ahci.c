@@ -395,8 +395,7 @@ static bool port_init(ahci_port_t *ap, volatile hba_port_t *regs, int idx, int p
     regs->fbu = (uint32_t)(fis_phys >> 32);
     regs->is = (uint32_t)~0;
     regs->serr = (uint32_t)~0;
-    regs->ie = HBA_IS_DHRS | (1u << 1) | (1u << 2) | (1u << 3)
-               | HBA_IS_TFES | HBA_IS_HBFS | HBA_IS_IFS;
+    regs->ie = 0;
 
     ULOG("port_init: starting port");
     port_start(regs);
@@ -575,7 +574,6 @@ struct ahci_driver *return_ahci_driver(void)
         hba->ghc |= HBA_GHC_AE;
         ahci_io_mb();
         hba->is = (uint32_t)~0;
-        hba->ghc |= HBA_GHC_IE;
         ahci_io_mb();
         ahci_puts("[AHCI] GHC=", AHCI_COL_INFO); ahci_hex32(hba->ghc, AHCI_COL_DATA); ahci_puts("\n", AHCI_COL_INFO);
 

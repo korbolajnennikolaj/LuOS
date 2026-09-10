@@ -85,9 +85,9 @@ static struct task *dequeue(int core) {
 }
 
 static void register_task(struct task *t) {
-    spin_lock(&g_tasks_lock);
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
     g_tasks[g_task_count++] = t;
-    spin_unlock(&g_tasks_lock);
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
 static void idle_entry(void *arg) {
@@ -111,7 +111,7 @@ void scheduler_start(void) {
 
     struct task *main_task = kmalloc(sizeof(struct task));
     memset(main_task, 0, sizeof(struct task));
-    main_task->tid = g_next_tid++;
+    main_task->tid = __atomic_fetch_add(&g_next_tid, 1, __ATOMIC_SEQ_CST);
     strncpy(main_task->name, "main", TASK_NAME_MAX);
     main_task->state = TASK_RUNNING;
     main_task->priority = PRIO_DEFAULT;
@@ -127,7 +127,7 @@ struct task *task_create(const char *name, void (*entry)(void *), void *arg, int
     struct task *t = kmalloc(sizeof(struct task));
     memset(t, 0, sizeof(struct task));
 
-    t->tid = g_next_tid++;
+    t->tid = __atomic_fetch_add(&g_next_tid, 1, __ATOMIC_SEQ_CST);
     strncpy(t->name, name, TASK_NAME_MAX);
     t->priority = priority;
     t->time_slice = TIME_SLICE_TICKS;
@@ -147,7 +147,10 @@ struct task *task_create(const char *name, void (*entry)(void *), void *arg, int
     t->regs.rflags = 0x202;
 
     register_task(t);
+
+    uint64_t flags = spin_lock_irqsave(&g_rq_lock);
     enqueue(current_core(), t);
+    spin_unlock_irqrestore(&g_rq_lock, flags);
 
     return t;
 }
@@ -252,30 +255,30 @@ void scheduler_block(void *channel) {
 }
 
 void scheduler_wake(void *channel) {
-    spin_lock(&g_tasks_lock);
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
     for (int i = 0; i < g_task_count; i++) {
         struct task *t = g_tasks[i];
         if (t->state == TASK_BLOCKED && t->wait_channel == channel) {
             t->wait_channel = 0;
-            spin_lock(&g_rq_lock);
+            uint64_t rq_flags = spin_lock_irqsave(&g_rq_lock);
             enqueue(current_core(), t);
-            spin_unlock(&g_rq_lock);
+            spin_unlock_irqrestore(&g_rq_lock, rq_flags);
             break;
         }
     }
-    spin_unlock(&g_tasks_lock);
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
 void scheduler_wake_all(void *channel) {
-    spin_lock(&g_tasks_lock);
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
     for (int i = 0; i < g_task_count; i++) {
         struct task *t = g_tasks[i];
         if (t->state == TASK_BLOCKED && t->wait_channel == channel) {
             t->wait_channel = 0;
-            spin_lock(&g_rq_lock);
+            uint64_t rq_flags = spin_lock_irqsave(&g_rq_lock);
             enqueue(current_core(), t);
-            spin_unlock(&g_rq_lock);
+            spin_unlock_irqrestore(&g_rq_lock, rq_flags);
         }
     }
-    spin_unlock(&g_tasks_lock);
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
