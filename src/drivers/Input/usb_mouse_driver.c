@@ -5,7 +5,7 @@
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/USB/xhci.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include "mouse_driver.h"
 
 #include <stdbool.h>

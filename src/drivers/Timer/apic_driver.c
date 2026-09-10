@@ -3,7 +3,7 @@
 #include "components/drivers.h"
 #include "components/Interruptions/isr.h"
 #include "drivers/Timer/timer.h"
-#include "kernel/sched/sched.h"
+#include "kernel/scheduler/scheduler.h"
 
 #include <ports.h>
 #include <stdbool.h>
@@ -92,7 +92,7 @@ static void apic_calibrate(struct pit_driver *pit) {
 
 static void apic_timer_isr(struct registers *regs) {
     apic_milliseconds++;
-    sched_tick(regs);
+    scheduler_tick(regs);
 }
 
 void apic_timer_handler(void) {

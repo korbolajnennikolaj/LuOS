@@ -6,7 +6,6 @@ CC = gcc
 LD = ld
 AS = nasm
 
-# === Добавь эти переменные в начало Makefile ===
 MPY_DIR = micropython
 MPY_PORT = luos
 MPY_BUILD_DIR = $(MPY_DIR)/ports/$(MPY_PORT)/build
@@ -43,11 +42,6 @@ ASFLAGS = -f elf64
 
 LDFLAGS = -m elf_x86_64 -T scripts/linker.ld -nostdlib -z max-page-size=0x1000 -static
 
-# libgcc.a — компиляторные хелперы (мягкая арифметика: 64-битное деление,
-# конверсии float16 и т.п.), которые gcc может подставлять в сгенерированный
-# код даже в freestanding-режиме. Нужен на финальной линковке ядра, иначе
-# такие символы (например __extendhfdf2/__truncsfhf2 из MicroPython/py/binary.c)
-# останутся неразрешёнными.
 LIBGCC = $(shell $(CC) $(CFLAGS_BASE) -print-libgcc-file-name)
 
 SRC_DIR = src
@@ -74,11 +68,11 @@ NORMAL_OBJECTS = $(filter-out $(MATH_OBJECTS) $(LUA_OBJECTS), $(C_OBJECTS))
 
 OBJECTS = $(NORMAL_OBJECTS) $(MATH_OBJECTS) $(LUA_OBJECTS) $(ASM_OBJECTS)
 
-.PHONY: all clean run-uefi run-bios iso-limine help \
+.PHONY: all clean run-uefi run-uefi-smp run-bios iso-limine help \
 	run-uhci-bios run-ehci-bios run-ohci-bios \
 	run-xhci-bios run-xhci-uefi run-xhci-log \
 	run-uhci-log run-ehci-log run-ohci-log \
-	run-ata-log
+	run-ata-log run-stress-log
 
 AHCI_LOG       = ahci_trace.log
 AHCI_QEMU_LOG  = qemu_debug_ahci.log
@@ -86,24 +80,15 @@ DISK_IMG       = disk.img
 NVME_DISK_IMG  = nvme_disk.img
 DISK_SIZE      = 512M
 
-# =================================================================
-# Общий образ диска для всех тестов (AHCI/ATA/USB/xHCI/NVMe и т.д.)
-#
-# Вместо простого нулевого файла (dd if=/dev/zero) здесь создаётся
-# настоящий диск с GPT-таблицей и тремя разделами:
-#   p1 - FAT32  (помечен как загрузочный/EFI)
-#   p2 - exFAT
-#   p3 - ext4
-#
-# Требуются: parted, util-linux (losetup/partprobe), dosfstools (mkfs.vfat),
-# exfatprogs/exfat-utils (mkfs.exfat), e2fsprogs (mkfs.ext4) и sudo для
-# работы с loop-устройствами (см. цель install).
-#
-# Правило общее для $(DISK_IMG) и $(NVME_DISK_IMG) — раз это обычные
-# файловые цели без иных предпосылок, make пересоздаст образ только
-# если файла ещё нет на диске (обычное поведение make для файлов).
-# Чтобы пересоздать образ заново — удалите его (или `make clean`).
-# =================================================================
+STRESS_DISK_SIZE = 32M
+DISK_AHCI = disk_ahci.img
+DISK_XHCI = disk_xhci.img
+DISK_EHCI = disk_ehci.img
+DISK_UHCI = disk_uhci.img
+DISK_OHCI = disk_ohci.img
+
+STRESS_DISKS = $(DISK_AHCI) $(DISK_XHCI) $(DISK_EHCI) $(DISK_UHCI) $(DISK_OHCI)
+
 $(DISK_IMG) $(NVME_DISK_IMG):
 	@set -e; \
 	IMG="$@"; \
@@ -125,11 +110,18 @@ $(DISK_IMG) $(NVME_DISK_IMG):
 	if command -v mkfs.exfat >/dev/null 2>&1; then \
 		sudo mkfs.exfat -n LUOSEXFAT "$${LOOPDEV}p2" >/dev/null; \
 	else \
-		echo "[WARN] mkfs.exfat не найден (пакет exfatprogs/exfat-utils) - раздел 2 останется без ФС"; \
+		echo "[WARN] mkfs.exfat not found (exfatprogs/exfat-utils package) - partition 2 will have no filesystem"; \
 	fi; \
 	sudo mkfs.ext4 -q -F -L LUOSEXT4 "$${LOOPDEV}p3"; \
 	sudo losetup -d "$$LOOPDEV"; \
-	echo "[IMG] $$IMG готов: p1=FAT32(EFI) p2=exFAT p3=ext4"
+	echo "[IMG] $$IMG ready: p1=FAT32(EFI) p2=exFAT p3=ext4"
+
+$(STRESS_DISKS):
+	@echo "[IMG] Creating $@ ($(STRESS_DISK_SIZE) FAT32)..."
+	@rm -f $@
+	@truncate -s $(STRESS_DISK_SIZE) $@
+	@mkfs.vfat -F32 -n STRESS $@ >/dev/null
+	@echo "[IMG] $@ ready"
 
 all: $(BUILD_DIR) $(KERNEL)
 
@@ -151,7 +143,6 @@ $(MATH_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@echo "[CC]  Compiling (SSE2) $<..."
 	@$(CC) $(CFLAGS_MATH) -c $< -o $@
 
-# === Добавь правило сборки MicroPython ===
 $(MPY_FIRMWARE):
 	@echo "[MPY] Building MicroPython bare-metal port..."
 	@$(MAKE) -C $(MPY_DIR)/ports/$(MPY_PORT)
@@ -190,6 +181,38 @@ run-uefi: iso-limine
 		-k en-us \
 		-nodefaults \
 		-vga std
+
+SMP_LOG     = qemu_smp_trace.log
+SMP_DBG_LOG = qemu_smp_debug.log
+SMP_GDB_PORT = 1234
+
+run-uefi-smp: iso-limine
+	@echo "[QEMU SMP DEBUG] Running with 4 cores in UEFI mode (TCG, NO KVM)..."
+	@echo "[QEMU SMP DEBUG] GDB: gdb your_kernel.elf -ex 'target remote :$(SMP_GDB_PORT)'"
+	@if [ ! -f "$(OVMF_PATH)" ]; then \
+		echo "[ERR] OVMF not found at $(OVMF_PATH)!"; \
+		exit 1; \
+	fi
+	@rm -f $(SMP_LOG) $(SMP_DBG_LOG)
+	qemu-system-x86_64 \
+		-machine q35,accel=tcg \
+		-bios $(OVMF_PATH) \
+		-cdrom $(ISO_LIMINE) \
+		-m 2048M \
+		-cpu qemu64,+x2apic \
+		-smp 4,sockets=1,cores=4,threads=1 \
+		-boot d \
+		-serial mon:stdio \
+		-trace "apic*" \
+		-d int,pcall,mmu,cpu_reset,guest_errors,unimp \
+		-D $(SMP_DBG_LOG) \
+		-no-reboot \
+		-gdb tcp::$(SMP_GDB_PORT) \
+		-k en-us \
+		-nodefaults \
+		-vga std \
+		2>$(SMP_LOG)
+	@echo "[QEMU SMP DEBUG] Logs: $(SMP_DBG_LOG) | $(SMP_LOG)"
 
 run-bios: iso-limine
 	@echo "[QEMU] Running in BIOS mode (CPU: 2GHz, PS/2 input)..."
@@ -281,7 +304,7 @@ OHCI_DBG_LOG   = qemu_debug_ohci.log
 
 run-uhci-bios: iso-limine $(DISK_IMG)
 	@echo "[UHCI BIOS] USB 1.1 controller (PIIX4 built-in), emulated usb-kbd + usb-mouse + usb-storage"
-	@echo "[UHCI BIOS] Machine: pc,usb=on — встроенный UHCI (usb-bus.0, 2端口) + второй UHCI для диска"
+	@echo "[UHCI BIOS] Machine: pc,usb=on — built-in UHCI (usb-bus.0, 2 ports) + second UHCI for disk"
 	@rm -f $(UHCI_LOG) $(UHCI_DBG_LOG); \
 	qemu-system-x86_64 \
 		-machine pc,usb=on \
@@ -355,8 +378,6 @@ run-uhci-log: run-uhci-bios
 run-ehci-log: run-ehci-bios
 run-ohci-log: run-ohci-bios
 
-# =================================================================
-
 ATA_LOG = ata_trace.log
 ATA_QEMU_LOG = qemu_debug_ata.log
 
@@ -417,7 +438,6 @@ iso-limine: $(KERNEL)
 
 	@echo "ISO created successfully: $(ISO_LIMINE)"
 
-
 USB_DISK_LOG = usb_flash_trace.log
 USB_DISK_QEMU_LOG = qemu_debug_usb_flash.log
 
@@ -463,30 +483,9 @@ run-ahci-log: iso-limine $(DISK_IMG)
 	@echo "  QEMU : $(AHCI_QEMU_LOG)"
 	@echo "  STDERR: $(AHCI_LOG)"
 
-# =================================================================
-# NVMe test target
-#
-# QEMU's "nvme" device (qemu-system-x86_64 -device nvme) is only
-# available if that build of QEMU was compiled with NVMe emulation
-# support - true for essentially every mainstream distro package, but
-# not guaranteed everywhere (some minimal/custom QEMU builds omit it).
-# Rather than fail with a cryptic "'nvme' is not a valid device model
-# name" from QEMU itself, we check `-device help` up front and skip
-# with a clear message if it's missing.
-# =================================================================
-
 NVME_LOG = nvme_trace.log
 NVME_QEMU_LOG = qemu_debug_nvme.log
-# NVME_DISK_IMG объявлен выше, рядом с DISK_IMG
 
-# Evaluated once, at Makefile-parse time (not inside the recipe), so a
-# plain Make conditional can gate the whole target below. Doing this
-# check *inside* the recipe with a shell "if ... exit 0 ... fi" doesn't
-# actually work here: each recipe line runs in its own subshell, so an
-# "exit 0" from one line's "if" block only ends that line - Make just
-# moves on and runs the next recipe line regardless. Evaluating the
-# check with $(shell ...) up front and branching with ifeq avoids that
-# trap entirely.
 QEMU_HAS_NVME := $(shell qemu-system-x86_64 -device help 2>/dev/null | grep -q '"nvme"' && echo yes)
 
 run-nvme-log: iso-limine
@@ -521,6 +520,74 @@ else
 	@echo "  STDERR: $(NVME_LOG)"
 endif
 
+SMP_STRESS_CORES ?= 4
+STRESS_LOG     = qemu_stress_trace.log
+STRESS_DBG_LOG = qemu_stress_debug.log
+
+ifeq ($(QEMU_HAS_NVME),yes)
+STRESS_NVME_ARGS = -drive file=$(NVME_DISK_IMG),if=none,format=raw,id=nvmedisk0 \
+	-device nvme,serial=deadbeef,drive=nvmedisk0
+else
+STRESS_NVME_ARGS =
+endif
+
+run-stress-log: iso-limine $(DISK_IMG) $(STRESS_DISKS)
+	@echo "[STRESS UEFI] SMP ($(SMP_STRESS_CORES) cores) + AHCI + ATA + xHCI/EHCI/UHCI/OHCI"
+	@echo "[STRESS UEFI] Input spread across controllers, not duplicated on each:"
+	@echo "[STRESS UEFI]   xHCI  -> usb-mouse + usb-storage"
+	@echo "[STRESS UEFI]   EHCI  -> usb-kbd   + usb-storage"
+	@echo "[STRESS UEFI]   UHCI  -> usb-storage (no input)"
+	@echo "[STRESS UEFI]   OHCI  -> usb-storage (no input)"
+	@echo "[STRESS UEFI] So there's exactly one working keyboard and one mouse — you can control the kernel,"
+	@echo "[STRESS UEFI] but each controller is still really loaded with its own hardware, not just 'listed' in the command line."
+	@echo "[STRESS UEFI] Each controller gets its own dedicated 32 MB FAT32 disk image (no shared-file locking issues)."
+	@echo "[STRESS UEFI] The main ATA disk remains the big multi-partition disk.img."
+ifneq ($(QEMU_HAS_NVME),yes)
+	@echo "[STRESS UEFI] This QEMU build doesn't support -device nvme — NVMe skipped, rest of hardware unchanged."
+endif
+	@rm -f $(STRESS_LOG) $(STRESS_DBG_LOG)
+	@$(MAKE) --no-print-directory $(NVME_DISK_IMG)
+	qemu-system-x86_64 \
+		-machine q35 \
+		-bios $(OVMF_PATH) \
+		-cdrom $(ISO_LIMINE) \
+		-m 1024M \
+		-cpu host \
+		-enable-kvm \
+		-smp $(SMP_STRESS_CORES) \
+		-boot d \
+		-serial stdio \
+		-nodefaults \
+		-vga std \
+		-no-reboot \
+		-no-shutdown \
+		-drive file=$(DISK_IMG),if=ide,format=raw \
+		-device ich9-ahci,id=ahci0 \
+		-drive file=$(DISK_AHCI),if=none,format=raw,id=ahcidisk0 \
+		-device ide-hd,drive=ahcidisk0,bus=ahci0.0 \
+		$(STRESS_NVME_ARGS) \
+		-device qemu-xhci,id=xhci0 \
+		-drive file=$(DISK_XHCI),if=none,format=raw,id=xhcidisk0 \
+		-device usb-mouse,bus=xhci0.0 \
+		-device usb-storage,drive=xhcidisk0,bus=xhci0.0 \
+		-device usb-ehci,id=ehci0 \
+		-drive file=$(DISK_EHCI),if=none,format=raw,id=ehcidisk0 \
+		-device usb-kbd,bus=ehci0.0 \
+		-device usb-storage,drive=ehcidisk0,bus=ehci0.0 \
+		-device piix4-usb-uhci,id=uhci2 \
+		-drive file=$(DISK_UHCI),if=none,format=raw,id=uhcidisk0 \
+		-device usb-storage,drive=uhcidisk0,bus=uhci2.0 \
+		-device pci-ohci,id=ohci0 \
+		-drive file=$(DISK_OHCI),if=none,format=raw,id=ohcidisk0 \
+		-device usb-storage,drive=ohcidisk0,bus=ohci0.0 \
+		-netdev user,id=net0 \
+		-device e1000,netdev=net0 \
+		-trace "usb_*" \
+		-d guest_errors,unimp,int,cpu_reset \
+		-D $(STRESS_DBG_LOG) \
+		2>$(STRESS_LOG)
+	@echo "[STRESS UEFI] Done. Traces -> $(STRESS_LOG) | QEMU log (incl. int/cpu_reset) -> $(STRESS_DBG_LOG)"
+
 clean:
 	@echo "[CLEAN] Cleaning all build artifacts and logs..."
 	@rm -rf $(BUILD_DIR) $(KERNEL) $(ISO_LIMINE) $(ISO_DIR_LIMINE)
@@ -533,15 +600,20 @@ clean:
 		$(EHCI_LOG) $(EHCI_DBG_LOG) \
 		$(OHCI_LOG) $(OHCI_DBG_LOG) \
 		$(DISK_IMG) \
+		$(NVME_DISK_IMG) \
+		$(STRESS_DISKS) \
 		$(AHCI_LOG) \
 		$(AHCI_QEMU_LOG) \
 		$(ATA_LOG) \
 		$(ATA_QEMU_LOG) \
 		$(NVME_LOG) \
 		$(NVME_QEMU_LOG) \
-		$(NVME_DISK_IMG) \
 		$(USB_DISK_LOG) \
-		$(USB_DISK_QEMU_LOG)
+		$(USB_DISK_QEMU_LOG) \
+		$(STRESS_LOG) \
+		$(STRESS_DBG_LOG) \
+		$(SMP_LOG) \
+		$(SMP_DBG_LOG)
 	@echo "Cleanup complete."
 
 help:
@@ -554,7 +626,8 @@ help:
 	@echo "  make clean               - Remove build artifacts and logs"
 	@echo ""
 	@echo "RUN (QEMU):"
-	@echo "  make run-uefi            - Run in QEMU (UEFI mode)"
+	@echo "  make run-uefi            - Run in QEMU (UEFI mode, 1 core)"
+	@echo "  make run-uefi-smp        - Run in QEMU (UEFI mode, 4 cores, KVM, 1024M RAM)"
 	@echo "  make run-bios            - Run in QEMU (BIOS mode)"
 	@echo "  make run-bios-2ghz       - Run in BIOS mode (TCG, 2GHz, no KVM)"
 	@echo ""
@@ -574,6 +647,19 @@ help:
 	@echo "  make run-ehci-bios       - EHCI (USB 2.0) + companion UHCI"
 	@echo "  make run-ohci-bios       - PCI OHCI (USB 1.1)"
 	@echo ""
+	@echo "RUN (SMP TEST - 4 cores):"
+	@echo "  make run-uefi-smp        - Quick SMP test (UEFI, 4 cores, no extra devices)"
+	@echo ""
+	@echo "RUN (STRESS - SMP + heavy device load):"
+	@echo "  make run-stress-log      - SMP ($(SMP_STRESS_CORES) cores, override with SMP_STRESS_CORES=N)"
+	@echo "                             + AHCI + ATA/IDE + NVMe (if supported) + xHCI/EHCI/UHCI/OHCI."
+	@echo "                             Input is spread out, not duplicated on every controller:"
+	@echo "                             xHCI=mouse, EHCI=keyboard, UHCI/OHCI=storage only —"
+	@echo "                             one working kbd+mouse total, still real HW load per controller."
+	@echo "                             Each controller gets its own 32 MB FAT32 disk image."
+	@echo "                             Stresses the scheduler/SMP bring-up and every driver lock at once."
+	@echo "                             Logs -> $(STRESS_LOG) (stderr/trace) and $(STRESS_DBG_LOG) (QEMU -d incl. int/cpu_reset)"
+	@echo ""
 	@echo "DEBUG AND SOURCE:"
 	@echo "  make fullsource          - Gather all source files into one file (.c, .h, .asm)"
 	@echo "  make unpack              - Extract files from fullsource.txt"
@@ -583,6 +669,8 @@ help:
 	@echo "                             p1=FAT32, p2=exFAT, p3=ext4) for AHCI,"
 	@echo "                             ATA, and USB (xHCI/EHCI/OHCI/UHCI) tests"
 	@echo "                             (requires sudo for losetup)"
-	@echo "  make clean               - removes disk.img, nvme_disk.img, and all logs"
+	@echo "  disk_ahci/xhci/ehci/uhci/ohci.img - 32 MB FAT32 per-controller images"
+	@echo "                             for the stress test (no sudo needed)"
+	@echo "  make clean               - removes all disk images and logs"
 	@echo ""
 	@echo "================================================================="

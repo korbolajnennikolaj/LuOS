@@ -3,7 +3,7 @@
 #include <components/drivers.h>
 #include "gop_font.h"
 #include "kernel/limine.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
 #include <stddef.h>

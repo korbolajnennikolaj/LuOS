@@ -2,11 +2,11 @@
 #define DRIVERS_H
 
 #include "components/pci.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdint.h>
 
-#define MAX_DRIVERS_PER_TYPE 32
+#define MAX_DRIVERS_PER_TYPE 64
 #define AMOUNT_DRIVERS_TYPE 7
 
 #define MAX_DEVICES_PER_TYPE 64

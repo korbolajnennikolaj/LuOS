@@ -1,7 +1,7 @@
 #include "rtc_driver.h"
 
 #include "drivers/Timer/timer.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include <kernel/limine.h>
 
 #include <ports.h>

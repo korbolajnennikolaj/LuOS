@@ -1,7 +1,7 @@
 #include "drivers/Storage/partition.h"
 
 #include "components/Memory/heap.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdio.h>
 #include <string.h>

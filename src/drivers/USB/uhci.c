@@ -62,7 +62,7 @@ static void dbg_hex32(uint32_t v) { (void)v; }
 static void dbg_dec(int v) { (void)v; }
 #endif
 
-#define MAX_UHCI_CONTROLLERS 4
+#define MAX_UHCI_CONTROLLERS 32
 
 #define TD_PID_SETUP 0x2D
 #define TD_PID_IN 0x69

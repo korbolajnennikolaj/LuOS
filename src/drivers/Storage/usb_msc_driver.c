@@ -9,7 +9,7 @@
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/Video/limine_video_driver.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
 #include <stddef.h>

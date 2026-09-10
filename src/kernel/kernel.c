@@ -2,6 +2,7 @@
 
 #include "components/drivers.h"
 #include "components/panic.h"
+#include "components/GDT/gdt.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "drivers/Timer/pit_driver.h"
@@ -31,8 +32,8 @@
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/root_hub.h"
-#include "kernel/sched/sched.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/scheduler.h"
+#include "kernel/scheduler/spinlock.h"
 #include "kernel/smp/smp.h"
 #include "lua/lua.h"
 #include "lua/lualib.h"
@@ -1570,70 +1571,70 @@ static void cmd_usb_list(struct limine_video_driver* video) {
     video->printf("==============================\n", LIMINE_COLOR_CYAN);
 }
 
-#define SHEDULER_TEST_TASKS 4
-#define SHEDULER_TEST_ITERS 15
+#define SCHEDULER_TEST_TASKS 4
+#define SCHEDULER_TEST_ITERS 15
 
-static volatile long sheduler_test_counter = 0;
-static spinlock_t sheduler_test_lock = SPINLOCK_INIT;
-static volatile int sheduler_test_done = 0;
-static volatile uint8_t sheduler_test_core_seen[MAX_CORES];
+static volatile long scheduler_test_counter = 0;
+static spinlock_t scheduler_test_lock = SPINLOCK_INIT;
+static volatile int scheduler_test_done = 0;
+static volatile uint8_t scheduler_test_core_seen[MAX_CORES];
 
-static void sheduler_test_worker(void *arg) {
+static void scheduler_test_worker(void *arg) {
     long id = (long)arg;
 
-    for (int i = 0; i < SHEDULER_TEST_ITERS; i++) {
-        spin_lock(&sheduler_test_lock);
-        sheduler_test_counter++;
-        spin_unlock(&sheduler_test_lock);
+    for (int i = 0; i < SCHEDULER_TEST_ITERS; i++) {
+        spin_lock(&scheduler_test_lock);
+        scheduler_test_counter++;
+        spin_unlock(&scheduler_test_lock);
 
-        sheduler_test_core_seen[current_core()] = 1;
+        scheduler_test_core_seen[current_core()] = 1;
 
         printf_color(LIMINE_COLOR_AMBER,
-                     "[sheduler-test] task %d iter %d/%d on core %d (tid=%d)\n",
-                     (int)id, i + 1, SHEDULER_TEST_ITERS, current_core(),
+                     "[scheduler-test] task %d iter %d/%d on core %d (tid=%d)\n",
+                     (int)id, i + 1, SCHEDULER_TEST_ITERS, current_core(),
                      (int)current_task()->tid);
 
-        sched_sleep_ms(30);
+        scheduler_sleep_ms(30);
     }
 
-    __atomic_fetch_add(&sheduler_test_done, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&scheduler_test_done, 1, __ATOMIC_SEQ_CST);
     task_exit();
 }
 
-static void cmd_sheduler_test(struct limine_video_driver *video)
+static void cmd_scheduler_test(struct limine_video_driver *video)
 {
-    video->printf("\n=== Sheduler Test ===\n", LIMINE_COLOR_CYAN);
-    printf_color(LIMINE_COLOR_LIGHT_GRAY, " cores online: %d\n", sched_core_count());
+    video->printf("\n=== Scheduler Test ===\n", LIMINE_COLOR_CYAN);
+    printf_color(LIMINE_COLOR_LIGHT_GRAY, " cores online: %d\n", scheduler_core_count());
     printf_color(LIMINE_COLOR_LIGHT_GRAY, " spawning %d tasks, %d iterations each...\n\n",
-                 SHEDULER_TEST_TASKS, SHEDULER_TEST_ITERS);
+                 SCHEDULER_TEST_TASKS, SCHEDULER_TEST_ITERS);
 
-    sheduler_test_counter = 0;
-    sheduler_test_done = 0;
-    for (int i = 0; i < MAX_CORES; i++) sheduler_test_core_seen[i] = 0;
+    scheduler_test_counter = 0;
+    scheduler_test_done = 0;
+    for (int i = 0; i < MAX_CORES; i++) scheduler_test_core_seen[i] = 0;
 
-    for (long i = 0; i < SHEDULER_TEST_TASKS; i++) {
+    for (long i = 0; i < SCHEDULER_TEST_TASKS; i++) {
         char name[16];
         snprintf(name, sizeof(name), "shed-test%d", (int)i);
-        task_create(name, sheduler_test_worker, (void *)i, PRIO_DEFAULT);
+        task_create(name, scheduler_test_worker, (void *)i, PRIO_DEFAULT);
     }
 
-    while (__atomic_load_n(&sheduler_test_done, __ATOMIC_SEQ_CST) < SHEDULER_TEST_TASKS)
-        sched_yield();
+    while (__atomic_load_n(&scheduler_test_done, __ATOMIC_SEQ_CST) < SCHEDULER_TEST_TASKS)
+        scheduler_yield();
 
-    long expected = (long)SHEDULER_TEST_TASKS * SHEDULER_TEST_ITERS;
+    long expected = (long)SCHEDULER_TEST_TASKS * SCHEDULER_TEST_ITERS;
 
     video->printf("\n", 0);
     printf_color(LIMINE_COLOR_WHITE, " counter = %d (expected %d) -> ",
-                 (int)sheduler_test_counter, (int)expected);
+                 (int)scheduler_test_counter, (int)expected);
 
-    if (sheduler_test_counter == expected)
+    if (scheduler_test_counter == expected)
         video->printf("PASS\n", LIMINE_COLOR_LIGHT_GREEN);
     else
         video->printf("FAIL (lost updates under concurrency)\n", LIMINE_COLOR_LIGHT_RED);
 
     printf_color(LIMINE_COLOR_LIGHT_GRAY, " cores that actually ran a task: ");
     for (int i = 0; i < MAX_CORES; i++) {
-        if (sheduler_test_core_seen[i])
+        if (scheduler_test_core_seen[i])
             printf_color(LIMINE_COLOR_AMBER, "%d ", i);
     }
     video->printf("\n======================\n\n", LIMINE_COLOR_CYAN);
@@ -2454,6 +2455,8 @@ static void cmd_fastfetch(struct limine_video_driver* video) {
 }
 
 void _start(void) {
+    init_gdt();
+
     fpu_init();
     pmm_init();
     vmm_init();
@@ -2473,9 +2476,9 @@ void _start(void) {
 
     init_drivers();
 
-    sched_init();
+    scheduler_init();
     smp_init();
-    sched_start();
+    scheduler_start();
 
 #ifdef PANIC_BOOT_TEST
     {
@@ -2597,7 +2600,7 @@ void _start(void) {
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "usb           - USB controllers", "usb-ports     - root hub ports");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "kbd-test      - keyboard test", "mouse-test    - mouse test (5s)");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "hid-test      - kbd+mouse test (15s)", "hpet          - HPET info/self-test");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "sheduler-test - scheduler/multitask test", "guess-game    - guess the number");
+            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "scheduler-test - scheduler/multitask test", "guess-game    - guess the number");
 
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Lua / Python --\n");
             printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "lua-test      - Lua test suite", "lua-kernel-test - kernel.* bindings");
@@ -2682,7 +2685,7 @@ void _start(void) {
         else if (str_cmp(cmd_buffer, "kbd-test") == 0) { cmd_kbd_test(video, kbd); }
         else if (str_cmp(cmd_buffer, "mouse-test") == 0) { cmd_mouse_test(video, mouse, tsc); }
         else if (str_cmp(cmd_buffer, "hid-test") == 0) { cmd_hid_test(video, kbd, mouse, tsc); }
-        else if (str_cmp(cmd_buffer, "sheduler-test") == 0) { cmd_sheduler_test(video); }
+        else if (str_cmp(cmd_buffer, "scheduler-test") == 0) { cmd_scheduler_test(video); }
         else if (str_cmp(cmd_buffer, "hpet") == 0) { cmd_hpet(video); }
 
         else if (str_cmp(cmd_buffer, "lua-test") == 0) { cmd_lua_test(video); }

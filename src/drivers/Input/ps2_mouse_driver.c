@@ -3,7 +3,7 @@
 #include "components/drivers.h"
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include "mouse_driver.h"
 
 #include <ports.h>

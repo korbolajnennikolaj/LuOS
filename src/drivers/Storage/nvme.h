@@ -4,13 +4,13 @@
 #include "block_device.h"
 #include "components/drivers.h"
 #include "components/pci.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 
-#define NVME_MAX_CONTROLLERS 4
-#define NVME_MAX_DISKS 8
+#define NVME_MAX_CONTROLLERS 16
+#define NVME_MAX_DISKS 32
 
 #define NVME_IO_QUEUE_ID 1
 #define NVME_ADMIN_QUEUE_ID 0

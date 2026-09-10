@@ -1,7 +1,7 @@
 #ifndef USB_EVENT_H
 #define USB_EVENT_H
 
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
 #include <stdint.h>

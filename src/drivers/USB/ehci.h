@@ -2,12 +2,12 @@
 #define EHCI_H
 
 #include "drivers/Timer/tsc_driver.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include "usb_controller.h"
 
 #include <stdint.h>
 
-#define MAX_EHCI_CONTROLLERS 8
+#define MAX_EHCI_CONTROLLERS 32
 
 #define EHCI_CAPLENGTH 0x00
 #define EHCI_HCSPARAMS 0x04

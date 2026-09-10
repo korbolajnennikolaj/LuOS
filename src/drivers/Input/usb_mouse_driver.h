@@ -17,7 +17,7 @@
 #define HID_SET_IDLE 0x0A
 #define HID_SET_PROTOCOL 0x0B
 
-#define MAX_USB_MICE 4
+#define MAX_USB_MICE 16
 
 typedef struct usb_mouse_state {
     int32_t x;

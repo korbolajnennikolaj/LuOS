@@ -28,7 +28,7 @@
 #define LOAD_BARRIER() asm volatile("lfence" ::: "memory")
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
 
-#define MAX_XHCI_CONTROLLERS 8
+#define MAX_XHCI_CONTROLLERS 32
 #define TRB_RING_SIZE 256
 #define MAX_SLOTS 64
 #define ERDP_WITH_EHB(pa) ((pa) | (1ULL << 3))

@@ -1,6 +1,6 @@
 #ifndef XHCI_H
 #define XHCI_H
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdint.h>
 

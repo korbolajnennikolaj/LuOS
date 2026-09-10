@@ -2,7 +2,7 @@
 
 #include "components/drivers.h"
 #include "drivers/Video/limine_video_driver.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stddef.h>
 

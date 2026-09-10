@@ -5,13 +5,13 @@
 #include "block_device.h"
 #include "components/drivers.h"
 #include "components/pci.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #define AHCI_MAX_PORTS 32
-#define AHCI_MAX_DISKS 8
+#define AHCI_MAX_DISKS 32
 #define AHCI_CMD_SLOTS 32
 
 #define HBA_PORT_SIZE 0x80

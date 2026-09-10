@@ -1,6 +1,6 @@
-#include "kernel/sched/sched.h"
+#include "kernel/scheduler/scheduler.h"
 
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include "drivers/Timer/apic_driver.h"
 #include "components/Memory/heap.h"
 #include "components/Interruptions/isr.h"
@@ -27,16 +27,16 @@ static spinlock_t g_rq_lock = SPINLOCK_INIT;
 static uint8_t g_lapic_to_core[256];
 static int g_core_count = 1;
 
-void sched_register_core(uint8_t lapic_id, int logical_id) {
+void scheduler_register_core(uint8_t lapic_id, int logical_id) {
     g_lapic_to_core[lapic_id] = (uint8_t)logical_id;
     if (logical_id + 1 > g_core_count) g_core_count = logical_id + 1;
 }
 
-int sched_core_count(void) {
+int scheduler_core_count(void) {
     return g_core_count;
 }
 
-static void sched_yield_isr(struct registers *regs);
+static void scheduler_yield_isr(struct registers *regs);
 
 int current_core(void) {
     return g_lapic_to_core[apic_get_lapic_id()];
@@ -96,17 +96,17 @@ static void idle_entry(void *arg) {
         asm volatile("hlt");
 }
 
-void sched_init(void) {
+void scheduler_init(void) {
     for (int c = 0; c < MAX_CORES; c++) {
         memset(&g_rq[c], 0, sizeof(struct rq));
     }
     spin_lock_init(&g_tasks_lock);
     spin_lock_init(&g_rq_lock);
-    sched_register_core(apic_get_lapic_id(), 0);
-    irq_register_handler(SCHED_YIELD_VECTOR, sched_yield_isr);
+    scheduler_register_core(apic_get_lapic_id(), 0);
+    irq_register_handler(SCHEDULER_YIELD_VECTOR, scheduler_yield_isr);
 }
 
-void sched_start(void) {
+void scheduler_start(void) {
     int core = current_core();
 
     struct task *main_task = kmalloc(sizeof(struct task));
@@ -161,7 +161,7 @@ void task_trampoline(void) {
 void task_exit(void) {
     struct task *t = current_task();
     t->state = TASK_ZOMBIE;
-    sched_yield();
+    scheduler_yield();
     for (;;)
         asm volatile("hlt");
 }
@@ -203,7 +203,7 @@ static void reschedule(int core, struct registers *regs) {
     spin_unlock(&g_rq_lock);
 }
 
-void sched_tick(struct registers *regs) {
+void scheduler_tick(struct registers *regs) {
     g_ticks++;
 
     spin_lock(&g_tasks_lock);
@@ -229,29 +229,29 @@ void sched_tick(struct registers *regs) {
     reschedule(core, regs);
 }
 
-static void sched_yield_isr(struct registers *regs) {
+static void scheduler_yield_isr(struct registers *regs) {
     reschedule(current_core(), regs);
 }
 
-void sched_yield(void) {
+void scheduler_yield(void) {
     asm volatile("int $0x41");
 }
 
-void sched_sleep_ms(uint64_t ms) {
+void scheduler_sleep_ms(uint64_t ms) {
     struct task *t = current_task();
     t->wake_tick = g_ticks + ms;
     t->state = TASK_SLEEPING;
-    sched_yield();
+    scheduler_yield();
 }
 
-void sched_block(void *channel) {
+void scheduler_block(void *channel) {
     struct task *t = current_task();
     t->wait_channel = channel;
     t->state = TASK_BLOCKED;
-    sched_yield();
+    scheduler_yield();
 }
 
-void sched_wake(void *channel) {
+void scheduler_wake(void *channel) {
     spin_lock(&g_tasks_lock);
     for (int i = 0; i < g_task_count; i++) {
         struct task *t = g_tasks[i];
@@ -266,7 +266,7 @@ void sched_wake(void *channel) {
     spin_unlock(&g_tasks_lock);
 }
 
-void sched_wake_all(void *channel) {
+void scheduler_wake_all(void *channel) {
     spin_lock(&g_tasks_lock);
     for (int i = 0; i < g_task_count; i++) {
         struct task *t = g_tasks[i];

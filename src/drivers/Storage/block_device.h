@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MAX_BLOCK_DEVICES 16
+#define MAX_BLOCK_DEVICES 64
 
 enum STORAGE_TYPE
 {

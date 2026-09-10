@@ -1,7 +1,7 @@
 #ifndef UHCI_H
 #define UHCI_H
 
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include "usb_controller.h"
 
 #include <stdint.h>

@@ -1,5 +1,7 @@
 #include "heap.h"
 
+#include "kernel/scheduler/spinlock.h"
+
 #include <stddef.h>
 
 #define ALIGN 16UL
@@ -40,6 +42,7 @@ static rb_root_t addr_root;
 static rb_root_t size_root;
 static size_t heap_used = 0;
 static size_t heap_total = 0;
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 size_t heap_get_used(void) { return heap_used; }
 size_t heap_get_total(void) { return heap_total; }
@@ -409,7 +412,7 @@ void heap_init(uintptr_t addr, size_t size)
     size_insert(b);
 }
 
-void* kmalloc(size_t size)
+static void* kmalloc_impl(size_t size)
 {
     if (size == 0) return NULL;
 
@@ -429,7 +432,15 @@ void* kmalloc(size_t size)
     return BLOCK_DATA(b);
 }
 
-void kfree(void* ptr)
+void* kmalloc(size_t size)
+{
+    spin_lock(&heap_lock);
+    void *p = kmalloc_impl(size);
+    spin_unlock(&heap_lock);
+    return p;
+}
+
+static void kfree_impl(void* ptr)
 {
     if (!ptr) return;
 
@@ -460,12 +471,21 @@ void kfree(void* ptr)
     size_insert(b);
 }
 
+void kfree(void* ptr)
+{
+    spin_lock(&heap_lock);
+    kfree_impl(ptr);
+    spin_unlock(&heap_lock);
+}
+
 void* krealloc(void* ptr, size_t size)
 {
     if (!ptr) return kmalloc(size);
     if (size == 0) { kfree(ptr); return NULL; }
 
     size = ALIGN_UP(size);
+
+    spin_lock(&heap_lock);
 
     block_t *b = DATA_BLOCK(ptr);
 
@@ -476,6 +496,7 @@ void* krealloc(void* ptr, size_t size)
             block_split(b, size);
             heap_used -= (old_size - b->size);
         }
+        spin_unlock(&heap_lock);
         return ptr;
     }
 
@@ -493,12 +514,13 @@ void* krealloc(void* ptr, size_t size)
             if (b->size >= size + BLOCK_SIZE + MIN_SPLIT)
                 block_split(b, size);
             heap_used += b->size;
+            spin_unlock(&heap_lock);
             return ptr;
         }
     }
 
-    void *new_ptr = kmalloc(size);
-    if (!new_ptr) return NULL;
+    void *new_ptr = kmalloc_impl(size);
+    if (!new_ptr) { spin_unlock(&heap_lock); return NULL; }
 
     unsigned char *src = (unsigned char*)ptr;
     unsigned char *dst = (unsigned char*)new_ptr;
@@ -506,6 +528,7 @@ void* krealloc(void* ptr, size_t size)
     for (size_t i = 0; i < copy_sz; i++)
         dst[i] = src[i];
 
-    kfree(ptr);
+    kfree_impl(ptr);
+    spin_unlock(&heap_lock);
     return new_ptr;
 }

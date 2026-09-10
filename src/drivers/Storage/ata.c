@@ -6,7 +6,7 @@
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "drivers/Video/limine_video_driver.h"
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <ports.h>
 #include <stddef.h>

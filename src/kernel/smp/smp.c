@@ -2,9 +2,10 @@
 
 #include "kernel/limine.h"
 #include "components/Memory/heap.h"
+#include "components/GDT/gdt.h"
 #include "components/Interruptions/idt.h"
 #include "drivers/Timer/apic_driver.h"
-#include "kernel/sched/sched.h"
+#include "kernel/scheduler/scheduler.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -20,15 +21,16 @@ static uint32_t total_cpus = 1;
 void ap_main(struct limine_smp_info *info) {
     (void)info;
 
+    load_gdt();
     load_idt();
     apic_enable_this_core();
 
     uint32_t logical = __atomic_fetch_add(&next_logical_id, 1, __ATOMIC_SEQ_CST);
-    sched_register_core(apic_get_lapic_id(), (int)logical);
+    scheduler_register_core(apic_get_lapic_id(), (int)logical);
 
     __atomic_fetch_add(&cpus_online, 1, __ATOMIC_SEQ_CST);
 
-    sched_start();
+    scheduler_start();
 
     asm volatile("sti");
     for (;;)

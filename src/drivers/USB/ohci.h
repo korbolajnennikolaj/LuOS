@@ -1,7 +1,7 @@
 #ifndef OHCI_H
 #define OHCI_H
 
-#include "kernel/sched/spinlock.h"
+#include "kernel/scheduler/spinlock.h"
 #include "usb_controller.h"
 
 #include <stdint.h>
@@ -9,7 +9,7 @@
 struct tsc_driver;
 struct usb_device;
 
-#define MAX_OHCI_CONTROLLERS 8
+#define MAX_OHCI_CONTROLLERS 32
 
 #define OHCI_HcRevision 0x00
 #define OHCI_HcControl 0x04

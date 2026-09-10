@@ -8,7 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define USB_MSC_MAX_DEVICES 8
+#define USB_MSC_MAX_DEVICES 32
 
 #define USB_CLASS_MSC 0x08
 #define USB_SUBCLASS_SCSI 0x06

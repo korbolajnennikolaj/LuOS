@@ -1,10 +1,13 @@
 #include "pmm.h"
 
 #include "kernel/limine.h"
+#include "kernel/scheduler/spinlock.h"
 
 extern volatile struct limine_memmap_request memmap_req;
 extern volatile struct limine_hhdm_request hhdm_req;
 extern volatile struct limine_kernel_address_request kernel_address_request;
+
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 #define BITS_PER_ENTRY 64ULL
 #define BITMAP_ENTRY_T uint64_t
@@ -132,7 +135,7 @@ void pmm_init(void) {
     pmm_last_idx = 0;
 }
 
-uint64_t pmm_alloc_page(void) {
+static uint64_t pmm_alloc_page_impl(void) {
     if (!pmm_bitmap || pmm_free == 0) return PMM_ALLOC_FAIL;
 
     uint64_t entries = (pmm_total + BITS_PER_ENTRY - 1) / BITS_PER_ENTRY;
@@ -163,9 +166,23 @@ uint64_t pmm_alloc_page(void) {
     return PMM_ALLOC_FAIL;
 }
 
+uint64_t pmm_alloc_page(void) {
+    spin_lock(&pmm_lock);
+    uint64_t p = pmm_alloc_page_impl();
+    spin_unlock(&pmm_lock);
+    return p;
+}
+
 uint64_t pmm_alloc_pages(uint64_t count) {
     if (!pmm_bitmap || count == 0 || pmm_free < count) return PMM_ALLOC_FAIL;
-    if (count == 1) return pmm_alloc_page();
+
+    spin_lock(&pmm_lock);
+
+    if (count == 1) {
+        uint64_t p = pmm_alloc_page_impl();
+        spin_unlock(&pmm_lock);
+        return p;
+    }
 
     uint64_t consecutive = 0;
     uint64_t start_frame = 0;
@@ -180,6 +197,7 @@ uint64_t pmm_alloc_pages(uint64_t count) {
                     _bitmap_set(i);
                 pmm_free -= count;
                 pmm_last_idx = (start_frame + count) / BITS_PER_ENTRY;
+                spin_unlock(&pmm_lock);
                 return PAGE_TO_PHYS(start_frame);
             }
         } else {
@@ -187,10 +205,11 @@ uint64_t pmm_alloc_pages(uint64_t count) {
         }
     }
 
+    spin_unlock(&pmm_lock);
     return PMM_ALLOC_FAIL;
 }
 
-void pmm_free_page(uint64_t phys) {
+static void pmm_free_page_impl(uint64_t phys) {
     if (!pmm_bitmap || phys == 0) return;
     uint64_t frame = PHYS_TO_PAGE(PAGE_ALIGN_DOWN(phys));
     if (frame >= pmm_total) return;
@@ -203,9 +222,17 @@ void pmm_free_page(uint64_t phys) {
     }
 }
 
+void pmm_free_page(uint64_t phys) {
+    spin_lock(&pmm_lock);
+    pmm_free_page_impl(phys);
+    spin_unlock(&pmm_lock);
+}
+
 void pmm_free_pages(uint64_t phys, uint64_t count) {
+    spin_lock(&pmm_lock);
     for (uint64_t i = 0; i < count; i++)
-        pmm_free_page(phys + i * PAGE_SIZE);
+        pmm_free_page_impl(phys + i * PAGE_SIZE);
+    spin_unlock(&pmm_lock);
 }
 
 uint64_t pmm_total_pages(void) { return pmm_usable_total; }
