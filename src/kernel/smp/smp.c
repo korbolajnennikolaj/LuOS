@@ -13,6 +13,7 @@
 #define AP_STACK_SIZE (32 * 1024)
 
 extern struct limine_smp_request* get_smp_request(void);
+extern uint64_t vmm_kernel_pml4(void);
 
 static volatile uint32_t cpus_online = 1;
 static volatile uint32_t next_logical_id = 1;
@@ -39,7 +40,15 @@ void ap_main(struct limine_smp_info *info) {
 
 __attribute__((naked)) static void ap_trampoline(struct limine_smp_info *info __attribute__((unused))) {
     asm volatile(
-        "mov 24(%rdi), %rsp\n\t"
+        "push %rdi\n\t"
+        "push %rax\n\t"         
+        "call vmm_kernel_pml4\n\t"
+        "mov %rax, %rcx\n\t"
+        "pop %rax\n\t"
+        "pop %rdi\n\t"
+        "mov %rcx, %cr3\n\t"    
+
+        "mov 24(%rdi), %rsp\n\t" 
         "jmp ap_main\n\t"
     );
 }
