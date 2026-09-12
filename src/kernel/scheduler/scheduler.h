@@ -14,6 +14,7 @@ void scheduler_init(void);
 void scheduler_start(void);
 
 struct task *task_create(const char *name, void (*entry)(void *), void *arg, int priority);
+struct task *task_create_on_core(const char *name, void (*entry)(void *), void *arg, int priority, int core);
 void task_exit(void);
 
 void scheduler_tick(struct registers *regs);

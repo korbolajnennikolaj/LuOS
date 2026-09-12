@@ -7,6 +7,9 @@
 
 #include "drivers/Video/limine_video_driver.h"
 #include "components/drivers.h"
+#include "kernel/scheduler/spinlock.h"
+
+static spinlock_t stdio_out_lock = SPINLOCK_INIT;
 
 stdio_stream_t stdio_streams[STDIO_MAX_STREAMS] = {0};
 
@@ -371,7 +374,10 @@ int vprintf_stream(int stream_idx, uint32_t color, const char *fmt, va_list ap)
         .stream = stream_idx,
         .color = color
     };
-    return _vformat(&ctx, fmt, ap);
+    uint64_t flags = spin_lock_irqsave(&stdio_out_lock);
+    int n = _vformat(&ctx, fmt, ap);
+    spin_unlock_irqrestore(&stdio_out_lock, flags);
+    return n;
 }
 
 int fprintf_stream(int stream_idx, uint32_t color, const char *fmt, ...) {
@@ -402,8 +408,11 @@ int puts(const char *s) {
 int putchar(int c) {
     char buf[2] = { (char)c, '\0' };
     stdio_stream_t *st = &stdio_streams[STDIO_STREAM_STDOUT];
-    if (st->active && st->write)
+    if (st->active && st->write) {
+        uint64_t flags = spin_lock_irqsave(&stdio_out_lock);
         st->write(buf, st->default_color);
+        spin_unlock_irqrestore(&stdio_out_lock, flags);
+    }
     return c;
 }
 

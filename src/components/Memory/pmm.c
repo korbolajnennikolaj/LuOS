@@ -167,20 +167,20 @@ static uint64_t pmm_alloc_page_impl(void) {
 }
 
 uint64_t pmm_alloc_page(void) {
-    spin_lock(&pmm_lock);
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
     uint64_t p = pmm_alloc_page_impl();
-    spin_unlock(&pmm_lock);
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return p;
 }
 
 uint64_t pmm_alloc_pages(uint64_t count) {
     if (!pmm_bitmap || count == 0 || pmm_free < count) return PMM_ALLOC_FAIL;
 
-    spin_lock(&pmm_lock);
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
 
     if (count == 1) {
         uint64_t p = pmm_alloc_page_impl();
-        spin_unlock(&pmm_lock);
+        spin_unlock_irqrestore(&pmm_lock, flags);
         return p;
     }
 
@@ -197,7 +197,7 @@ uint64_t pmm_alloc_pages(uint64_t count) {
                     _bitmap_set(i);
                 pmm_free -= count;
                 pmm_last_idx = (start_frame + count) / BITS_PER_ENTRY;
-                spin_unlock(&pmm_lock);
+                spin_unlock_irqrestore(&pmm_lock, flags);
                 return PAGE_TO_PHYS(start_frame);
             }
         } else {
@@ -205,7 +205,7 @@ uint64_t pmm_alloc_pages(uint64_t count) {
         }
     }
 
-    spin_unlock(&pmm_lock);
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return PMM_ALLOC_FAIL;
 }
 
@@ -223,16 +223,16 @@ static void pmm_free_page_impl(uint64_t phys) {
 }
 
 void pmm_free_page(uint64_t phys) {
-    spin_lock(&pmm_lock);
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
     pmm_free_page_impl(phys);
-    spin_unlock(&pmm_lock);
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 void pmm_free_pages(uint64_t phys, uint64_t count) {
-    spin_lock(&pmm_lock);
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
     for (uint64_t i = 0; i < count; i++)
         pmm_free_page_impl(phys + i * PAGE_SIZE);
-    spin_unlock(&pmm_lock);
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 uint64_t pmm_total_pages(void) { return pmm_usable_total; }

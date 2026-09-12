@@ -434,9 +434,9 @@ static void* kmalloc_impl(size_t size)
 
 void* kmalloc(size_t size)
 {
-    spin_lock(&heap_lock);
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
     void *p = kmalloc_impl(size);
-    spin_unlock(&heap_lock);
+    spin_unlock_irqrestore(&heap_lock, flags);
     return p;
 }
 
@@ -473,9 +473,9 @@ static void kfree_impl(void* ptr)
 
 void kfree(void* ptr)
 {
-    spin_lock(&heap_lock);
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
     kfree_impl(ptr);
-    spin_unlock(&heap_lock);
+    spin_unlock_irqrestore(&heap_lock, flags);
 }
 
 void* krealloc(void* ptr, size_t size)
@@ -485,7 +485,7 @@ void* krealloc(void* ptr, size_t size)
 
     size = ALIGN_UP(size);
 
-    spin_lock(&heap_lock);
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
 
     block_t *b = DATA_BLOCK(ptr);
 
@@ -496,7 +496,7 @@ void* krealloc(void* ptr, size_t size)
             block_split(b, size);
             heap_used -= (old_size - b->size);
         }
-        spin_unlock(&heap_lock);
+        spin_unlock_irqrestore(&heap_lock, flags);
         return ptr;
     }
 
@@ -514,13 +514,13 @@ void* krealloc(void* ptr, size_t size)
             if (b->size >= size + BLOCK_SIZE + MIN_SPLIT)
                 block_split(b, size);
             heap_used += b->size;
-            spin_unlock(&heap_lock);
+            spin_unlock_irqrestore(&heap_lock, flags);
             return ptr;
         }
     }
 
     void *new_ptr = kmalloc_impl(size);
-    if (!new_ptr) { spin_unlock(&heap_lock); return NULL; }
+    if (!new_ptr) { spin_unlock_irqrestore(&heap_lock, flags); return NULL; }
 
     unsigned char *src = (unsigned char*)ptr;
     unsigned char *dst = (unsigned char*)new_ptr;
@@ -529,6 +529,6 @@ void* krealloc(void* ptr, size_t size)
         dst[i] = src[i];
 
     kfree_impl(ptr);
-    spin_unlock(&heap_lock);
+    spin_unlock_irqrestore(&heap_lock, flags);
     return new_ptr;
 }

@@ -1615,7 +1615,8 @@ static void cmd_scheduler_test(struct limine_video_driver *video)
     for (long i = 0; i < SCHEDULER_TEST_TASKS; i++) {
         char name[16];
         snprintf(name, sizeof(name), "shed-test%d", (int)i);
-        task_create(name, scheduler_test_worker, (void *)i, PRIO_DEFAULT);
+        int target_core = (int)(i % scheduler_core_count());
+        task_create_on_core(name, scheduler_test_worker, (void *)i, PRIO_DEFAULT, target_core);
     }
 
     while (__atomic_load_n(&scheduler_test_done, __ATOMIC_SEQ_CST) < SCHEDULER_TEST_TASKS)

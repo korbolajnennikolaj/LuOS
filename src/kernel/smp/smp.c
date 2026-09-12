@@ -6,6 +6,7 @@
 #include "components/Interruptions/idt.h"
 #include "drivers/Timer/apic_driver.h"
 #include "kernel/scheduler/scheduler.h"
+#include <math.h>
 
 #include <stdint.h>
 #include <stddef.h>
@@ -24,6 +25,7 @@ void ap_main(struct limine_smp_info *info) {
 
     load_gdt();
     load_idt();
+    fpu_init();
     apic_enable_this_core();
 
     uint32_t logical = __atomic_fetch_add(&next_logical_id, 1, __ATOMIC_SEQ_CST);
@@ -41,14 +43,14 @@ void ap_main(struct limine_smp_info *info) {
 __attribute__((naked)) static void ap_trampoline(struct limine_smp_info *info __attribute__((unused))) {
     asm volatile(
         "push %rdi\n\t"
-        "push %rax\n\t"         
+        "push %rax\n\t"
         "call vmm_kernel_pml4\n\t"
         "mov %rax, %rcx\n\t"
         "pop %rax\n\t"
         "pop %rdi\n\t"
-        "mov %rcx, %cr3\n\t"    
+        "mov %rcx, %cr3\n\t"
 
-        "mov 24(%rdi), %rsp\n\t" 
+        "mov 24(%rdi), %rsp\n\t"
         "jmp ap_main\n\t"
     );
 }

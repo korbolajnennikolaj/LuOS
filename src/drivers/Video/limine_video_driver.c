@@ -195,9 +195,9 @@ static void limine_video_char_at_raw(char c, uint32_t color, uint16_t cx, uint16
 
 static void limine_video_char_at(char c, uint32_t color, uint16_t cx, uint16_t cy)
 {
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     limine_video_char_at_raw(c, color, cx, cy);
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 static void draw_cursor_shape(uint32_t color) {
@@ -209,7 +209,7 @@ static void draw_cursor_shape(uint32_t color) {
 
 static void limine_video_clear(uint32_t color)
 {
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
 
     current_bg_color = color;
     size_t total_px = (size_t)(screen_height * phys_pitch) >> 2;
@@ -223,7 +223,7 @@ static void limine_video_clear(uint32_t color)
 
     cursor_x = cursor_y = 0;
 
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 static void limine_video_scroll(void)
@@ -258,7 +258,7 @@ static void limine_video_scroll(void)
 
 static void limine_video_printf(const char* string, uint32_t color)
 {
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
 
     draw_cursor_shape(current_bg_color);
     while (*string) {
@@ -283,37 +283,37 @@ static void limine_video_printf(const char* string, uint32_t color)
     }
     draw_cursor_shape(color);
 
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 static void limine_video_set_cursor_visible(bool visible) {
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     if (!visible) draw_cursor_shape(current_bg_color);
     cursor_enabled = visible;
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 static void limine_video_set_cursor_pos(uint32_t x, uint32_t y) {
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     draw_cursor_shape(current_bg_color);
     if (x < max_chars_x) cursor_x = x;
     if (y < max_chars_y) cursor_y = y;
     draw_cursor_shape(LIMINE_COLOR_WHITE);
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 static void limine_video_get_display_resolution(uint64_t* w, uint64_t* h) {
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
     if (w) *w = phys_width;
     if (h) *h = phys_height;
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
 }
 
 static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
     if (!width || width > phys_width) return false;
     if (!height || height > phys_height) return false;
 
-    spin_lock(&video_lock);
+    uint64_t flags = spin_lock_irqsave(&video_lock);
 
     screen_width = width;
     screen_height = height;
@@ -323,7 +323,7 @@ static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
 
     scroll_cache_init();
 
-    spin_unlock(&video_lock);
+    spin_unlock_irqrestore(&video_lock, flags);
     return true;
 }
 

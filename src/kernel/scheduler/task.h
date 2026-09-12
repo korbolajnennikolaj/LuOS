@@ -32,6 +32,7 @@ struct task {
     void *arg;
     uint64_t wake_tick;
     void *wait_channel;
+    int core;
     struct task *next;
 };
 
