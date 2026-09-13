@@ -66,14 +66,14 @@ static int usb_iso_transfer(struct usb_device *dev, uint8_t endpoint, void *data
 static spinlock_t usb_core_lock = SPINLOCK_INIT;
 
 static int usb_reserve_slot(void) {
-    spin_lock(&usb_core_lock);
+    uint64_t flags = spin_lock_irqsave(&usb_core_lock);
     int slot = -1;
     for (int i = 0; i < usb_device_count; i++) {
         if (!usb_device_pool[i].valid) { slot = i; break; }
     }
     if (slot < 0 && usb_device_count < MAX_USB_DEVICES) slot = usb_device_count;
     if (slot >= 0) usb_device_pool[slot].valid = 1;
-    spin_unlock(&usb_core_lock);
+    spin_unlock_irqrestore(&usb_core_lock, flags);
     return slot;
 }
 
@@ -121,10 +121,10 @@ void usb_core_remove_device(struct usb_device *dev) {
         }
     }
 
-    spin_lock(&usb_core_lock);
+    { uint64_t flags = spin_lock_irqsave(&usb_core_lock);
     dev->valid = 0;
     device_table[USB_DEVICE][slot] = NULL;
-    spin_unlock(&usb_core_lock);
+    spin_unlock_irqrestore(&usb_core_lock, flags); }
     s_poll_pending[slot] = false;
     s_bulk_poll_pending[slot] = false;
     s_iso_poll_pending[slot] = false;
@@ -1066,11 +1066,11 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     s_iso_poll_pending[slot] = false;
     for (int i = 0; i < POLL_BULK_BUF_SIZE; i++) s_bulk_poll_buf[slot][i] = 0;
 
-    spin_lock(&usb_core_lock);
+    { uint64_t flags = spin_lock_irqsave(&usb_core_lock);
     dev->valid = 1;
     device_table[USB_DEVICE][slot] = dev;
     if (slot == usb_device_count) usb_device_count++;
-    spin_unlock(&usb_core_lock);
+    spin_unlock_irqrestore(&usb_core_lock, flags); }
 
     usb_event_t conn_evt = {
         .type = USB_EVENT_DEVICE_CONN,
@@ -1091,9 +1091,9 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     return;
 
 fail:
-    spin_lock(&usb_core_lock);
+    { uint64_t flags = spin_lock_irqsave(&usb_core_lock);
     dev->valid = 0;
-    spin_unlock(&usb_core_lock);
+    spin_unlock_irqrestore(&usb_core_lock, flags); }
 }
 
 void usb_scan_all(void) {

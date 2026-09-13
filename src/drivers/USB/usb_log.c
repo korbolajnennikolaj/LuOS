@@ -126,8 +126,10 @@ static uint16_t strwidth(const char *s) {
     return n;
 }
 
+static uint64_t s_row_lock_flags;
+
 void usb_logrow_begin(usb_log_tag tag, usb_log_level lvl) {
-    spin_lock(&log_lock);
+    s_row_lock_flags = spin_lock_irqsave(&log_lock);
     if ((unsigned)tag >= USB_LOG_TAG_COUNT) tag = USB_LOG_CORE;
     s_row_col = 0;
     s_row_muted = ((unsigned)lvl < (unsigned)s_min_level);
@@ -182,11 +184,11 @@ void usb_logrow_pad(uint16_t col) {
 }
 
 void usb_logrow_end(void) {
-    if (s_row_muted) { s_row_muted = 0; s_row_col = 0; spin_unlock(&log_lock); return; }
+    if (s_row_muted) { s_row_muted = 0; s_row_col = 0; spin_unlock_irqrestore(&log_lock, s_row_lock_flags); return; }
     struct limine_video_driver *v = get_v();
     if (v && v->printf) v->printf("\n", s_row_color);
     s_row_col = 0;
-    spin_unlock(&log_lock);
+    spin_unlock_irqrestore(&log_lock, s_row_lock_flags);
 }
 
 void usb_log(usb_log_tag tag, usb_log_level lvl, const char *msg) {

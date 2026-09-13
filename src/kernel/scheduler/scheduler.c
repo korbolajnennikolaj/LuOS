@@ -161,6 +161,40 @@ struct task *task_create(const char *name, void (*entry)(void *), void *arg, int
     return task_create_on_core(name, entry, arg, priority, current_core());
 }
 
+static int core_load(int core) {
+    int load = 0;
+    for (int i = 0; i < g_task_count; i++) {
+        struct task *t = g_tasks[i];
+        if (t->core == core && t->state != TASK_ZOMBIE && t != g_rq[core].idle)
+            load++;
+    }
+    return load;
+}
+
+int scheduler_least_loaded_core(void) {
+    int core_count = scheduler_core_count();
+
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
+
+    int best_core = 0;
+    int best_load = core_load(0);
+    for (int c = 1; c < core_count; c++) {
+        int load = core_load(c);
+        if (load < best_load) {
+            best_load = load;
+            best_core = c;
+        }
+    }
+
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    return best_core;
+}
+
+struct task *task_create_balanced(const char *name, void (*entry)(void *), void *arg, int priority) {
+    int core = scheduler_least_loaded_core();
+    return task_create_on_core(name, entry, arg, priority, core);
+}
+
 void task_trampoline(void) {
     struct task *t = current_task();
     t->entry(t->arg);

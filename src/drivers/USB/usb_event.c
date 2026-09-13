@@ -94,11 +94,11 @@ void usb_all_rings_init(void) {
 }
 
 bool usb_event_enqueue(usb_event_ring_t *ring, const usb_event_t *evt) {
-    spin_lock(&ring->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&ring->lock);
     uint32_t next = (ring->head + 1) & ring->mask;
     if (next == ring->tail) {
         ring->drop_count++;
-        spin_unlock(&ring->lock);
+        spin_unlock_irqrestore(&ring->lock, irq_flags);
         return false;
     }
     ring->entries[ring->head] = *evt;
@@ -111,14 +111,14 @@ bool usb_event_enqueue(usb_event_ring_t *ring, const usb_event_t *evt) {
     }
     asm volatile("mfence" ::: "memory");
     ring->head = next;
-    spin_unlock(&ring->lock);
+    spin_unlock_irqrestore(&ring->lock, irq_flags);
     return true;
 }
 
 bool usb_event_dequeue(usb_event_ring_t *ring, usb_event_t *out) {
-    spin_lock(&ring->lock);
+    uint64_t irq_flags = spin_lock_irqsave(&ring->lock);
     if (ring->tail == ring->head) {
-        spin_unlock(&ring->lock);
+        spin_unlock_irqrestore(&ring->lock, irq_flags);
         return false;
     }
     *out = ring->entries[ring->tail];
@@ -126,7 +126,7 @@ bool usb_event_dequeue(usb_event_ring_t *ring, usb_event_t *out) {
         out->data = out->inline_data;
     asm volatile("mfence" ::: "memory");
     ring->tail = (ring->tail + 1) & ring->mask;
-    spin_unlock(&ring->lock);
+    spin_unlock_irqrestore(&ring->lock, irq_flags);
     return true;
 }
 
@@ -137,14 +137,14 @@ uint32_t usb_event_pending(const usb_event_ring_t *ring) {
 }
 
 void usb_event_register_handler(usb_event_handler_t fn, void *ctx) {
-    spin_lock(&handlers_lock);
-    if (s_intr_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
+    if (s_intr_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
     struct handler_entry *e = &s_intr_handlers[s_intr_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
     e->xfer_type = USB_XFER_INTERRUPT;
     e->has_device_filter = false;
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
 void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint, usb_transfer_type_t xfer_type)
@@ -159,14 +159,14 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
     default:
         table = s_intr_handlers; count = &s_intr_handler_count; break;
     }
-    spin_lock(&handlers_lock);
-    if (*count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
+    if (*count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
     struct handler_entry *e = &table[(*count)++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
     e->xfer_type = xfer_type;
     e->has_device_filter = true;
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 
     if (device) {
         struct usb_device *dev = (struct usb_device *)device;
@@ -175,49 +175,49 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
 }
 
 void usb_bulk_register_handler(usb_event_handler_t fn, void *ctx) {
-    spin_lock(&handlers_lock);
-    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
+    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
     struct handler_entry *e = &s_bulk_handlers[s_bulk_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
     e->xfer_type = USB_XFER_BULK;
     e->has_device_filter = false;
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
 void usb_bulk_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint)
 {
-    spin_lock(&handlers_lock);
-    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
+    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
     struct handler_entry *e = &s_bulk_handlers[s_bulk_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
     e->xfer_type = USB_XFER_BULK;
     e->has_device_filter = true;
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
 void usb_iso_register_handler(usb_event_handler_t fn, void *ctx) {
-    spin_lock(&handlers_lock);
-    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
+    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
     struct handler_entry *e = &s_iso_handlers[s_iso_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
     e->xfer_type = USB_XFER_ISO;
     e->has_device_filter = false;
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
 void usb_iso_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint)
 {
-    spin_lock(&handlers_lock);
-    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock(&handlers_lock); return; }
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
+    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
     struct handler_entry *e = &s_iso_handlers[s_iso_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
     e->xfer_type = USB_XFER_ISO;
     e->has_device_filter = true;
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
 static void dispatch_to_table(struct handler_entry *table, int count, const usb_event_t *evt)
@@ -255,20 +255,23 @@ static int remove_matching(struct handler_entry *table, int count, void *device)
 
 void usb_event_unregister_for_device(void *device) {
     if (!device) return;
-    spin_lock(&handlers_lock);
+    uint64_t flags = spin_lock_irqsave(&handlers_lock);
     s_intr_handler_count = remove_matching(s_intr_handlers, s_intr_handler_count, device);
     s_bulk_handler_count = remove_matching(s_bulk_handlers, s_bulk_handler_count, device);
     s_iso_handler_count = remove_matching(s_iso_handlers, s_iso_handler_count, device);
-    spin_unlock(&handlers_lock);
+    spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
 void usb_event_dispatch_all(void) {
     usb_event_t evt;
     while (usb_pop_event(&evt)) {
         if (evt.type == USB_EVENT_NONE) continue;
-        spin_lock(&handlers_lock);
-        dispatch_to_table(s_intr_handlers, s_intr_handler_count, &evt);
-        spin_unlock(&handlers_lock);
+        struct handler_entry snapshot[USB_EVENT_MAX_HANDLERS];
+        uint64_t flags = spin_lock_irqsave(&handlers_lock);
+        int count = s_intr_handler_count;
+        for (int i = 0; i < count; i++) snapshot[i] = s_intr_handlers[i];
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        dispatch_to_table(snapshot, count, &evt);
     }
 }
 
@@ -276,9 +279,12 @@ void usb_bulk_dispatch_all(void) {
     usb_event_t evt;
     while (usb_pop_bulk_event(&evt)) {
         if (evt.type == USB_EVENT_NONE) continue;
-        spin_lock(&handlers_lock);
-        dispatch_to_table(s_bulk_handlers, s_bulk_handler_count, &evt);
-        spin_unlock(&handlers_lock);
+        struct handler_entry snapshot[USB_EVENT_MAX_HANDLERS];
+        uint64_t flags = spin_lock_irqsave(&handlers_lock);
+        int count = s_bulk_handler_count;
+        for (int i = 0; i < count; i++) snapshot[i] = s_bulk_handlers[i];
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        dispatch_to_table(snapshot, count, &evt);
     }
 }
 
@@ -286,8 +292,11 @@ void usb_iso_dispatch_all(void) {
     usb_event_t evt;
     while (usb_pop_iso_event(&evt)) {
         if (evt.type == USB_EVENT_NONE) continue;
-        spin_lock(&handlers_lock);
-        dispatch_to_table(s_iso_handlers, s_iso_handler_count, &evt);
-        spin_unlock(&handlers_lock);
+        struct handler_entry snapshot[USB_EVENT_MAX_HANDLERS];
+        uint64_t flags = spin_lock_irqsave(&handlers_lock);
+        int count = s_iso_handler_count;
+        for (int i = 0; i < count; i++) snapshot[i] = s_iso_handlers[i];
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        dispatch_to_table(snapshot, count, &evt);
     }
 }
