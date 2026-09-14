@@ -22,8 +22,6 @@
 
 extern unsigned int xhci_read_current_usbsts(void);
 
-extern uint8_t uhci_dev_is_ls[4][128];
-
 static struct usb_device usb_device_pool[MAX_USB_DEVICES];
 static int usb_device_count = 0;
 
@@ -691,17 +689,17 @@ static void usb_core_poll_transfers(void) {
                 switch (dev->ctrl ? dev->ctrl->type : -1) {
                     case USB_TYPE_EHCI: {
                         struct ehci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_EHCI);
-                        if (drv) { extern void ehci_poll_iso(void *e); ehci_poll_iso((struct ehci_controller *)dev->ctrl); }
+                        if (drv) { extern void ehci_poll_iso(void *e); ehci_poll_iso((void *)dev->ctrl); }
                         break;
                     }
                     case USB_TYPE_OHCI: {
                         struct ohci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_OHCI);
-                        if (drv) { extern void ohci_poll_iso(void *o); ohci_poll_iso((struct ohci_controller *)dev->ctrl); }
+                        if (drv) ohci_poll_iso((struct ohci_controller *)dev->ctrl);
                         break;
                     }
                     case USB_TYPE_UHCI: {
                         struct uhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
-                        if (drv) { extern void uhci_poll_iso(void *u); uhci_poll_iso((struct uhci_controller *)dev->ctrl); }
+                        if (drv) uhci_poll_iso((struct uhci_controller *)dev->ctrl);
                         break;
                     }
                     default: break;
@@ -945,20 +943,26 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         delay_ms(50);
 
         if (dev->ctrl && dev->ctrl->type == USB_TYPE_UHCI) {
-            struct uhci_driver *uhci_drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
-            if (uhci_drv) {
-                int uhci_cnt = uhci_drv->get_controller_count();
-                for (int ki = 0; ki < uhci_cnt; ki++) {
-                    if (uhci_drv->get_controller(ki) == (struct uhci_controller *)dev->ctrl) {
+            int ki = uhci_controller_index((struct uhci_controller *)dev->ctrl);
+            if (ki >= 0) {
+                dev->is_low_speed = uhci_dev_is_ls[ki][0];
+                uhci_dev_is_ls[ki][new_addr & 0x7F] = uhci_dev_is_ls[ki][0];
+                uhci_dev_mps0[ki][new_addr & 0x7F] = (uint8_t)dev->max_packet_size;
+                usb_debug("LS save ki=", (uint32_t)ki, 1);
+                usb_debug("LS save addr=", (uint32_t)new_addr, 1);
+                usb_debug("LS save ls[0]=", (uint32_t)uhci_dev_is_ls[ki][0], 1);
+            }
+        }
 
-                        dev->is_low_speed = uhci_dev_is_ls[ki][0];
-                        uhci_dev_is_ls[ki][new_addr & 0x7F] = uhci_dev_is_ls[ki][0];
-                        usb_debug("LS save ki=", (uint32_t)ki, 1);
-                        usb_debug("LS save addr=", (uint32_t)new_addr, 1);
-                        usb_debug("LS save ls[0]=", (uint32_t)uhci_dev_is_ls[ki][0], 1);
-                        break;
-                    }
-                }
+        if (dev->ctrl && dev->ctrl->type == USB_TYPE_OHCI) {
+            int ki = ohci_controller_index((struct ohci_controller *)dev->ctrl);
+            if (ki >= 0) {
+                dev->is_low_speed = ohci_dev_is_ls[ki][0];
+                ohci_dev_is_ls[ki][new_addr & 0x7F] = ohci_dev_is_ls[ki][0];
+                ohci_dev_mps0[ki][new_addr & 0x7F] = (uint8_t)dev->max_packet_size;
+                usb_debug("LS save ohci ki=", (uint32_t)ki, 1);
+                usb_debug("LS save ohci addr=", (uint32_t)new_addr, 1);
+                usb_debug("LS save ohci ls[0]=", (uint32_t)ohci_dev_is_ls[ki][0], 1);
             }
         }
 

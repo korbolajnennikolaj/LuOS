@@ -9,16 +9,32 @@
 struct tsc_driver;
 struct usb_device;
 
-#define MAX_OHCI_CONTROLLERS 32
+#define MAX_OHCI_CONTROLLERS 8
+#define MAX_OHCI_HID_SLOTS 4
+#define MAX_OHCI_BULK_SLOTS 4
+#define OHCI_MAX_PORTS 15
 
 #define OHCI_HcRevision 0x00
 #define OHCI_HcControl 0x04
 #define OHCI_HcCommandStatus 0x08
 #define OHCI_HcInterruptStatus 0x0C
+#define OHCI_HcInterruptEnable 0x10
 #define OHCI_HcInterruptDisable 0x14
 #define OHCI_HcHCCA 0x18
+#define OHCI_HcPeriodCurrentED 0x1C
+#define OHCI_HcControlHeadED 0x20
+#define OHCI_HcControlCurrentED 0x24
+#define OHCI_HcBulkHeadED 0x28
+#define OHCI_HcBulkCurrentED 0x2C
+#define OHCI_HcDoneHead 0x30
 #define OHCI_HcFmInterval 0x34
+#define OHCI_HcFmRemaining 0x38
+#define OHCI_HcFmNumber 0x3C
 #define OHCI_HcPeriodicStart 0x40
+#define OHCI_HcLSThreshold 0x44
+#define OHCI_HcRhDescriptorA 0x48
+#define OHCI_HcRhDescriptorB 0x4C
+#define OHCI_HcRhStatus 0x50
 #define OHCI_HcRhPortStatus 0x54
 
 typedef struct ohci_td {
@@ -46,12 +62,13 @@ typedef struct ohci_hcca {
 
 typedef struct ohci_controller {
     enum USB_CONTROLLER_TYPE type;
-    uint32_t base_addr;
+    uint64_t base_addr;
     uint8_t num_ports;
     uint8_t initialized;
     uint32_t next_td_index;
 
     uint8_t is_low_speed;
+    uint8_t power_on_delay_ms;
     spinlock_t lock;
 } ohci_controller;
 
@@ -85,8 +102,17 @@ typedef struct ohci_driver {
     void (*notify_disconnect)(struct usb_device* dev);
 } ohci_driver;
 
+extern uint8_t ohci_dev_is_ls[MAX_OHCI_CONTROLLERS][128];
+extern uint8_t ohci_dev_mps0[MAX_OHCI_CONTROLLERS][128];
+
 struct ohci_driver* return_ohci_driver(void);
 struct driver* return_meta_ohci_driver(void);
 void ohci_irq(void);
+void ohci_poll_iso(struct ohci_controller* o);
+int ohci_controller_index(struct ohci_controller* o);
+uint8_t ohci_port_count(struct ohci_controller* o);
+void ohci_delay_ms(uint64_t ms);
+uint32_t ohci_mmio_read(struct ohci_controller* o, uint32_t reg);
+void ohci_mmio_write(struct ohci_controller* o, uint32_t reg, uint32_t val);
 
 #endif
