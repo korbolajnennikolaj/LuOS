@@ -79,5 +79,6 @@ typedef struct uhci_driver {
 struct uhci_driver* return_uhci_driver(void);
 struct driver* return_meta_uhci_driver(void);
 void uhci_irq(void);
+int uhci_controller_index(struct uhci_controller *u);
 
 #endif

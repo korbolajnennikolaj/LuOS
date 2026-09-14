@@ -1258,10 +1258,6 @@ void usb_scan_all(void) {
             for (uint8_t port = 1; port <= hub.port_count; port++) {
                 uint32_t pst = root_hub_port_status(&hub, port);
                 if (!(pst & 0x01)) continue;
-                int ci = -1;
-                for (int k = 0; k < 4; k++) {
-                    if (uhci->get_controller(k) == ctrl) { ci = k; break; }
-                }
                 root_hub_port_reset(&hub, port);
 
                 for (int w = 0; w < 100; w++) {
@@ -1275,9 +1271,6 @@ void usb_scan_all(void) {
                     usb_log_port_event(USB_LOG_UHCI, i, port, "lost-after-reset", pst, 0xFF);
                     continue;
                 }
-
-                if (ci >= 0)
-                    uhci_dev_is_ls[ci][0] = (pst & 0x0100) ? 1 : 0;
 
                 usb_root_port_mark(s_root_uhci, i, port, USB_ROOT_PORT_BUSY);
                 usb_init_device(ctrl, port, false);

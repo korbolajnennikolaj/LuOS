@@ -1,10 +1,12 @@
 #include "uhci_hub.h"
 
 #include "drivers/Timer/timer.h"
+#include "drivers/USB/uhci.h"
 
 #include <ports.h>
 
 extern void delay_ms(uint64_t ms);
+extern uint8_t uhci_dev_is_ls[4][128];
 
 uint32_t uhci_hub_exec(struct uhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port, uint32_t val) {
     if (!hub || !hub->ctrl) return 0;
@@ -21,6 +23,9 @@ uint32_t uhci_hub_exec(struct uhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
             uint16_t addr = c->io_base + 0x10 + (port-1)*2;
 
             int is_ls_port = (inw(addr) & 0x0100) ? 1 : 0;
+
+            int ci = uhci_controller_index(c);
+            if (ci >= 0) uhci_dev_is_ls[ci][0] = (uint8_t)is_ls_port;
 
             outw(addr, (inw(addr) & ~0x000A) | 0x000A);
             delay_ms(1);

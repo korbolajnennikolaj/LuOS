@@ -196,15 +196,14 @@ static inline int uhci_res_index(struct uhci_controller *u) {
     return -1;
 }
 
+int uhci_controller_index(struct uhci_controller *u) {
+    return uhci_res_index(u);
+}
+
 static int uhci_detect_ls(struct uhci_controller *u, uint8_t dev_addr) {
     int ri = uhci_res_index(u);
     if (ri < 0) return 0;
-    if (dev_addr == 0) {
-        uint16_t p1 = uhci_readw(u, UHCI_PORTSC1);
-        uint16_t p2 = uhci_readw(u, UHCI_PORTSC1 + 2);
-        if ((p1 & 0x0100) || (p2 & 0x0100)) return (1 << 26);
-        return 0;
-    }
+    if (dev_addr == 0) return uhci_dev_is_ls[ri][0] ? (1 << 26) : 0;
     for (int _di = 0; _di < MAX_USB_DEVICES; _di++) {
         struct usb_device *_d = (struct usb_device *)device_table[USB_DEVICE][_di];
         if (_d && (uint8_t)_d->address == dev_addr &&
