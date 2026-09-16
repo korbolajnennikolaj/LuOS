@@ -14,6 +14,8 @@
 
 extern void delay_ms(uint64_t ms);
 
+#define USB_MOUSE_PUMP_STALE_MS 100
+
 static int usb_mouse_class_request(struct usb_core_driver *core, struct usb_device *dev,
                                     uint8_t type, uint8_t req, uint16_t val, uint16_t idx,
                                     uint16_t len, void *data) {
@@ -153,7 +155,8 @@ void usb_mouse_handler_poll(void) {
     }
 
     usb_mouse_poll(core);
-    if (core->poll_transfers) core->poll_transfers();
+    if (core->poll_transfers && usb_core_pump_age_ms() > USB_MOUSE_PUMP_STALE_MS)
+        core->poll_transfers();
     usb_event_dispatch_all();
     asm volatile("pause");
 }

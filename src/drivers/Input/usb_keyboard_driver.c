@@ -12,6 +12,8 @@
 
 extern void delay_ms(uint64_t ms);
 
+#define USB_KBD_PUMP_STALE_MS 100
+
 #define MAX_USB_KEYBOARDS 4
 #define USB_KBD_BUFFER_SIZE 128
 #define USB_KBD_EXT_SIZE 32
@@ -384,7 +386,8 @@ void usb_kbd_handler_poll(void) {
     if (!core) return;
 
     xhci_kbd_poll(core);
-    if (core->poll_transfers) core->poll_transfers();
+    if (core->poll_transfers && usb_core_pump_age_ms() > USB_KBD_PUMP_STALE_MS)
+        core->poll_transfers();
     usb_event_dispatch_all();
     asm volatile("pause");
 }
@@ -490,7 +493,8 @@ void usb_kbd_input(const char *prompt, char *buffer, uint32_t max_len, uint32_t 
 
     while (idx < max_len - 1) {
         xhci_kbd_poll(core);
-        if (core && core->poll_transfers) core->poll_transfers();
+        if (core && core->poll_transfers && usb_core_pump_age_ms() > USB_KBD_PUMP_STALE_MS)
+            core->poll_transfers();
         usb_event_dispatch_all();
 
         if (usb_kbd_has_key()) {
@@ -502,7 +506,8 @@ void usb_kbd_input(const char *prompt, char *buffer, uint32_t max_len, uint32_t 
         } else {
             for (int p = 0; p < 4; p++) {
                 xhci_kbd_poll(core);
-                if (core && core->poll_transfers) core->poll_transfers();
+                if (core && core->poll_transfers && usb_core_pump_age_ms() > USB_KBD_PUMP_STALE_MS)
+                    core->poll_transfers();
                 usb_event_dispatch_all();
                 if (usb_kbd_has_key()) break;
                 asm volatile("pause");

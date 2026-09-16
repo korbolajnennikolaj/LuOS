@@ -110,6 +110,8 @@ typedef struct usb_device {
     uint8_t valid;
 } usb_device;
 
+uint64_t usb_core_pump_age_ms(void);
+
 typedef struct usb_core_driver {
     void (*scan_all)(void);
 

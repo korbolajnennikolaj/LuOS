@@ -147,6 +147,84 @@ static void vkbd_set_leds(bool caps_lock, bool num_lock, bool scroll_lock)
     }
 }
 
+#define VKBD_EXTERNAL_PUMP_STALE_MS 200
+#define VKBD_MIN_POLL_INTERVAL_MS 5
+
+static volatile uint64_t vkbd_last_external_poll_ms = 0;
+
+static bool vkbd_locks_inited = false;
+static bool vkbd_caps_lock = false;
+static bool vkbd_num_lock = false;
+static bool vkbd_scroll_lock = false;
+
+static bool backend_caps_seen[KEYBOARD_MAX_BACKENDS];
+static bool backend_num_seen[KEYBOARD_MAX_BACKENDS];
+static bool backend_scroll_seen[KEYBOARD_MAX_BACKENDS];
+
+static void vkbd_sync_locks(void) {
+    bool changed = false;
+
+    FOR_EACH_BACKEND(i) {
+        struct keyboard_backend *b = &vkbd.backends[i];
+        struct ps2_keyboard_state *st = backend_get_state(b);
+        if (!st) continue;
+
+        if (!vkbd_locks_inited) {
+            vkbd_caps_lock = st->is_caps_lock;
+            vkbd_num_lock = st->is_num_lock;
+            vkbd_scroll_lock = st->is_scroll_lock;
+        } else {
+            if (st->is_caps_lock != backend_caps_seen[i]) {
+                vkbd_caps_lock = st->is_caps_lock;
+                changed = true;
+            }
+            if (st->is_num_lock != backend_num_seen[i]) {
+                vkbd_num_lock = st->is_num_lock;
+                changed = true;
+            }
+            if (st->is_scroll_lock != backend_scroll_seen[i]) {
+                vkbd_scroll_lock = st->is_scroll_lock;
+                changed = true;
+            }
+        }
+
+        backend_caps_seen[i] = st->is_caps_lock;
+        backend_num_seen[i] = st->is_num_lock;
+        backend_scroll_seen[i] = st->is_scroll_lock;
+    }
+
+    vkbd_locks_inited = true;
+    if (!changed) return;
+
+    FOR_EACH_BACKEND(i) {
+        struct keyboard_backend *b = &vkbd.backends[i];
+        struct ps2_keyboard_state *st = backend_get_state(b);
+        if (!st) continue;
+
+        st->is_caps_lock = vkbd_caps_lock;
+        st->is_num_lock = vkbd_num_lock;
+        st->is_scroll_lock = vkbd_scroll_lock;
+
+        backend_caps_seen[i] = vkbd_caps_lock;
+        backend_num_seen[i] = vkbd_num_lock;
+        backend_scroll_seen[i] = vkbd_scroll_lock;
+    }
+
+    vkbd_set_leds(vkbd_caps_lock, vkbd_num_lock, vkbd_scroll_lock);
+}
+
+static void vkbd_poll_backends(void) {
+    FOR_EACH_BACKEND(i) backend_poll(&vkbd.backends[i]);
+}
+
+static bool vkbd_external_pump_alive(void) {
+    uint64_t last = vkbd_last_external_poll_ms;
+    if (last == 0) return false;
+
+    uint64_t now = kbd_uptime_ms();
+    return (now >= last) && ((now - last) < VKBD_EXTERNAL_PUMP_STALE_MS);
+}
+
 static bool vkbd_is_key_pressed(uint8_t scancode) {
     FOR_EACH_BACKEND(i)
         if (backend_is_key_held(&vkbd.backends[i], scancode)) return true;
@@ -253,10 +331,15 @@ static bool vkbd_is_key_held_from(enum KEYBOARD_TYPE source, uint8_t scancode) {
 }
 
 static void vkbd_keyboard_handler(void) {
-    FOR_EACH_BACKEND(i) backend_poll(&vkbd.backends[i]);
+    uint64_t now = kbd_uptime_ms();
 
-    struct usb_core_driver *usb_core = get_self_driver(USB_DRIVER, USB_CORE_SLOT);
-    if (usb_core && usb_core->poll_transfers) usb_core->poll_transfers();
+    if (now != 0 && vkbd_last_external_poll_ms != 0 &&
+        (now - vkbd_last_external_poll_ms) < VKBD_MIN_POLL_INTERVAL_MS) return;
+
+    vkbd_poll_backends();
+    vkbd_sync_locks();
+
+    vkbd_last_external_poll_ms = now;
 }
 
 static void vkbd_input(const char *prompt, char *buffer, uint32_t max_len, uint32_t color, void (*print)(const char *, uint32_t))
@@ -272,7 +355,10 @@ static void vkbd_input(const char *prompt, char *buffer, uint32_t max_len, uint3
 
     while (idx < max_len - 1) {
 
-        FOR_EACH_BACKEND(i) backend_poll(&vkbd.backends[i]);
+        if (!vkbd_external_pump_alive()) {
+            vkbd_poll_backends();
+            vkbd_sync_locks();
+        }
 
         if (hold_sc != 0 && hold_backend != NULL) {
             if (!backend_is_key_held(hold_backend, hold_sc)) {

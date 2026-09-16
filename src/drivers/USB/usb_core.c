@@ -14,6 +14,7 @@
 #include "drivers/USB/xhci.h"
 #include "drivers/USB/xhci_hub.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/scheduler/scheduler.h"
 
 #include <cpuid.h>
 #include <stdbool.h>
@@ -613,7 +614,41 @@ static void usb_root_ports_poll(void) {
     }
 }
 
-static void usb_core_poll_transfers(void) {
+static spinlock_t usb_pump_lock = SPINLOCK_INIT;
+static volatile uint64_t usb_pump_last_ms = 0;
+static void *usb_pump_owner = NULL;
+static int usb_pump_depth = 0;
+
+static bool usb_pump_enter(void) {
+    void *me = (void *)current_task();
+
+    uint64_t flags = spin_lock_irqsave(&usb_pump_lock);
+
+    if (usb_pump_owner == NULL) {
+        usb_pump_owner = me ? me : (void *)&usb_pump_depth;
+        usb_pump_depth = 1;
+        spin_unlock_irqrestore(&usb_pump_lock, flags);
+        return true;
+    }
+
+    if (me && usb_pump_owner == me) {
+        usb_pump_depth++;
+        spin_unlock_irqrestore(&usb_pump_lock, flags);
+        return true;
+    }
+
+    spin_unlock_irqrestore(&usb_pump_lock, flags);
+    return false;
+}
+
+static void usb_pump_leave(void) {
+    uint64_t flags = spin_lock_irqsave(&usb_pump_lock);
+    if (usb_pump_depth > 0) usb_pump_depth--;
+    if (usb_pump_depth == 0) usb_pump_owner = NULL;
+    spin_unlock_irqrestore(&usb_pump_lock, flags);
+}
+
+static void usb_core_poll_transfers_locked(void) {
     for (int i = 0; i < usb_device_count; i++) {
         struct usb_device *dev = &usb_device_pool[i];
         if (!dev->valid) continue;
@@ -716,6 +751,26 @@ static void usb_core_poll_transfers(void) {
     usb_event_dispatch_all();
     usb_bulk_dispatch_all();
     usb_iso_dispatch_all();
+}
+
+static uint64_t usb_pump_now_ms(void) {
+    struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
+    return tsc ? tsc->get_tsc_uptime_ms() : 0;
+}
+
+uint64_t usb_core_pump_age_ms(void) {
+    uint64_t last = usb_pump_last_ms;
+    if (last == 0) return UINT64_MAX;
+
+    uint64_t now = usb_pump_now_ms();
+    return (now > last) ? (now - last) : 0;
+}
+
+static void usb_core_poll_transfers(void) {
+    if (!usb_pump_enter()) return;
+    usb_core_poll_transfers_locked();
+    usb_pump_last_ms = usb_pump_now_ms();
+    usb_pump_leave();
 }
 
 static int usb_validate_device_descriptor(struct usb_device_descriptor *desc) {
@@ -1100,7 +1155,7 @@ fail:
     spin_unlock_irqrestore(&usb_core_lock, flags); }
 }
 
-void usb_scan_all(void) {
+static void usb_scan_all_locked(void) {
     usb_device_count = 0;
     usb_next_address = 1;
 
@@ -1286,6 +1341,19 @@ void usb_scan_all(void) {
         }
     }
 
+}
+
+void usb_scan_all(void) {
+    for (int wait = 0; wait < 200; wait++) {
+        if (usb_pump_enter()) {
+            usb_scan_all_locked();
+            usb_pump_leave();
+            return;
+        }
+        delay_ms(10);
+    }
+
+    usb_debug("USB: scan skipped, controller busy", 0, 1);
 }
 
 static struct usb_core_driver core = {
