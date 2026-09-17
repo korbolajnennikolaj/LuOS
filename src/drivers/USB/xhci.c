@@ -29,7 +29,7 @@
 #define LOAD_BARRIER() asm volatile("lfence" ::: "memory")
 #define COMPILER_BARRIER() asm volatile("" ::: "memory")
 
-#define MAX_XHCI_CONTROLLERS 32
+#define MAX_XHCI_CONTROLLERS 8
 #define TRB_RING_SIZE 256
 #define MAX_SLOTS 64
 #define ERDP_WITH_EHB(pa) ((pa) | (1ULL << 3))
@@ -145,6 +145,12 @@ static uint8_t bulk_error [MAX_XHCI_CONTROLLERS][MAX_SLOTS][2];
 static uint8_t bulk_ep_configured[MAX_XHCI_CONTROLLERS][MAX_SLOTS][2];
 static uint8_t bulk_slot_dci [MAX_XHCI_CONTROLLERS][MAX_SLOTS][2];
 
+static volatile uint8_t bulk_submitted[MAX_XHCI_CONTROLLERS][MAX_SLOTS][2];
+static volatile uint8_t bulk_done [MAX_XHCI_CONTROLLERS][MAX_SLOTS][2];
+static volatile uint8_t intr_submitted[MAX_XHCI_CONTROLLERS][MAX_SLOTS];
+static volatile uint8_t intr_done [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
+static volatile uint8_t intr_error [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
+
 static uint32_t iso_tr_idx [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
 static uint8_t iso_cycle [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
 static uint8_t iso_ep_configured[MAX_XHCI_CONTROLLERS][MAX_SLOTS];
@@ -242,37 +248,82 @@ static void dusts(uint64_t op) {
     (void)op;
 }
 
-static spinlock_t xhci_event_lock = SPINLOCK_INIT;
-static void *xhci_event_owner = NULL;
-static int xhci_event_depth = 0;
-
-static bool xhci_event_enter(void) {
+static inline void *xhci_self(struct xhci_controller *x) {
     void *me = (void *)current_task();
-
-    uint64_t flags = spin_lock_irqsave(&xhci_event_lock);
-
-    if (xhci_event_owner == NULL) {
-        xhci_event_owner = me ? me : (void *)&xhci_event_depth;
-        xhci_event_depth = 1;
-        spin_unlock_irqrestore(&xhci_event_lock, flags);
-        return true;
-    }
-
-    if (me && xhci_event_owner == me) {
-        xhci_event_depth++;
-        spin_unlock_irqrestore(&xhci_event_lock, flags);
-        return true;
-    }
-
-    spin_unlock_irqrestore(&xhci_event_lock, flags);
-    return false;
+    return me ? me : (void *)x;
 }
 
-static void xhci_event_leave(void) {
-    uint64_t flags = spin_lock_irqsave(&xhci_event_lock);
-    if (xhci_event_depth > 0) xhci_event_depth--;
-    if (xhci_event_depth == 0) xhci_event_owner = NULL;
-    spin_unlock_irqrestore(&xhci_event_lock, flags);
+static void xhci_wait_ms(uint64_t ms) {
+    if (current_task()) scheduler_sleep_ms(ms);
+    else if (delay_ms) delay_ms(ms);
+}
+
+static inline void xhci_relax(void) {
+    if (current_task()) scheduler_yield();
+    else asm volatile("pause");
+}
+
+static void xhci_ctrl_enter(struct xhci_controller *x) {
+    void *me = xhci_self(x);
+
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&x->lock);
+        if (x->lock_depth == 0) {
+            x->lock_owner = me;
+            x->lock_depth = 1;
+            spin_unlock_irqrestore(&x->lock, flags);
+            return;
+        }
+        if (x->lock_owner == me) {
+            x->lock_depth++;
+            spin_unlock_irqrestore(&x->lock, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&x->lock, flags);
+        xhci_relax();
+    }
+}
+
+static void xhci_ctrl_leave(struct xhci_controller *x) {
+    uint64_t flags = spin_lock_irqsave(&x->lock);
+    if (x->lock_depth > 0) x->lock_depth--;
+    if (x->lock_depth == 0) x->lock_owner = NULL;
+    spin_unlock_irqrestore(&x->lock, flags);
+}
+
+static void xhci_event_enter(struct xhci_controller *x) {
+    void *me = xhci_self(x);
+
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&x->event_lock);
+        if (x->event_depth == 0) {
+            x->event_owner = me;
+            x->event_depth = 1;
+            spin_unlock_irqrestore(&x->event_lock, flags);
+            return;
+        }
+        if (x->event_owner == me) {
+            x->event_depth++;
+            spin_unlock_irqrestore(&x->event_lock, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&x->event_lock, flags);
+        xhci_relax();
+    }
+}
+
+static int xhci_send_command_impl(struct xhci_controller *x, struct xhci_trb *cmd);
+static int xhci_reset_port_impl(struct xhci_controller *x, uint8_t port);
+static int xhci_enable_slot_impl(struct xhci_controller *x);
+static int xhci_disable_slot_impl(struct xhci_controller *x, uint8_t slot_id);
+static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, const struct xhci_topology *topo);
+static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count);
+
+static void xhci_event_leave(struct xhci_controller *x) {
+    uint64_t flags = spin_lock_irqsave(&x->event_lock);
+    if (x->event_depth > 0) x->event_depth--;
+    if (x->event_depth == 0) x->event_owner = NULL;
+    spin_unlock_irqrestore(&x->event_lock, flags);
 }
 
 static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
@@ -295,7 +346,7 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
 
         } else if (type == TRB_TYPE_TRANSFER_EVENT) {
 
-            if (ev_slot == x->pending_xfer_slot)
+            if (ev_slot == x->pending_xfer_slot && ev_ep <= 1)
                 x->last_completion_code = code;
 
             if ((code == 1 || code == 13) && (ev_ep > 1)) {
@@ -319,8 +370,10 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
 
                     if (is_bulk) {
 
-                        if (ki_e >= 0 && ki_e < MAX_SLOTS)
+                        if (ki_e >= 0 && ki_e < MAX_SLOTS) {
                             bulk_active[ci_e][ki_e][bulk_dir] = 0;
+                            bulk_done  [ci_e][ki_e][bulk_dir] = 1;
+                        }
                         usb_event_t uevt = {
                             .type = USB_EVENT_BULK_DONE,
                             .src = USB_SRC_XHCI,
@@ -367,7 +420,10 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
                         uint8_t is_in = (ev_ep & 1);
                         uint8_t ep_addr = ep_num | (is_in ? 0x80u : 0x00u);
 
-                        intr_active[ci_e][ki_e] = 0;
+                        if (ki_e >= 0 && ki_e < MAX_SLOTS) {
+                            intr_active[ci_e][ki_e] = 0;
+                            intr_done  [ci_e][ki_e] = 1;
+                        }
 
                         void *evt_buf = (ki_e >= 0 && ki_e < MAX_SLOTS)
                         ? intr_data_ptr[ci_e][ki_e] : NULL;
@@ -404,11 +460,16 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
                     int ci_p = (int)(x - ctrls);
                     int ki_p = (int)ev_slot - 1;
                     if (ki_p >= 0 && ki_p < MAX_SLOTS) {
+                        if (intr_slot_dci[ci_p][ki_p] == ev_ep &&
+                            intr_submitted[ci_p][ki_p]) {
+                            intr_error[ci_p][ki_p] = 1;
+                        }
                         intr_active[ci_p][ki_p] = 0;
 
                         for (uint8_t _bdir = 0; _bdir < 2; _bdir++) {
-                            if (bulk_active[ci_p][ki_p][_bdir] &&
-                                bulk_slot_dci[ci_p][ki_p][_bdir] == ev_ep) {
+                            if (bulk_slot_dci[ci_p][ki_p][_bdir] == ev_ep &&
+                                (bulk_active[ci_p][ki_p][_bdir] ||
+                                 bulk_submitted[ci_p][ki_p][_bdir])) {
                                 bulk_error [ci_p][ki_p][_bdir] = 1;
                             g_last_xfer_error_code = code;
                             bulk_active[ci_p][ki_p][_bdir] = 0;
@@ -446,10 +507,10 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
 
 void xhci_poll_event_ring(struct xhci_controller *x) {
     if (!x || !x->initialized) return;
-    if (!xhci_event_enter()) return;
 
+    xhci_event_enter(x);
     xhci_poll_event_ring_locked(x);
-    xhci_event_leave();
+    xhci_event_leave(x);
 }
 
 void xhci_irq(void) {
@@ -468,7 +529,16 @@ void xhci_irq(void) {
     }
 }
 
-int xhci_send_command(struct xhci_controller *x, struct xhci_trb *cmd) {
+int xhci_send_command(struct xhci_controller *x, struct xhci_trb *cmd)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_send_command_impl(x, cmd);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_send_command_impl(struct xhci_controller *x, struct xhci_trb *cmd) {
     if (!x || !x->initialized) return -1;
 
     struct xhci_trb *trb = &x->cmd_ring[x->cmd_ring_idx];
@@ -585,7 +655,16 @@ static void xhci_handoff(struct xhci_controller *x) {
     log("No USB Legacy Support ExtCap found", 0, 0);
 }
 
-int xhci_reset_port(struct xhci_controller *x, uint8_t port) {
+int xhci_reset_port(struct xhci_controller *x, uint8_t port)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_reset_port_impl(x, port);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_reset_port_impl(struct xhci_controller *x, uint8_t port) {
     if (!x || port == 0) return -1;
     log("=== RESET PORT ===", port, 1);
 
@@ -649,7 +728,16 @@ int xhci_reset_port(struct xhci_controller *x, uint8_t port) {
     return -1;
 }
 
-int xhci_enable_slot(struct xhci_controller *x) {
+int xhci_enable_slot(struct xhci_controller *x)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_enable_slot_impl(x);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_enable_slot_impl(struct xhci_controller *x) {
     log("=== Enable Slot ===", 0, 0);
     struct xhci_trb cmd = {0};
     cmd.control = (TRB_TYPE_ENABLE_SLOT << 10);
@@ -675,7 +763,16 @@ int xhci_enable_slot(struct xhci_controller *x) {
     return -1;
 }
 
-int xhci_disable_slot(struct xhci_controller *x, uint8_t slot_id) {
+int xhci_disable_slot(struct xhci_controller *x, uint8_t slot_id)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_disable_slot_impl(x, slot_id);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_disable_slot_impl(struct xhci_controller *x, uint8_t slot_id) {
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) return -1;
 
     log("=== Disable Slot ===", slot_id, 1);
@@ -701,6 +798,9 @@ int xhci_disable_slot(struct xhci_controller *x, uint8_t slot_id) {
     xhci_mem[idx].dcbaa[slot_id] = 0;
     CACHE_FLUSH(&xhci_mem[idx].dcbaa[slot_id]);
     intr_active[idx][slot_id - 1] = 0;
+    intr_submitted[idx][slot_id - 1] = 0;
+    intr_done[idx][slot_id - 1] = 0;
+    intr_error[idx][slot_id - 1] = 0;
     intr_slot_dci[idx][slot_id - 1] = 0;
     ep_configured[idx][slot_id - 1] = 0;
     ep_needs_reset[idx][slot_id - 1] = 0;
@@ -710,11 +810,27 @@ int xhci_disable_slot(struct xhci_controller *x, uint8_t slot_id) {
     bulk_active[idx][slot_id - 1][1] = 0;
     bulk_error[idx][slot_id - 1][0] = 0;
     bulk_error[idx][slot_id - 1][1] = 0;
+    bulk_submitted[idx][slot_id - 1][0] = 0;
+    bulk_submitted[idx][slot_id - 1][1] = 0;
+    bulk_done[idx][slot_id - 1][0] = 0;
+    bulk_done[idx][slot_id - 1][1] = 0;
+    intr_submitted[idx][slot_id - 1] = 0;
+    intr_done[idx][slot_id - 1] = 0;
+    intr_error[idx][slot_id - 1] = 0;
 
     return 0;
 }
 
-int xhci_address_device(struct xhci_controller *x, uint8_t slot_id, const struct xhci_topology *topo) {
+int xhci_address_device(struct xhci_controller *x, uint8_t slot_id, const struct xhci_topology *topo)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_address_device_impl(x, slot_id, topo);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, const struct xhci_topology *topo) {
     log("=== Address Device ===", slot_id, 1);
     if (slot_id == 0 || slot_id > MAX_SLOTS) { err("Bad slot", slot_id); return -1; }
 
@@ -732,6 +848,9 @@ int xhci_address_device(struct xhci_controller *x, uint8_t slot_id, const struct
     memset(dc, 0, XHCI_DEV_CTX_BYTES);
     memset(tr, 0, sizeof(struct xhci_trb) * TRB_RING_SIZE);
     intr_active[idx][slot_id - 1] = 0;
+    intr_submitted[idx][slot_id - 1] = 0;
+    intr_done[idx][slot_id - 1] = 0;
+    intr_error[idx][slot_id - 1] = 0;
     intr_slot_dci[idx][slot_id - 1] = 0;
     ep_configured[idx][slot_id - 1] = 0;
     ep_needs_reset[idx][slot_id - 1] = 0;
@@ -818,7 +937,16 @@ int xhci_address_device(struct xhci_controller *x, uint8_t slot_id, const struct
     return -1;
 }
 
-int xhci_evaluate_hub_slot(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count) {
+int xhci_evaluate_hub_slot(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_evaluate_hub_slot_impl(x, slot_id, port_count);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count) {
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) return -1;
 
     int idx = x - ctrls;
@@ -915,6 +1043,8 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
         bulk_tr_idx[ci][ki][bulk_dir] = 0;
         bulk_cycle [ci][ki][bulk_dir] = 1;
         bulk_active[ci][ki][bulk_dir] = 0;
+        bulk_submitted[ci][ki][bulk_dir] = 0;
+        bulk_done [ci][ki][bulk_dir] = 0;
     }
 
     uint64_t tr_phys = virt_to_phys(tr_ring);
@@ -1136,7 +1266,7 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
             xhci_control_ep0_recover(x, slot_id, idx, tr);
             return -1;
         }
-        delay_ms(2);
+        xhci_wait_ms(2);
     }
     err("XFR TIMEOUT", 0);
     g_last_xfer_error_code = 0xFF;
@@ -1148,9 +1278,9 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
 int xhci_control_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *setup, uint16_t setup_len, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!x) return -1;
-    spin_lock(&x->lock);
+    xhci_ctrl_enter(x);
     int ret = xhci_control_transfer_impl(x, slot_id, endpoint, setup, setup_len, data, data_len, direction);
-    spin_unlock(&x->lock);
+    xhci_ctrl_leave(x);
     return ret;
 }
 
@@ -1221,6 +1351,9 @@ static int xhci_init(struct xhci_controller *x, int idx) {
         intr_tr_idx[idx][s] = 0;
         intr_cycle[idx][s] = 1;
         intr_active[idx][s] = 0;
+        intr_submitted[idx][s] = 0;
+        intr_done[idx][s] = 0;
+        intr_error[idx][s] = 0;
         intr_slot_dci[idx][s] = 0;
         ep_configured[idx][s] = 0;
         ep_needs_reset[idx][s] = 0;
@@ -1232,6 +1365,8 @@ static int xhci_init(struct xhci_controller *x, int idx) {
             bulk_cycle [idx][s][d] = 1;
             bulk_active [idx][s][d] = 0;
             bulk_error [idx][s][d] = 0;
+            bulk_submitted[idx][s][d] = 0;
+            bulk_done [idx][s][d] = 0;
             bulk_ep_configured[idx][s][d] = 0;
             bulk_slot_dci [idx][s][d] = 0;
         }
@@ -1397,7 +1532,7 @@ static void xhci_control_ep0_recover(struct xhci_controller *x, uint8_t slot_id,
     ctrl_tr_cycle[idx][slot_id - 1] = 1;
 }
 
-static void xhci_reset_bulk_toggle(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint)
+static void xhci_reset_bulk_toggle_locked(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint)
 {
     if (!x || !x->initialized || slot_id == 0) return;
 
@@ -1483,9 +1618,19 @@ static void xhci_reset_bulk_toggle(struct xhci_controller *x, uint8_t slot_id, u
     bulk_cycle [ci][ki][dir] = 1u;
     bulk_active[ci][ki][dir] = 0u;
     bulk_error [ci][ki][dir] = 0u;
+    bulk_submitted[ci][ki][dir] = 0u;
+    bulk_done [ci][ki][dir] = 0u;
 }
 
-static int xhci_interrupt_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
+static void xhci_reset_bulk_toggle(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint)
+{
+    if (!x) return;
+    xhci_ctrl_enter(x);
+    xhci_reset_bulk_toggle_locked(x, slot_id, endpoint);
+    xhci_ctrl_leave(x);
+}
+
+static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) {
         usb_log_hex(USB_LOG_XHCI, USB_LOG_ERROR, "INTR: bad ctrl/slot", slot_id);
@@ -1505,17 +1650,31 @@ static int xhci_interrupt_transfer(struct xhci_controller *x, uint8_t slot_id, u
     uint64_t ring_base = virt_to_phys(tr_ring);
     uint64_t buf_phys = virt_to_phys(data);
 
-    if (intr_active[ci][ki]) {
+    if (intr_submitted[ci][ki]) {
 
-        xhci_poll_event_ring(x);
+        if (!intr_done[ci][ki] && !intr_error[ci][ki])
+            xhci_poll_event_ring(x);
 
-        if (intr_active[ci][ki]) {
+        if (intr_error[ci][ki]) {
+            intr_error[ci][ki] = 0;
+            intr_done[ci][ki] = 0;
+            intr_active[ci][ki] = 0;
+            intr_submitted[ci][ki] = 0;
+            ep_needs_reset[ci][ki] = 1;
+            return -1;
+        }
+
+        if (!intr_done[ci][ki]) {
             uint32_t s = rd32(x->op_base, XHCI_OP_USBSTS);
             if (s & (1 << 3)) wr32(x->op_base, XHCI_OP_USBSTS, (1 << 3));
             wr32(x->rt_base, 0x20, rd32(x->rt_base, 0x20) | 3u);
             FULL_BARRIER();
             return -2;
         }
+
+        intr_done[ci][ki] = 0;
+        intr_active[ci][ki] = 0;
+        intr_submitted[ci][ki] = 0;
 
         if (is_in) {
             for (uint64_t ca = (uint64_t)data;
@@ -1623,12 +1782,24 @@ static int xhci_interrupt_transfer(struct xhci_controller *x, uint8_t slot_id, u
     FULL_BARRIER();
 
     ep_configured[ci][ki] = 1;
+    intr_done[ci][ki] = 0;
+    intr_error[ci][ki] = 0;
     intr_active[ci][ki] = 1;
+    intr_submitted[ci][ki] = 1;
     intr_slot_dci[ci][ki] = dci;
     intr_data_ptr[ci][ki] = data;
     intr_data_len[ci][ki] = data_len;
 
     return -2;
+}
+
+static int xhci_interrupt_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int ret = xhci_interrupt_transfer_impl(x, slot_id, endpoint, data, data_len, direction);
+    xhci_ctrl_leave(x);
+    return ret;
 }
 
 static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
@@ -1649,31 +1820,34 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
     struct xhci_trb *tr_ring = xhci_mem[ci].bulk_rings[ki][dir];
     uint64_t ring_base = virt_to_phys(tr_ring);
     uint64_t buf_phys = virt_to_phys(data);
+    (void)ring_base;
 
-    if (bulk_error[ci][ki][dir]) {
-        bulk_error[ci][ki][dir] = 0;
-        bulk_active[ci][ki][dir] = 0;
-        xhci_reset_bulk_toggle(x, slot_id, endpoint);
-        return -1;
-    }
+    if (bulk_submitted[ci][ki][dir]) {
 
-    if (bulk_active[ci][ki][dir]) {
-
-        xhci_poll_event_ring(x);
+        if (!bulk_done[ci][ki][dir] && !bulk_error[ci][ki][dir])
+            xhci_poll_event_ring(x);
 
         if (bulk_error[ci][ki][dir]) {
             bulk_error[ci][ki][dir] = 0;
             bulk_active[ci][ki][dir] = 0;
-            xhci_reset_bulk_toggle(x, slot_id, endpoint);
+            bulk_submitted[ci][ki][dir] = 0;
+            bulk_done[ci][ki][dir] = 0;
+            xhci_reset_bulk_toggle_locked(x, slot_id, endpoint);
             return -1;
         }
-        if (bulk_active[ci][ki][dir]) {
+
+        if (!bulk_done[ci][ki][dir]) {
             uint32_t s = rd32(x->op_base, XHCI_OP_USBSTS);
             if (s & (1u << 3)) wr32(x->op_base, XHCI_OP_USBSTS, (1u << 3));
             wr32(x->rt_base, 0x20, rd32(x->rt_base, 0x20) | 3u);
             FULL_BARRIER();
             return -2;
         }
+
+        bulk_done[ci][ki][dir] = 0;
+        bulk_active[ci][ki][dir] = 0;
+        bulk_submitted[ci][ki][dir] = 0;
+
         if (is_in) {
 
             for (uint64_t ca = (uint64_t)data;
@@ -1686,6 +1860,14 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
         intr_data_ptr[ci][ki] = NULL;
         intr_data_len[ci][ki] = 0;
         return 0;
+    }
+
+    if (bulk_error[ci][ki][dir]) {
+        bulk_error[ci][ki][dir] = 0;
+        bulk_active[ci][ki][dir] = 0;
+        bulk_done[ci][ki][dir] = 0;
+        xhci_reset_bulk_toggle_locked(x, slot_id, endpoint);
+        return -1;
     }
 
     if (!bulk_ep_configured[ci][ki][dir]) {
@@ -1774,7 +1956,7 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
             for (int _i = 0; _i < 5000; _i++) {
                 xhci_poll_event_ring(x);
                 if (x->last_completion_code != 0xFF) break;
-                delay_ms(2);
+                xhci_wait_ms(2);
             }
             if (x->last_completion_code != 1) {
                 g_last_xfer_error_code = x->last_completion_code;
@@ -1819,7 +2001,7 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
             for (int _i = 0; _i < 5000; _i++) {
                 xhci_poll_event_ring(x);
                 if (x->last_completion_code != 0xFF) break;
-                delay_ms(2);
+                xhci_wait_ms(2);
             }
             if (x->last_completion_code != 1) {
                 g_last_xfer_error_code = x->last_completion_code;
@@ -1840,6 +2022,8 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
         bulk_tr_idx[ci][ki][1] = 0; bulk_cycle[ci][ki][1] = 1;
         bulk_error [ci][ki][0] = 0; bulk_error [ci][ki][1] = 0;
         bulk_active[ci][ki][0] = 0; bulk_active[ci][ki][1] = 0;
+        bulk_submitted[ci][ki][0] = 0; bulk_submitted[ci][ki][1] = 0;
+        bulk_done [ci][ki][0] = 0; bulk_done [ci][ki][1] = 0;
         bulk_ep_configured[ci][ki][0] = 1; bulk_slot_dci[ci][ki][0] = dci_out;
         bulk_ep_configured[ci][ki][1] = 1; bulk_slot_dci[ci][ki][1] = dci_in;
 
@@ -1895,16 +2079,19 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
 
     FULL_BARRIER();
 
+    bulk_done[ci][ki][dir] = 0;
+    bulk_error[ci][ki][dir] = 0;
     bulk_active[ci][ki][dir] = 1;
+    bulk_submitted[ci][ki][dir] = 1;
     return -2;
 }
 
 static int xhci_bulk_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!x) return -1;
-    spin_lock(&x->lock);
+    xhci_ctrl_enter(x);
     int ret = xhci_bulk_transfer_impl(x, slot_id, endpoint, data, data_len, direction);
-    spin_unlock(&x->lock);
+    xhci_ctrl_leave(x);
     return ret;
 }
 
@@ -2016,9 +2203,9 @@ static int xhci_iso_transfer_impl(struct xhci_controller *x, uint8_t slot_id, ui
 static int xhci_iso_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
 {
     if (!x) return -1;
-    spin_lock(&x->lock);
+    xhci_ctrl_enter(x);
     int ret = xhci_iso_transfer_impl(x, slot_id, endpoint, data, total_len, n_frames, frame_lens, direction);
-    spin_unlock(&x->lock);
+    xhci_ctrl_leave(x);
     return ret;
 }
 

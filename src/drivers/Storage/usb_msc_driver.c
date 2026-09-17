@@ -9,6 +9,7 @@
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/scheduler/scheduler.h"
 #include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
@@ -23,7 +24,22 @@ static usb_msc_device_t msc_devs[USB_MSC_MAX_DEVICES];
 static int msc_dev_count = 0;
 static spinlock_t msc_lock = SPINLOCK_INIT;
 
+static void msc_lock_acquire(spinlock_t *l)
+{
+    while (!spin_trylock(l)) {
+        if (current_task()) scheduler_yield();
+        else asm volatile("pause");
+    }
+}
+
 static void (*delay_ms)(uint64_t) = NULL;
+
+static void msc_wait_tick(void)
+{
+    if (current_task()) scheduler_sleep_ms(1);
+    else if (delay_ms) delay_ms(1);
+}
+
 
 static usb_cbw_t g_cbw __attribute__((aligned(64)));
 static usb_csw_t g_csw __attribute__((aligned(64)));
@@ -211,7 +227,7 @@ static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t l
         ret = core->bulk_transfer(d->usb_dev, endpoint, buf, len, direction);
         attempts++;
         if (ret != -2) break;
-        if (delay_ms) delay_ms(1);
+        msc_wait_tick();
 
         if ((ms & 63) == 63) {
             struct usb_core_driver *_fcore = get_usb_core();
@@ -719,7 +735,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
 
     if (d->sector_size == 0) return MSC_ERR_IO;
 
-    spin_lock(&msc_lock);
+    msc_lock_acquire(&msc_lock);
 
     uint8_t *dst = (uint8_t *)buf;
     uint32_t done = 0;
@@ -772,7 +788,7 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
 
     if (d->sector_size == 0) return MSC_ERR_IO;
 
-    spin_lock(&msc_lock);
+    msc_lock_acquire(&msc_lock);
 
     uint8_t *src = (uint8_t *)buf;
     uint32_t done = 0;

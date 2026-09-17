@@ -63,7 +63,14 @@ typedef struct xhci_controller {
     volatile uint8_t transfer_in_progress;
     uint8_t initialized;
     uint8_t use_polling;
+
     spinlock_t lock;
+    void *volatile lock_owner;
+    volatile uint32_t lock_depth;
+
+    spinlock_t event_lock;
+    void *volatile event_owner;
+    volatile uint32_t event_depth;
 } xhci_controller;
 
 typedef struct xhci_driver {

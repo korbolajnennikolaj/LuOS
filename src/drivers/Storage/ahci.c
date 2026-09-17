@@ -1,5 +1,7 @@
 #include "ahci.h"
 
+#include "kernel/scheduler/scheduler.h"
+
 #include "ata.h"
 #include "block_device.h"
 #include "components/drivers.h"
@@ -55,6 +57,18 @@ static inline void ahci_io_mb(void)
 }
 
 #define AHCI_TIMEOUT_MS 500
+
+#define AHCI_LINK_SETTLE_MS 100
+#define AHCI_LINK_TIMEOUT_MS 600
+
+static void ahci_lock(spinlock_t *l)
+{
+    while (!spin_trylock(l)) {
+        if (current_task()) scheduler_yield();
+        else asm volatile("pause");
+    }
+}
+
 static void (*delay_ms)(uint64_t);
 
 static void port_stop(volatile hba_port_t *port)
@@ -102,7 +116,7 @@ static int port_find_free_slot(volatile hba_port_t *port)
 
 static int port_issue_cmd(ahci_port_t *ap, bool write, uint64_t lba, uint32_t sectors, void *buf)
 {
-    spin_lock(&ap->lock);
+    ahci_lock(&ap->lock);
 
     volatile hba_port_t *port = ap->regs;
 
@@ -335,11 +349,15 @@ static bool port_init(ahci_port_t *ap, volatile hba_port_t *regs, int idx, int p
 
     ssts = regs->ssts;
     if ((ssts & 0xF) != HBA_SSTS_DET_PRESENT || ((ssts >> 8) & 0xF) != 0x1) {
-        int retries = 100;
-        while (retries-- > 0) {
-            if (delay_ms) delay_ms(50);
+        int waited = 0;
+        while (waited < AHCI_LINK_TIMEOUT_MS) {
+            uint32_t det = ssts & 0xFu;
+            uint32_t ipm = (ssts >> 8) & 0xFu;
+            if (det == HBA_SSTS_DET_PRESENT && ipm == 0x1u) break;
+            if (waited >= AHCI_LINK_SETTLE_MS && (det == 0u || det == 4u)) break;
+            if (delay_ms) delay_ms(1);
+            waited++;
             ssts = regs->ssts;
-            if ((ssts & 0xF) == HBA_SSTS_DET_PRESENT && ((ssts >> 8) & 0xF) == 0x1) break;
         }
         ahci_puts("[AHCI] port ", AHCI_COL_INFO); ahci_dec(port_no, AHCI_COL_DATA);
         ahci_puts(": after link wait SSTS=", AHCI_COL_INFO);
