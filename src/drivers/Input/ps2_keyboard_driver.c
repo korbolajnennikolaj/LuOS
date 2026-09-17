@@ -58,6 +58,14 @@ static void send_keyboard_command(uint8_t cmd) {
 }
 
 static spinlock_t ps2_bus_lock = SPINLOCK_INIT;
+
+uint64_t ps2_bus_acquire(void) {
+    return spin_lock_irqsave(&ps2_bus_lock);
+}
+
+void ps2_bus_release(uint64_t flags) {
+    spin_unlock_irqrestore(&ps2_bus_lock, flags);
+}
 static volatile bool leds_dirty = false;
 
 static void ps2_process_byte(uint8_t raw);
@@ -89,7 +97,7 @@ static void ps2_program_leds_locked(void) {
 }
 
 static void keyboard_set_leds(bool caps, bool num, bool scroll) {
-    uint64_t flags = spin_lock_irqsave(&ps2_bus_lock);
+    uint64_t flags = ps2_bus_acquire();
 
     kbd_state.is_caps_lock = caps;
     kbd_state.is_num_lock = num;
@@ -98,7 +106,7 @@ static void keyboard_set_leds(bool caps, bool num, bool scroll) {
 
     ps2_program_leds_locked();
 
-    spin_unlock_irqrestore(&ps2_bus_lock, flags);
+    ps2_bus_release(flags);
 }
 
 static bool key_buffer_push(uint8_t key) {
@@ -216,7 +224,7 @@ static void ps2_drain_locked(void) {
 }
 
 void ps2_keyboard_handler(void) {
-    uint64_t flags = spin_lock_irqsave(&ps2_bus_lock);
+    uint64_t flags = ps2_bus_acquire();
 
     ps2_drain_locked();
 
@@ -225,7 +233,7 @@ void ps2_keyboard_handler(void) {
         ps2_program_leds_locked();
     }
 
-    spin_unlock_irqrestore(&ps2_bus_lock, flags);
+    ps2_bus_release(flags);
 }
 
 static uint8_t keyboard_get_key(void) {

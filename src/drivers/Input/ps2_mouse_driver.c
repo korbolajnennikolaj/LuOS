@@ -4,6 +4,7 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "kernel/scheduler/spinlock.h"
+#include "ps2_keyboard_driver.h"
 #include "mouse_driver.h"
 
 #include <ports.h>
@@ -44,29 +45,17 @@ static bool mouse_detect_wheel(void) {
     return (inb(PS2_DATA_PORT) == 3);
 }
 
-void ps2_mouse_handler(void) {
-    uint8_t status = inb(PS2_STATUS_PORT);
-    if (!(status & PS2_STATUS_OUTPUT_FULL)) return;
-    if (!(status & PS2_STATUS_AUX_DATA)) return;
-
-    uint8_t data = inb(PS2_DATA_PORT);
-
-    if (packet_pos == 0 && !(data & MOUSE_PACKET_ALWAYS1)) return;
-
-    packet_buf[packet_pos++] = data;
-    if (packet_pos < packet_size) return;
-    packet_pos = 0;
-
+static void ps2_mouse_apply_packet(void) {
     uint8_t flags = packet_buf[0];
 
-    spin_lock(&mouse_lock);
+    uint64_t irq_flags = spin_lock_irqsave(&mouse_lock);
 
     mouse_state.btn_left = (flags & MOUSE_PACKET_BTN_LEFT) != 0;
     mouse_state.btn_right = (flags & MOUSE_PACKET_BTN_RIGHT) != 0;
     mouse_state.btn_middle = (flags & MOUSE_PACKET_BTN_MIDDLE) != 0;
 
     if ((flags & MOUSE_PACKET_X_OVERFLOW) || (flags & MOUSE_PACKET_Y_OVERFLOW)) {
-        spin_unlock(&mouse_lock);
+        spin_unlock_irqrestore(&mouse_lock, irq_flags);
         return;
     }
 
@@ -82,7 +71,30 @@ void ps2_mouse_handler(void) {
         mouse_state.wheel += dw;
     }
 
-    spin_unlock(&mouse_lock);
+    spin_unlock_irqrestore(&mouse_lock, irq_flags);
+}
+
+void ps2_mouse_handler(void) {
+    uint64_t flags = ps2_bus_acquire();
+
+    for (;;) {
+        uint8_t status = inb(PS2_STATUS_PORT);
+
+        if (!(status & PS2_STATUS_OUTPUT_FULL)) break;
+        if (!(status & PS2_STATUS_AUX_DATA)) break;
+
+        uint8_t data = inb(PS2_DATA_PORT);
+
+        if (packet_pos == 0 && !(data & MOUSE_PACKET_ALWAYS1)) continue;
+
+        packet_buf[packet_pos++] = data;
+        if (packet_pos < packet_size) continue;
+
+        packet_pos = 0;
+        ps2_mouse_apply_packet();
+    }
+
+    ps2_bus_release(flags);
 }
 
 static void ps2_mouse_irq_wrapper(struct registers *r) {
@@ -91,6 +103,8 @@ static void ps2_mouse_irq_wrapper(struct registers *r) {
 }
 
 static void mouse_init(void) {
+    uint64_t bus_flags = ps2_bus_acquire();
+
     while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL)
         inb(PS2_DATA_PORT);
 
@@ -120,7 +134,8 @@ static void mouse_init(void) {
 
     mouse_write(MOUSE_CMD_ENABLE_STREAM);
     irq_register_handler(PS2_MOUSE_IRQ_VECTOR, ps2_mouse_irq_wrapper);
-    ioapic_unmask_irq(12);
+
+    ps2_bus_release(bus_flags);
 }
 
 static struct ps2_mouse_state *mouse_get_state(void) {
@@ -128,11 +143,11 @@ static struct ps2_mouse_state *mouse_get_state(void) {
 }
 
 static void mouse_reset_deltas(void) {
-    spin_lock(&mouse_lock);
+    uint64_t irq_flags = spin_lock_irqsave(&mouse_lock);
     mouse_state.x = 0;
     mouse_state.y = 0;
     mouse_state.wheel = 0;
-    spin_unlock(&mouse_lock);
+    spin_unlock_irqrestore(&mouse_lock, irq_flags);
 }
 
 static struct ps2_mouse_driver drv_ps2_mouse = {

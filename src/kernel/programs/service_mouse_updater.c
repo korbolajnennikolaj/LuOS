@@ -9,6 +9,7 @@
 
 #define MOUSE_UPDATER_TICK_MS 10
 #define MOUSE_UPDATER_WATCHDOG_MS 2000
+#define MOUSE_UPDATER_STALE_MS 200
 
 static volatile uint64_t mouse_updater_polls = 0;
 static volatile uint64_t mouse_updater_events = 0;
@@ -64,6 +65,26 @@ static void mouse_updater_absorb(mouse_state_t *st) {
         mouse_updater_events++;
 }
 
+static bool mouse_updater_running(void) {
+    uint64_t last = mouse_updater_last_beat_ms;
+    if (last == 0) return false;
+
+    uint64_t now = service_uptime_ms();
+    return (now >= last) && ((now - last) < MOUSE_UPDATER_STALE_MS);
+}
+
+static void mouse_updater_absorb_direct(void) {
+    if (mouse_updater_running()) return;
+
+    struct mouse_driver *mouse = get_self_driver(MOUSE_DRIVER, VIRTUAL_MOUSE);
+    if (!mouse || !mouse->get_state) return;
+
+    if (cursor_max_x == 0 && cursor_max_y == 0) mouse_updater_load_limits();
+
+    mouse_updater_absorb(mouse->get_state());
+    if (mouse->reset_deltas) mouse->reset_deltas();
+}
+
 static void mouse_updater_entry(void *arg) {
     (void)arg;
 
@@ -102,15 +123,19 @@ static bool mouse_updater_update(void *arg) {
 }
 
 int32_t mouse_updater_x(void) {
+    mouse_updater_absorb_direct();
     return cursor_x;
 }
 
 int32_t mouse_updater_y(void) {
+    mouse_updater_absorb_direct();
     return cursor_y;
 }
 
 bool mouse_updater_take(mouse_sample_t *out) {
     if (!out) return false;
+
+    mouse_updater_absorb_direct();
 
     *out = pending;
 
@@ -123,6 +148,10 @@ bool mouse_updater_take(mouse_sample_t *out) {
 }
 
 int mouse_updater_active_type(void) {
+    if (mouse_updater_type < 0) {
+        struct mouse_driver *mouse = get_self_driver(MOUSE_DRIVER, VIRTUAL_MOUSE);
+        if (mouse && mouse->get_active_type) return mouse->get_active_type();
+    }
     return mouse_updater_type;
 }
 

@@ -159,6 +159,9 @@ typedef struct ps2_keyboard_driver {
 } ps2_keyboard_driver;
 
 void ps2_keyboard_handler(void);
+
+uint64_t ps2_bus_acquire(void);
+void ps2_bus_release(uint64_t flags);
 struct ps2_keyboard_driver *return_ps2_keyboard_driver(void);
 struct driver *return_meta_ps2_keyboard_driver(void);
 

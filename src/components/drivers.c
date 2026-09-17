@@ -111,6 +111,9 @@ void init_drivers() {
     uint32_t kbd_gsi = madt_remap_isa_irq(1);
     if (kbd_gsi <= 23) ioapic_unmask_irq((uint8_t)kbd_gsi);
 
+    uint32_t mouse_gsi = madt_remap_isa_irq(12);
+    if (mouse_gsi <= 23) ioapic_unmask_irq((uint8_t)mouse_gsi);
+
     msi_init();
 
     register_driver(return_meta_uhci_driver());

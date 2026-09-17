@@ -13,9 +13,14 @@ static struct mouse_state vmouse_state = {0};
 
 static void backend_poll(struct mouse_backend *b) {
     if (!b->active) return;
-    if (b->type == USB_MOUSE && b->drv.usb && b->drv.usb->mouse_handler)
-        b->drv.usb->mouse_handler();
 
+    if (b->type == USB_MOUSE && b->drv.usb && b->drv.usb->mouse_handler) {
+        b->drv.usb->mouse_handler();
+        return;
+    }
+
+    if (b->type == PS2_MOUSE && b->drv.ps2 && b->drv.ps2->mouse_handler)
+        b->drv.ps2->mouse_handler();
 }
 
 static void backend_reset_deltas(struct mouse_backend *b) {
