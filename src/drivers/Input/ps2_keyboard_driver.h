@@ -14,6 +14,9 @@
 #define PS2_STATUS_INPUT_FULL (1 << 1)
 #define PS2_STATUS_AUX_DATA (1 << 5)
 
+#define PS2_ACK 0xFA
+#define PS2_RESEND 0xFE
+
 #define PS2_KEY_ESC 0x01
 #define PS2_KEY_1 0x02
 #define PS2_KEY_2 0x03

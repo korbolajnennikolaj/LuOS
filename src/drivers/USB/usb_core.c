@@ -744,13 +744,16 @@ static void usb_core_poll_transfers_locked(void) {
             asm volatile("pause");
     }
 
-    usb_root_ports_poll();
-
-    usb_hub_poll();
-
     usb_event_dispatch_all();
     usb_bulk_dispatch_all();
     usb_iso_dispatch_all();
+}
+
+static void usb_core_poll_topology_locked(void) {
+    usb_root_ports_poll();
+    usb_hub_poll();
+
+    usb_event_dispatch_all();
 }
 
 static uint64_t usb_pump_now_ms(void) {
@@ -769,6 +772,13 @@ uint64_t usb_core_pump_age_ms(void) {
 static void usb_core_poll_transfers(void) {
     if (!usb_pump_enter()) return;
     usb_core_poll_transfers_locked();
+    usb_pump_last_ms = usb_pump_now_ms();
+    usb_pump_leave();
+}
+
+void usb_core_poll_topology(void) {
+    if (!usb_pump_enter()) return;
+    usb_core_poll_topology_locked();
     usb_pump_last_ms = usb_pump_now_ms();
     usb_pump_leave();
 }
@@ -1362,6 +1372,7 @@ static struct usb_core_driver core = {
     .interrupt_transfer = usb_interrupt_transfer,
     .enqueue_event = usb_core_enqueue_event,
     .poll_transfers = usb_core_poll_transfers,
+    .poll_topology = usb_core_poll_topology,
     .bulk_transfer = usb_bulk_transfer,
     .iso_transfer = usb_iso_transfer,
     .reset_endpoint_toggle = usb_reset_endpoint_toggle,

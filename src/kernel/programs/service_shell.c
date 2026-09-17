@@ -1696,8 +1696,6 @@ static void cmd_hid_test(struct limine_video_driver *video, struct keyboard_driv
     while (running) {
 
         if (kbd) {
-            kbd->keyboard_handler();
-
             while (kbd->has_key()) {
                 uint8_t sc = kbd->get_key();
 

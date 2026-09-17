@@ -6,6 +6,7 @@
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
 #include "components/pci.h"
+#include "components/ACPI/madt.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Input/mouse_driver.h"
 #include "drivers/Storage/ahci.h"
@@ -106,6 +107,9 @@ void init_drivers() {
     acpi_init();
 
     ioapic_apply_isa_overrides();
+
+    uint32_t kbd_gsi = madt_remap_isa_irq(1);
+    if (kbd_gsi <= 23) ioapic_unmask_irq((uint8_t)kbd_gsi);
 
     msi_init();
 

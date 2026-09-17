@@ -2,6 +2,7 @@
 
 #include "components/drivers.h"
 #include "components/Interruptions/isr.h"
+#include "kernel/scheduler/spinlock.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "drivers/Video/limine_video_driver.h"
@@ -56,17 +57,48 @@ static void send_keyboard_command(uint8_t cmd) {
     outb(PS2_DATA_PORT, cmd);
 }
 
-static void keyboard_set_leds(bool caps, bool num, bool scroll) {
+static spinlock_t ps2_bus_lock = SPINLOCK_INIT;
+static volatile bool leds_dirty = false;
+
+static void ps2_process_byte(uint8_t raw);
+
+static void ps2_wait_ack_locked(void) {
+    for (int i = 0; i < 16; i++) {
+        wait_able_read();
+
+        uint8_t status = inb(PS2_STATUS_PORT);
+        if (!(status & PS2_STATUS_OUTPUT_FULL)) return;
+        if (status & PS2_STATUS_AUX_DATA) return;
+
+        uint8_t b = inb(PS2_DATA_PORT);
+        if (b == PS2_ACK || b == PS2_RESEND) return;
+
+        ps2_process_byte(b);
+    }
+}
+
+static void ps2_program_leds_locked(void) {
+    uint8_t leds = ((uint8_t)kbd_state.is_scroll_lock << 0)
+                 | ((uint8_t)kbd_state.is_num_lock << 1)
+                 | ((uint8_t)kbd_state.is_caps_lock << 2);
+
     send_keyboard_command(0xED);
-    wait_able_read(); inb(PS2_DATA_PORT);
-    uint8_t leds = ((uint8_t)scroll << 0)
-                 | ((uint8_t)num << 1)
-                 | ((uint8_t)caps << 2);
+    ps2_wait_ack_locked();
     send_keyboard_command(leds);
-    wait_able_read(); inb(PS2_DATA_PORT);
+    ps2_wait_ack_locked();
+}
+
+static void keyboard_set_leds(bool caps, bool num, bool scroll) {
+    uint64_t flags = spin_lock_irqsave(&ps2_bus_lock);
+
     kbd_state.is_caps_lock = caps;
     kbd_state.is_num_lock = num;
     kbd_state.is_scroll_lock = scroll;
+    leds_dirty = false;
+
+    ps2_program_leds_locked();
+
+    spin_unlock_irqrestore(&ps2_bus_lock, flags);
 }
 
 static bool key_buffer_push(uint8_t key) {
@@ -93,98 +125,107 @@ static void ps2_keyboard_irq_wrapper(struct registers *r) {
     ps2_keyboard_handler();
 }
 
-void ps2_keyboard_handler(void) {
+static void ps2_process_byte(uint8_t raw) {
 
+    if (raw == PS2_KEY_EXTENDED) {
+        kbd_state.extended_pending = true;
+        return;
+    }
+
+    bool pressed = !(raw & 0x80);
+    uint8_t key = raw & 0x7F;
+
+    if (kbd_state.extended_pending) {
+        kbd_state.extended_pending = false;
+
+        if (key == PS2_EXT_RCTRL) {
+            kbd_state.is_rctrl_pressed = pressed;
+            return;
+        }
+        if (key == PS2_EXT_RALT) {
+            kbd_state.is_ralt_pressed = pressed;
+            return;
+        }
+
+        if (key == PS2_EXT_KP_ENTER) {
+            bool was_held = ext_held[PS2_KEY_ENTER & 0x7F];
+            ext_held[PS2_KEY_ENTER & 0x7F] = pressed;
+            if (pressed && !was_held)
+                key_buffer_push(PS2_KEY_ENTER);
+            return;
+        }
+
+        bool was_ext_held = ext_held[key & 0x7F];
+        ext_held[key & 0x7F] = pressed;
+        if (pressed && !was_ext_held)
+            ext_buffer_push(PS2_EXTKEY(key));
+        return;
+    }
+
+    switch (key) {
+        case PS2_KEY_LSHIFT:
+        case PS2_KEY_RSHIFT:
+            kbd_state.is_shift_pressed = pressed;
+            break;
+        case PS2_KEY_LCTRL:
+            kbd_state.is_ctrl_pressed = pressed;
+            break;
+        case PS2_KEY_LALT:
+            kbd_state.is_alt_pressed = pressed;
+            break;
+        case PS2_KEY_CAPS_LOCK:
+            if (pressed) {
+                kbd_state.is_caps_lock = !kbd_state.is_caps_lock;
+                leds_dirty = true;
+            }
+            return;
+        case PS2_KEY_NUM_LOCK:
+            if (pressed) {
+                kbd_state.is_num_lock = !kbd_state.is_num_lock;
+                leds_dirty = true;
+            }
+            return;
+        case PS2_KEY_SCROLL_LOCK:
+            if (pressed) {
+                kbd_state.is_scroll_lock = !kbd_state.is_scroll_lock;
+                leds_dirty = true;
+            }
+            return;
+    }
+
+    if (key < 128) {
+        bool was_held = key_held[key];
+        key_held[key] = pressed;
+        if (pressed && !was_held)
+            key_buffer_push(key);
+    }
+}
+
+static void ps2_drain_locked(void) {
     for (;;) {
         uint8_t status = inb(PS2_STATUS_PORT);
 
-        if (!(status & PS2_STATUS_OUTPUT_FULL)) {
-            return;
-        }
-
-        if (status & PS2_STATUS_AUX_DATA) {
-
-            return;
-        }
+        if (!(status & PS2_STATUS_OUTPUT_FULL)) return;
+        if (status & PS2_STATUS_AUX_DATA) return;
 
         uint8_t raw = inb(PS2_DATA_PORT);
+        if (raw == PS2_ACK || raw == PS2_RESEND) continue;
 
-        if (raw == PS2_KEY_EXTENDED) {
-            kbd_state.extended_pending = true;
-            continue;
-        }
-
-        bool pressed = !(raw & 0x80);
-        uint8_t key = raw & 0x7F;
-
-        if (kbd_state.extended_pending) {
-            kbd_state.extended_pending = false;
-
-            if (key == PS2_EXT_RCTRL) {
-                kbd_state.is_rctrl_pressed = pressed;
-                continue;
-            }
-            if (key == PS2_EXT_RALT) {
-                kbd_state.is_ralt_pressed = pressed;
-                continue;
-            }
-
-            if (key == PS2_EXT_KP_ENTER) {
-                bool was_held = ext_held[PS2_KEY_ENTER & 0x7F];
-                ext_held[PS2_KEY_ENTER & 0x7F] = pressed;
-                if (pressed && !was_held)
-                    key_buffer_push(PS2_KEY_ENTER);
-                continue;
-            }
-
-            bool was_ext_held = ext_held[key & 0x7F];
-            ext_held[key & 0x7F] = pressed;
-            if (pressed && !was_ext_held)
-                ext_buffer_push(PS2_EXTKEY(key));
-            continue;
-        }
-
-        switch (key) {
-            case PS2_KEY_LSHIFT:
-            case PS2_KEY_RSHIFT:
-                kbd_state.is_shift_pressed = pressed;
-                break;
-            case PS2_KEY_LCTRL:
-                kbd_state.is_ctrl_pressed = pressed;
-                break;
-            case PS2_KEY_LALT:
-                kbd_state.is_alt_pressed = pressed;
-                break;
-            case PS2_KEY_CAPS_LOCK:
-                if (pressed) {
-                    keyboard_set_leds(!kbd_state.is_caps_lock,
-                                       kbd_state.is_num_lock,
-                                       kbd_state.is_scroll_lock);
-                }
-                continue;
-            case PS2_KEY_NUM_LOCK:
-                if (pressed) {
-                    keyboard_set_leds(kbd_state.is_caps_lock,
-                                      !kbd_state.is_num_lock,
-                                       kbd_state.is_scroll_lock);
-                }
-                continue;
-            case PS2_KEY_SCROLL_LOCK:
-                if (pressed) {
-                    keyboard_set_leds(kbd_state.is_caps_lock,
-                                       kbd_state.is_num_lock,
-                                      !kbd_state.is_scroll_lock);
-                }
-                continue;
-        }
-
-        if (key < 128) {
-            bool was_held = key_held[key];
-            key_held[key] = pressed;
-            if (pressed && !was_held)
-                key_buffer_push(key);
-        }
+        ps2_process_byte(raw);
     }
+}
+
+void ps2_keyboard_handler(void) {
+    uint64_t flags = spin_lock_irqsave(&ps2_bus_lock);
+
+    ps2_drain_locked();
+
+    if (leds_dirty) {
+        leds_dirty = false;
+        ps2_program_leds_locked();
+    }
+
+    spin_unlock_irqrestore(&ps2_bus_lock, flags);
 }
 
 static uint8_t keyboard_get_key(void) {

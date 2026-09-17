@@ -112,6 +112,9 @@ typedef struct keyboard_driver {
 
     void (*keyboard_handler)(void);
 
+    void (*claim_pump)(void);
+    void (*release_pump)(void);
+
     bool (*has_extended_key)(void);
     uint16_t (*get_extended_key)(void);
 

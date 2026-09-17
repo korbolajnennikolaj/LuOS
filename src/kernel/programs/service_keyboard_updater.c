@@ -22,9 +22,20 @@ static void keyboard_updater_entry(void *arg) {
     keyboard_updater_last_beat_ms = service_uptime_ms();
 
     struct keyboard_driver *kbd = get_self_driver(KEYBOARD_DRIVER, VIRTUAL_KEYBOARD);
+    if (kbd && kbd->claim_pump) kbd->claim_pump();
+
+    bool claimed = (kbd != NULL);
 
     while (!service_stop_requested(svc->id)) {
-        if (!kbd) kbd = get_self_driver(KEYBOARD_DRIVER, VIRTUAL_KEYBOARD);
+        if (!kbd) {
+            kbd = get_self_driver(KEYBOARD_DRIVER, VIRTUAL_KEYBOARD);
+            claimed = false;
+        }
+
+        if (kbd && !claimed) {
+            if (kbd->claim_pump) kbd->claim_pump();
+            claimed = true;
+        }
 
         if (kbd) {
             if (kbd->keyboard_handler) kbd->keyboard_handler();
@@ -35,6 +46,8 @@ static void keyboard_updater_entry(void *arg) {
         keyboard_updater_last_beat_ms = service_uptime_ms();
         scheduler_sleep_ms(KEYBOARD_UPDATER_TICK_MS);
     }
+
+    if (kbd && kbd->release_pump) kbd->release_pump();
 }
 
 static bool keyboard_updater_update(void *arg) {

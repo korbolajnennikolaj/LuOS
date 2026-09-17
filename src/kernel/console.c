@@ -64,8 +64,6 @@ int luos_console_readline(const char *prompt, char *buf, size_t cap) {
 
     for (;;) {
 
-        if (kbd->keyboard_handler) kbd->keyboard_handler();
-
         if (hold_valid && kbd->is_key_held_from) {
             if (!kbd->is_key_held_from(hold_src, hold_sc)) {
                 hold_valid = 0;
@@ -201,7 +199,6 @@ int luos_console_at_eof(void) {
 int luos_console_has_key(void) {
     struct keyboard_driver *kbd = return_keyboard_driver();
     if (!kbd || !kbd->has_key) return 0;
-    if (kbd->keyboard_handler) kbd->keyboard_handler();
     if (pushback != LUOS_CONSOLE_EOF || line_pos < line_len) return 1;
     return kbd->has_key() ? 1 : 0;
 }
@@ -211,8 +208,6 @@ int luos_console_getkey(void) {
     if (!kbd || !kbd->get_key_event) return LUOS_CONSOLE_EOF;
 
     for (;;) {
-        if (kbd->keyboard_handler) kbd->keyboard_handler();
-
         struct key_event ev;
         if (!kbd->get_key_event(&ev)) {
             if (kbd->get_active_type && kbd->get_active_type() == USB_KEYBOARD)

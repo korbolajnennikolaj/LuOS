@@ -1,6 +1,7 @@
 #include "drivers/Input/keyboard_driver.h"
 
 #include "components/drivers.h"
+#include "kernel/scheduler/scheduler.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "drivers/USB/usb_core.h"
@@ -63,18 +64,14 @@ static uint16_t backend_get_extended(struct keyboard_backend *b) {
 
 static void backend_poll(struct keyboard_backend *b) {
     if (!b->active) return;
+
     if (b->type == USB_KEYBOARD && b->drv.usb && b->drv.usb->keyboard_handler) {
         b->drv.usb->keyboard_handler();
         return;
     }
 
-    if (b->type == PS2_KEYBOARD && b->drv.ps2 && b->drv.ps2->keyboard_handler) {
-        uint64_t flags;
-        asm volatile("pushfq; pop %0" : "=r"(flags));
-        asm volatile("cli");
+    if (b->type == PS2_KEYBOARD && b->drv.ps2 && b->drv.ps2->keyboard_handler)
         b->drv.ps2->keyboard_handler();
-        if (flags & (1u << 9)) asm volatile("sti");
-    }
 }
 
 static bool backend_is_key_held(struct keyboard_backend *b, uint8_t sc) {
@@ -151,6 +148,7 @@ static void vkbd_set_leds(bool caps_lock, bool num_lock, bool scroll_lock)
 #define VKBD_MIN_POLL_INTERVAL_MS 5
 
 static volatile uint64_t vkbd_last_external_poll_ms = 0;
+static void *vkbd_pump_owner = NULL;
 
 static bool vkbd_locks_inited = false;
 static bool vkbd_caps_lock = false;
@@ -330,8 +328,21 @@ static bool vkbd_is_key_held_from(enum KEYBOARD_TYPE source, uint8_t scancode) {
     return false;
 }
 
+static void vkbd_claim_pump(void) {
+    vkbd_pump_owner = (void *)current_task();
+    vkbd_last_external_poll_ms = kbd_uptime_ms();
+}
+
+static void vkbd_release_pump(void) {
+    void *me = (void *)current_task();
+    if (vkbd_pump_owner == me) vkbd_pump_owner = NULL;
+}
+
 static void vkbd_keyboard_handler(void) {
+    void *me = (void *)current_task();
     uint64_t now = kbd_uptime_ms();
+
+    if (vkbd_pump_owner != NULL && vkbd_pump_owner != me && vkbd_external_pump_alive()) return;
 
     if (now != 0 && vkbd_last_external_poll_ms != 0 &&
         (now - vkbd_last_external_poll_ms) < VKBD_MIN_POLL_INTERVAL_MS) return;
@@ -354,11 +365,6 @@ static void vkbd_input(const char *prompt, char *buffer, uint32_t max_len, uint3
     uint64_t last_repeat_ms = 0;
 
     while (idx < max_len - 1) {
-
-        if (!vkbd_external_pump_alive()) {
-            vkbd_poll_backends();
-            vkbd_sync_locks();
-        }
 
         if (hold_sc != 0 && hold_backend != NULL) {
             if (!backend_is_key_held(hold_backend, hold_sc)) {
@@ -386,16 +392,8 @@ static void vkbd_input(const char *prompt, char *buffer, uint32_t max_len, uint3
         }
 
         if (!vkbd_has_key()) {
-            bool has_usb = false;
-            FOR_EACH_BACKEND(i) {
-                struct keyboard_backend *b = &vkbd.backends[i];
-                if (b->active && b->type == USB_KEYBOARD && b->drv.usb &&
-                    b->drv.usb->keyboard_count && b->drv.usb->keyboard_count() > 0) {
-                    has_usb = true; break;
-                }
-            }
-            if (!has_usb) asm volatile("hlt");
-            else asm volatile("pause");
+            if (current_task()) scheduler_yield();
+            else asm volatile("hlt");
             continue;
         }
 
@@ -801,6 +799,8 @@ static struct keyboard_driver vkbd = {
     .get_extended_key = vkbd_get_extended_key,
     .scancode_to_char = vkbd_scancode_to_char,
     .keyboard_handler = vkbd_keyboard_handler,
+    .claim_pump = vkbd_claim_pump,
+    .release_pump = vkbd_release_pump,
     .input = vkbd_input,
     .register_backend = vkbd_register_backend,
     .get_active_type = vkbd_get_active_type,

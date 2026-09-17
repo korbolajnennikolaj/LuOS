@@ -27,7 +27,6 @@ static inline uint64_t read_uptime_ms(struct tsc_driver *tsc) {
 }
 
 static uint8_t kbd_poll_key(struct keyboard_driver *kbd) {
-    kbd->keyboard_handler();
     if (kbd->has_key())
         return kbd->get_key();
 

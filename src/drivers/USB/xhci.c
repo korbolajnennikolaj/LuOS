@@ -17,6 +17,7 @@
 #include "drivers/USB/usb_log.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/limine.h"
+#include "kernel/scheduler/scheduler.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -241,8 +242,40 @@ static void dusts(uint64_t op) {
     (void)op;
 }
 
-void xhci_poll_event_ring(struct xhci_controller *x) {
-    if (!x || !x->initialized) return;
+static spinlock_t xhci_event_lock = SPINLOCK_INIT;
+static void *xhci_event_owner = NULL;
+static int xhci_event_depth = 0;
+
+static bool xhci_event_enter(void) {
+    void *me = (void *)current_task();
+
+    uint64_t flags = spin_lock_irqsave(&xhci_event_lock);
+
+    if (xhci_event_owner == NULL) {
+        xhci_event_owner = me ? me : (void *)&xhci_event_depth;
+        xhci_event_depth = 1;
+        spin_unlock_irqrestore(&xhci_event_lock, flags);
+        return true;
+    }
+
+    if (me && xhci_event_owner == me) {
+        xhci_event_depth++;
+        spin_unlock_irqrestore(&xhci_event_lock, flags);
+        return true;
+    }
+
+    spin_unlock_irqrestore(&xhci_event_lock, flags);
+    return false;
+}
+
+static void xhci_event_leave(void) {
+    uint64_t flags = spin_lock_irqsave(&xhci_event_lock);
+    if (xhci_event_depth > 0) xhci_event_depth--;
+    if (xhci_event_depth == 0) xhci_event_owner = NULL;
+    spin_unlock_irqrestore(&xhci_event_lock, flags);
+}
+
+static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
 
     volatile struct xhci_trb *ev = &x->event_ring[x->event_ring_idx];
     CACHE_FLUSH((void *)ev);
@@ -409,6 +442,14 @@ void xhci_poll_event_ring(struct xhci_controller *x) {
         FULL_BARRIER();
         cnt++;
     }
+}
+
+void xhci_poll_event_ring(struct xhci_controller *x) {
+    if (!x || !x->initialized) return;
+    if (!xhci_event_enter()) return;
+
+    xhci_poll_event_ring_locked(x);
+    xhci_event_leave();
 }
 
 void xhci_irq(void) {

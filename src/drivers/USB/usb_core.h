@@ -111,6 +111,7 @@ typedef struct usb_device {
 } usb_device;
 
 uint64_t usb_core_pump_age_ms(void);
+void usb_core_poll_topology(void);
 
 typedef struct usb_core_driver {
     void (*scan_all)(void);
@@ -128,6 +129,8 @@ typedef struct usb_core_driver {
     void (*enqueue_event)(const usb_event_t *evt);
 
     void (*poll_transfers)(void);
+
+    void (*poll_topology)(void);
 
     int (*bulk_transfer)(struct usb_device *dev,
                           uint8_t endpoint,

@@ -5,6 +5,7 @@
 #include "kernel/scheduler/scheduler.h"
 
 #define USB_HOTPLUG_TICK_MS 20
+#define USB_HOTPLUG_TOPOLOGY_TICKS 5
 #define USB_HOTPLUG_SURVEY_TICKS 25
 #define USB_HOTPLUG_WATCHDOG_MS 5000
 #define USB_HOTPLUG_MAX_TRACKED 64
@@ -82,6 +83,9 @@ static void usb_hotplug_entry(void *arg) {
             usb->poll_transfers();
             usb_hotplug_polls++;
         }
+
+        if (usb && usb->poll_topology && (tick % USB_HOTPLUG_TOPOLOGY_TICKS) == 0)
+            usb->poll_topology();
 
         if ((tick % USB_HOTPLUG_SURVEY_TICKS) == 0) usb_hotplug_survey();
 
