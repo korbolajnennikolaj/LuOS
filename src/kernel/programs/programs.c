@@ -244,7 +244,8 @@ static void try_start_service(service_t *svc) {
                           ? service_priority_to_sched[svc->priority]
                           : PRIO_DEFAULT;
 
-    struct task *t = task_create_balanced(svc->name, service_trampoline, svc, sched_prio);
+    struct task *t = task_create_ex(svc->name, service_trampoline, svc, sched_prio,
+                                    TASK_ANY_CORE, svc->stack_size);
     if (t) {
         svc->task = t;
         svc->state = SERVICE_STATE_STARTING;

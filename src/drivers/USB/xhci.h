@@ -61,6 +61,7 @@ typedef struct xhci_controller {
     volatile uint8_t pending_xfer_slot;
     volatile uint8_t pending_xfer_code;
     volatile uint8_t transfer_in_progress;
+    volatile uint64_t pending_xfer_trb;
     uint8_t initialized;
     uint8_t use_polling;
 

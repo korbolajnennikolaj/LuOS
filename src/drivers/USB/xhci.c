@@ -258,13 +258,60 @@ static void xhci_wait_ms(uint64_t ms) {
     else if (delay_ms) delay_ms(ms);
 }
 
-static inline void xhci_relax(void) {
-    if (current_task()) scheduler_yield();
-    else asm volatile("pause");
+#define XHCI_HOT_WINDOW_US 2000u
+#define XHCI_CTRL_TIMEOUT_MS 5000u
+#define XHCI_CMD_TIMEOUT_MS 5000u
+
+static uint64_t (*xhci_now_us_fn)(void) = NULL;
+
+static inline uint64_t xhci_now_us(void) {
+    return xhci_now_us_fn ? xhci_now_us_fn() : 0;
+}
+
+typedef struct {
+    uint64_t start_us;
+    uint32_t polls;
+} xhci_waiter_t;
+
+static inline void xhci_waiter_init(xhci_waiter_t *w) {
+    w->start_us = xhci_now_us();
+    w->polls = 0;
+}
+
+static inline uint64_t xhci_waiter_elapsed_us(const xhci_waiter_t *w) {
+    if (!xhci_now_us_fn) return (uint64_t)w->polls * 1000u;
+    return xhci_now_us() - w->start_us;
+}
+
+static inline int xhci_waiter_expired(const xhci_waiter_t *w, uint32_t timeout_ms) {
+    return xhci_waiter_elapsed_us(w) >= (uint64_t)timeout_ms * 1000u;
+}
+
+static void xhci_waiter_backoff(xhci_waiter_t *w) {
+    w->polls++;
+    if (xhci_now_us_fn && xhci_waiter_elapsed_us(w) < XHCI_HOT_WINDOW_US) {
+        asm volatile("pause");
+        return;
+    }
+    xhci_wait_ms(1);
+}
+
+#define XHCI_LOCK_SPINS 4096
+#define XHCI_BULK_SPIN_POLLS 256
+
+static inline void xhci_relax(unsigned *spins) {
+    unsigned s = ++(*spins);
+    if (s < XHCI_LOCK_SPINS || !current_task()) {
+        asm volatile("pause");
+        return;
+    }
+    if (s < XHCI_LOCK_SPINS + 16u) scheduler_yield();
+    else scheduler_sleep_ms(1);
 }
 
 static void xhci_ctrl_enter(struct xhci_controller *x) {
     void *me = xhci_self(x);
+    unsigned spins = 0;
 
     for (;;) {
         uint64_t flags = spin_lock_irqsave(&x->lock);
@@ -280,7 +327,7 @@ static void xhci_ctrl_enter(struct xhci_controller *x) {
             return;
         }
         spin_unlock_irqrestore(&x->lock, flags);
-        xhci_relax();
+        xhci_relax(&spins);
     }
 }
 
@@ -293,6 +340,7 @@ static void xhci_ctrl_leave(struct xhci_controller *x) {
 
 static void xhci_event_enter(struct xhci_controller *x) {
     void *me = xhci_self(x);
+    unsigned spins = 0;
 
     for (;;) {
         uint64_t flags = spin_lock_irqsave(&x->event_lock);
@@ -308,7 +356,7 @@ static void xhci_event_enter(struct xhci_controller *x) {
             return;
         }
         spin_unlock_irqrestore(&x->event_lock, flags);
-        xhci_relax();
+        xhci_relax(&spins);
     }
 }
 
@@ -346,8 +394,10 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
 
         } else if (type == TRB_TYPE_TRANSFER_EVENT) {
 
-            if (ev_slot == x->pending_xfer_slot && ev_ep <= 1)
-                x->last_completion_code = code;
+            if (ev_slot != 0 && ev_slot == x->pending_xfer_slot && ev_ep <= 1) {
+                if ((code != 1 && code != 13) || ev->param == x->pending_xfer_trb)
+                    x->last_completion_code = code;
+            }
 
             if ((code == 1 || code == 13) && (ev_ep > 1)) {
 
@@ -1226,16 +1276,27 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
     STORE_BARRIER(); CACHE_FLUSH(&tr[i]); i = (i + 1) % TRB_RING_SIZE; FULL_BARRIER();
 
     ctrl_tr_idx[idx][slot_id - 1] = i;
+
+    {
+        int st_idx = (i == 0) ? (TRB_RING_SIZE - 1) : (i - 1);
+        x->pending_xfer_trb = virt_to_phys(&tr[st_idx]);
+    }
+
+    x->pending_xfer_slot = 0;
+    xhci_poll_event_ring(x);
+
     x->pending_xfer_slot = slot_id;
     x->last_completion_code = 0xFF;
     FULL_BARRIER();
     wr32(x->db_base, slot_id * 4, 1);
     (void)rd32(x->db_base, slot_id * 4);
     FULL_BARRIER();
-    delay_ms(2);
 
-    for (int j = 0; j < 5000; j++) {
-        if (j % 100 == 0) log("XFR poll", j, 1);
+    xhci_waiter_t w;
+    xhci_waiter_init(&w);
+
+    for (;;) {
+        if ((w.polls & 1023u) == 0) log("XFR poll", (int)w.polls, 1);
         {
             uint32_t _sts = rd32(x->op_base, XHCI_OP_USBSTS);
             if (_sts & ((1u << 0) | (1u << 2) | (1u << 14))) {
@@ -1243,13 +1304,16 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
                 err("!!! ...for request type/req", ((uint32_t)((uint8_t *)setup)[0] << 8) | ((uint8_t *)setup)[1]);
                 g_last_xfer_error_code = x->last_completion_code;
                 g_last_usbsts = _sts;
+                x->pending_xfer_slot = 0;
                 xhci_control_ep0_recover(x, slot_id, idx, tr);
                 return -1;
             }
         }
         xhci_poll_event_ring(x);
         if (x->last_completion_code != 0xFF) {
-            if (x->last_completion_code == 1 || x->last_completion_code == 13) {
+            uint8_t cc = x->last_completion_code;
+            x->pending_xfer_slot = 0;
+            if (cc == 1 || cc == 13) {
                 if (direction == 1 && data_len > 0) {
                     for (uint64_t a = (uint64_t)data; a < (uint64_t)data + data_len; a += 64)
                         CACHE_FLUSH((void *)a);
@@ -1260,15 +1324,18 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
                 delay_ms(2);
                 return 0;
             }
-            err("XFR FAILED", x->last_completion_code);
-            g_last_xfer_error_code = x->last_completion_code;
+            err("XFR FAILED", cc);
+            g_last_xfer_error_code = cc;
             g_last_usbsts = rd32(x->op_base, XHCI_OP_USBSTS);
             xhci_control_ep0_recover(x, slot_id, idx, tr);
             return -1;
         }
-        xhci_wait_ms(2);
+        if (xhci_waiter_expired(&w, XHCI_CTRL_TIMEOUT_MS)) break;
+        xhci_waiter_backoff(&w);
     }
+    x->pending_xfer_slot = 0;
     err("XFR TIMEOUT", 0);
+    err("XFR TIMEOUT polls", w.polls);
     g_last_xfer_error_code = 0xFF;
     g_last_usbsts = rd32(x->op_base, XHCI_OP_USBSTS);
     xhci_control_ep0_recover(x, slot_id, idx, tr);
@@ -1776,19 +1843,19 @@ static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_
         intr_tr_idx[ci][ki] = nxt;
     }
 
+    ep_configured[ci][ki] = 1;
+    intr_done[ci][ki] = 0;
+    intr_error[ci][ki] = 0;
+    intr_slot_dci[ci][ki] = dci;
+    intr_data_ptr[ci][ki] = data;
+    intr_data_len[ci][ki] = data_len;
+    intr_active[ci][ki] = 1;
+    intr_submitted[ci][ki] = 1;
+
     FULL_BARRIER();
     wr32(x->db_base, (uint32_t)slot_id * 4, (uint32_t)dci);
     (void)rd32(x->db_base, (uint32_t)slot_id * 4);
     FULL_BARRIER();
-
-    ep_configured[ci][ki] = 1;
-    intr_done[ci][ki] = 0;
-    intr_error[ci][ki] = 0;
-    intr_active[ci][ki] = 1;
-    intr_submitted[ci][ki] = 1;
-    intr_slot_dci[ci][ki] = dci;
-    intr_data_ptr[ci][ki] = data;
-    intr_data_len[ci][ki] = data_len;
 
     return -2;
 }
@@ -1824,8 +1891,12 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
 
     if (bulk_submitted[ci][ki][dir]) {
 
-        if (!bulk_done[ci][ki][dir] && !bulk_error[ci][ki][dir])
+        for (int _sp = 0; _sp < XHCI_BULK_SPIN_POLLS; _sp++) {
+            if (bulk_done[ci][ki][dir] || bulk_error[ci][ki][dir]) break;
             xhci_poll_event_ring(x);
+            if (bulk_done[ci][ki][dir] || bulk_error[ci][ki][dir]) break;
+            asm volatile("pause");
+        }
 
         if (bulk_error[ci][ki][dir]) {
             bulk_error[ci][ki][dir] = 0;
@@ -1953,10 +2024,15 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
             _cmd_in.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_CONFIG_EP << 10);
             x->last_completion_code = 0xFF;
             if (xhci_send_command(x, &_cmd_in) != 0) return -1;
-            for (int _i = 0; _i < 5000; _i++) {
-                xhci_poll_event_ring(x);
-                if (x->last_completion_code != 0xFF) break;
-                xhci_wait_ms(2);
+            {
+                xhci_waiter_t _w;
+                xhci_waiter_init(&_w);
+                for (;;) {
+                    xhci_poll_event_ring(x);
+                    if (x->last_completion_code != 0xFF) break;
+                    if (xhci_waiter_expired(&_w, XHCI_CMD_TIMEOUT_MS)) break;
+                    xhci_waiter_backoff(&_w);
+                }
             }
             if (x->last_completion_code != 1) {
                 g_last_xfer_error_code = x->last_completion_code;
@@ -1998,10 +2074,15 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
             _cmd_out.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_CONFIG_EP << 10);
             x->last_completion_code = 0xFF;
             if (xhci_send_command(x, &_cmd_out) != 0) return -1;
-            for (int _i = 0; _i < 5000; _i++) {
-                xhci_poll_event_ring(x);
-                if (x->last_completion_code != 0xFF) break;
-                xhci_wait_ms(2);
+            {
+                xhci_waiter_t _w;
+                xhci_waiter_init(&_w);
+                for (;;) {
+                    xhci_poll_event_ring(x);
+                    if (x->last_completion_code != 0xFF) break;
+                    if (xhci_waiter_expired(&_w, XHCI_CMD_TIMEOUT_MS)) break;
+                    xhci_waiter_backoff(&_w);
+                }
             }
             if (x->last_completion_code != 1) {
                 g_last_xfer_error_code = x->last_completion_code;
@@ -2073,16 +2154,51 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
     uint32_t actual_dci = bulk_slot_dci[ci][ki][dir];
     if (actual_dci == 0) actual_dci = (uint32_t)dci;
 
+    bulk_done[ci][ki][dir] = 0;
+    bulk_error[ci][ki][dir] = 0;
+    bulk_active[ci][ki][dir] = 1;
+    bulk_submitted[ci][ki][dir] = 1;
+
     FULL_BARRIER();
     wr32(x->db_base, (uint32_t)slot_id * 4u, actual_dci);
     (void)rd32(x->db_base, (uint32_t)slot_id * 4u);
 
     FULL_BARRIER();
 
-    bulk_done[ci][ki][dir] = 0;
-    bulk_error[ci][ki][dir] = 0;
-    bulk_active[ci][ki][dir] = 1;
-    bulk_submitted[ci][ki][dir] = 1;
+    for (int _sp = 0; _sp < XHCI_BULK_SPIN_POLLS; _sp++) {
+        if (bulk_done[ci][ki][dir] || bulk_error[ci][ki][dir]) break;
+        xhci_poll_event_ring(x);
+        if (bulk_done[ci][ki][dir] || bulk_error[ci][ki][dir]) break;
+        asm volatile("pause");
+    }
+
+    if (bulk_error[ci][ki][dir]) {
+        bulk_error[ci][ki][dir] = 0;
+        bulk_active[ci][ki][dir] = 0;
+        bulk_submitted[ci][ki][dir] = 0;
+        bulk_done[ci][ki][dir] = 0;
+        xhci_reset_bulk_toggle_locked(x, slot_id, endpoint);
+        return -1;
+    }
+
+    if (bulk_done[ci][ki][dir]) {
+        bulk_done[ci][ki][dir] = 0;
+        bulk_active[ci][ki][dir] = 0;
+        bulk_submitted[ci][ki][dir] = 0;
+
+        if (is_in) {
+            for (uint64_t ca = (uint64_t)data;
+                 ca < (uint64_t)data + data_len; ca += 64)
+                 CACHE_FLUSH((void *)ca);
+            FULL_BARRIER();
+            LOAD_BARRIER();
+        }
+
+        intr_data_ptr[ci][ki] = NULL;
+        intr_data_len[ci][ki] = 0;
+        return 0;
+    }
+
     return -2;
 }
 
@@ -2278,6 +2394,7 @@ struct xhci_driver *return_xhci_driver(void) {
     struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
 
     delay_ms = tsc->sleep_tsc_ms;
+    xhci_now_us_fn = tsc->get_tsc_uptime_us;
     trace("XHCI", "Scanning PCI...");
 
     struct usb_controller *u = pci_get_usb_controllers();

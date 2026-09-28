@@ -52,7 +52,5 @@ void _start(void){
 
     start_service_manager();
 
-    while (1) {
-        asm volatile("hlt");
-    }
+    scheduler_idle_loop();
 }

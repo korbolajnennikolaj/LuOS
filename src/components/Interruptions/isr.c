@@ -28,7 +28,18 @@ static inline uint64_t read_cr3(void) {
     return val;
 }
 
-void isr_handler(struct registers *regs)
+extern void *scheduler_set_isr_fx(void *fx);
+
+static void isr_dispatch(struct registers *regs);
+
+void isr_handler(struct registers *regs, void *fx)
+{
+    void *prev_fx = scheduler_set_isr_fx(fx);
+    isr_dispatch(regs);
+    scheduler_set_isr_fx(prev_fx);
+}
+
+static void isr_dispatch(struct registers *regs)
 {
     uint64_t vec = regs->int_no;
 
@@ -111,6 +122,8 @@ void isr_handler(struct registers *regs)
     if (s_irq_handlers[vec]) {
         s_irq_handlers[vec](regs);
     }
+
+    if (vec == 0x41) return;
 
     apic_send_eoi();
 }

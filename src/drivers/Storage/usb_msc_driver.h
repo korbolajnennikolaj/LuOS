@@ -100,6 +100,7 @@ typedef struct usb_msc_device {
     uint64_t sector_count;
     uint32_t sector_size;
     uint32_t cbw_tag;
+    uint32_t max_xfer;
     bool bulk_configured;
     struct block_device blkdev;
 } usb_msc_device_t;

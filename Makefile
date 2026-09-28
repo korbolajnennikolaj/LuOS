@@ -143,9 +143,12 @@ $(MATH_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@echo "[CC]  Compiling (SSE2) $<..."
 	@$(CC) $(CFLAGS_MATH) -c $< -o $@
 
-$(MPY_FIRMWARE):
+$(MPY_FIRMWARE): FORCE
 	@echo "[MPY] Building MicroPython bare-metal port..."
-	@$(MAKE) -C $(MPY_DIR)/ports/$(MPY_PORT)
+	@$(MAKE) -j1 -C $(MPY_DIR)/ports/$(MPY_PORT)
+
+.PHONY: FORCE
+FORCE:
 
 $(NORMAL_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)

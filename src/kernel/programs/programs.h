@@ -77,6 +77,8 @@ typedef struct service {
     uint8_t restart_limit;
     uint8_t restart_count;
 
+    uint32_t stack_size;
+
     struct task *task;
 } service_t;
 

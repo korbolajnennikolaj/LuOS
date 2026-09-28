@@ -98,8 +98,17 @@ static void usb_mouse_poll(struct usb_core_driver *core) {
 
         bool is_xhci = (m->dev->ctrl && m->dev->ctrl->type == USB_TYPE_XHCI);
 
+        if (is_xhci) {
+            for (int round = 0; round < 2; round++) {
+                int r = core->interrupt_transfer(m->dev, m->endpoint_address,
+                                                 m->dma_report, 8, 1);
+                if (r == -2 || r != 0) break;
+            }
+            m->pending = false;
+            continue;
+        }
+
         if (m->pending) {
-            if (is_xhci) continue;
             int probe = core->interrupt_transfer(m->dev, m->endpoint_address,
                                                  m->dma_report, 8, 1);
 

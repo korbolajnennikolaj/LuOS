@@ -147,6 +147,15 @@ uint16_t usb_kbd_get_extended_key(void) {
     return key;
 }
 
+static volatile bool led_update_pending = false;
+
+static void usb_kbd_request_leds(bool caps, bool num, bool scroll) {
+    kbd_state.is_caps_lock = caps;
+    kbd_state.is_num_lock = num;
+    kbd_state.is_scroll_lock = scroll;
+    __atomic_store_n(&led_update_pending, true, __ATOMIC_RELEASE);
+}
+
 void usb_kbd_set_leds(bool caps, bool num, bool scroll) {
     kbd_state.is_caps_lock = caps;
     kbd_state.is_num_lock = num;
@@ -222,19 +231,19 @@ static void process_report(struct usb_keyboard_instance *kbd, const uint8_t *rep
             kbd->pressed_keys[key] = true;
 
         if (key == 0x39) {
-            usb_kbd_set_leds(!kbd_state.is_caps_lock,
+            usb_kbd_request_leds(!kbd_state.is_caps_lock,
                              kbd_state.is_num_lock,
                              kbd_state.is_scroll_lock);
             continue;
         }
         if (key == 0x53) {
-            usb_kbd_set_leds(kbd_state.is_caps_lock,
+            usb_kbd_request_leds(kbd_state.is_caps_lock,
                              !kbd_state.is_num_lock,
                              kbd_state.is_scroll_lock);
             continue;
         }
         if (key == 0x47) {
-            usb_kbd_set_leds(kbd_state.is_caps_lock,
+            usb_kbd_request_leds(kbd_state.is_caps_lock,
                              kbd_state.is_num_lock,
                              !kbd_state.is_scroll_lock);
             continue;
@@ -332,8 +341,21 @@ static void xhci_kbd_poll(struct usb_core_driver *core) {
 
         bool is_xhci = (kbd->dev->ctrl->type == USB_TYPE_XHCI);
 
+        if (is_xhci) {
+            for (int round = 0; round < 2; round++) {
+                int r = core->interrupt_transfer(kbd->dev,
+                                                 kbd->endpoint_address,
+                                                 kbd->dma_report, 8, 1);
+                if (r == -2) { kbd->armed = true; break; }
+                if (r == 0) continue;
+                kbd->armed = false;
+                break;
+            }
+            kbd->pending = false;
+            continue;
+        }
+
         if (kbd->pending) {
-            if (is_xhci) continue;
             int probe = core->interrupt_transfer(kbd->dev,
                                                  kbd->endpoint_address,
                                                  kbd->dma_report, 8, 1);
@@ -367,10 +389,6 @@ static void xhci_kbd_poll(struct usb_core_driver *core) {
         if (ret == -2) {
             kbd->pending = true;
             kbd->armed = true;
-        } else if (ret == 0 && is_xhci) {
-            asm volatile("clflush (%0)" :: "r"(kbd->dma_report) : "memory");
-            asm volatile("mfence" ::: "memory");
-            process_report(kbd, kbd->dma_report);
         }
         asm volatile("pause");
     }
@@ -389,6 +407,10 @@ void usb_kbd_handler_poll(void) {
     if (core->poll_transfers && usb_core_pump_age_ms() > USB_KBD_PUMP_STALE_MS)
         core->poll_transfers();
     usb_event_dispatch_all();
+
+    if (__atomic_exchange_n(&led_update_pending, false, __ATOMIC_ACQ_REL))
+        usb_kbd_set_leds(kbd_state.is_caps_lock, kbd_state.is_num_lock,
+                         kbd_state.is_scroll_lock);
     asm volatile("pause");
 }
 

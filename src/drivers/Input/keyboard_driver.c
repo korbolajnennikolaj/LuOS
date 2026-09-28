@@ -392,7 +392,7 @@ static void vkbd_input(const char *prompt, char *buffer, uint32_t max_len, uint3
         }
 
         if (!vkbd_has_key()) {
-            if (current_task()) scheduler_yield();
+            if (current_task()) scheduler_sleep_ms(1);
             else asm volatile("hlt");
             continue;
         }

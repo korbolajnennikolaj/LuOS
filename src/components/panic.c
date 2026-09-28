@@ -2,6 +2,7 @@
 
 #include "components/drivers.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/scheduler/scheduler.h"
 
 static void print_hex64(
     struct limine_video_driver *video_driver,
@@ -227,6 +228,23 @@ void panic(struct panic_info *info) {
             info->message,
             LIMINE_COLOR_WHITE
         );
+
+        {
+            char line[96];
+            int n = 0;
+            const char *pfx = "\n  Task    : ";
+            while (*pfx && n < 90) line[n++] = *pfx++;
+            struct task *t = current_task();
+            const char *nm = t ? t->name : "(no task)";
+            for (int i = 0; nm[i] && i < TASK_NAME_MAX && n < 70; i++) line[n++] = nm[i];
+            const char *cs = "  core ";
+            while (*cs && n < 90) line[n++] = *cs++;
+            int c = current_core();
+            if (c >= 10 && n < 90) line[n++] = (char)('0' + (c / 10) % 10);
+            if (n < 90) line[n++] = (char)('0' + c % 10);
+            line[n] = 0;
+            video_driver->printf(line, LIMINE_COLOR_LIGHT_GRAY);
+        }
 
         video_driver->printf(
             "\n\n",

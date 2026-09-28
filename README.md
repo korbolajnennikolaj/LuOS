@@ -12,6 +12,7 @@ A hobby x86-64 kernel built from scratch, booted via [Limine](https://limine-boo
 | USB | xHCI (USB 3.0), EHCI (USB 2.0), OHCI/UHCI (USB 1.1), USB Mass Storage, USB hotplug |
 | Filesystems | FAT32, exFAT, ext4, ISO9660 |
 | Scripting | Embedded Lua and MicroPython — `.lua` and `.py` scripts can be run directly from disk or a USB drive |
+| Scheduler | Preemptive SMP scheduler: per-core run queues, 16-level multi-level feedback queue (dynamic priority, level-dependent quantum), aging against starvation, wake-up placement, work stealing and load balancing, per-task FPU/SSE state, stack overflow canary |
 | Services | Service manager with priorities, dependencies, health checks and restarts (root fs, keyboard updater, mouse updater, USB hotplug, shell) |
 | Console | Interactive shell with its own console subsystem |
 | Extras | A few built-in terminal games (3D cube, Tetris-like, 2048-like) |

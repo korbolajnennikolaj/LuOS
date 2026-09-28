@@ -23,19 +23,71 @@ extern unsigned int xhci_read_current_usbsts(void);
 static usb_msc_device_t msc_devs[USB_MSC_MAX_DEVICES];
 static int msc_dev_count = 0;
 static spinlock_t msc_lock = SPINLOCK_INIT;
+static void *volatile msc_lock_owner = NULL;
+static volatile uint32_t msc_lock_depth = 0;
 
-static void msc_lock_acquire(spinlock_t *l)
+#define MSC_LOCK_SPINS 4096u
+
+static void *msc_self(void)
 {
-    while (!spin_trylock(l)) {
-        if (current_task()) scheduler_yield();
-        else asm volatile("pause");
+    void *me = (void *)current_task();
+    return me ? me : (void *)&msc_lock;
+}
+
+static void msc_bot_enter(void)
+{
+    void *me = msc_self();
+    unsigned spins = 0;
+
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&msc_lock);
+        if (msc_lock_depth == 0) {
+            msc_lock_owner = me;
+            msc_lock_depth = 1;
+            spin_unlock_irqrestore(&msc_lock, flags);
+            return;
+        }
+        if (msc_lock_owner == me) {
+            msc_lock_depth++;
+            spin_unlock_irqrestore(&msc_lock, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&msc_lock, flags);
+
+        ++spins;
+        if (spins < MSC_LOCK_SPINS || !current_task()) asm volatile("pause");
+        else if (spins < MSC_LOCK_SPINS + 16u) scheduler_yield();
+        else scheduler_sleep_ms(1);
     }
 }
 
-static void (*delay_ms)(uint64_t) = NULL;
-
-static void msc_wait_tick(void)
+static void msc_bot_leave(void)
 {
+    uint64_t flags = spin_lock_irqsave(&msc_lock);
+    if (msc_lock_depth > 0) msc_lock_depth--;
+    if (msc_lock_depth == 0) msc_lock_owner = NULL;
+    spin_unlock_irqrestore(&msc_lock, flags);
+}
+
+static void (*delay_ms)(uint64_t) = NULL;
+static void (*delay_us)(uint64_t) = NULL;
+static uint64_t (*uptime_ms)(void) = NULL;
+
+#define MSC_BULK_HOT_POLLS 400u
+#define MSC_BULK_WARM_MS 20u
+#define MSC_BULK_TIMEOUT_MS 600u
+
+static void msc_bulk_backoff(unsigned poll, uint64_t elapsed_ms)
+{
+    if (poll < MSC_BULK_HOT_POLLS) {
+        asm volatile("pause");
+        return;
+    }
+    if (elapsed_ms < MSC_BULK_WARM_MS) {
+        if (delay_us) delay_us(50);
+        else if (delay_ms) delay_ms(1);
+        return;
+    }
     if (current_task()) scheduler_sleep_ms(1);
     else if (delay_ms) delay_ms(1);
 }
@@ -46,8 +98,10 @@ static usb_csw_t g_csw __attribute__((aligned(64)));
 
 static uint8_t g_scsi_buf[96] __attribute__((aligned(64)));
 
-#define MSC_DMA_CHUNK 4096u
-static uint8_t g_dma_buf[MSC_DMA_CHUNK] __attribute__((aligned(4096)));
+#define MSC_DMA_CHUNK 32768u
+#define MSC_XFER_CHUNK_DEFAULT 4096u
+#define MSC_XFER_CHUNK_XHCI 32768u
+static uint8_t g_dma_buf[MSC_DMA_CHUNK] __attribute__((aligned(65536)));
 
 #define MSC_COL_INFO 0x00AAFFAA
 #define MSC_COL_ERR 0x00FF4444
@@ -182,103 +236,71 @@ static void msc_check_fatal_usbsts(void)
 
 static int msc_control(usb_msc_device_t *d, uint8_t type, uint8_t req, uint16_t val, uint16_t idx, uint16_t len, void *data);
 
-static void msc_qemu_yield(usb_msc_device_t *d)
-{
-    static uint8_t _desc_buf[18] __attribute__((aligned(64)));
-    for (int _i = 0; _i < 18; _i++) _desc_buf[_i] = 0;
-
-    msc_control(d, 0x80, 0x06 , 0x0100 , 0, 18, _desc_buf);
-
-}
-
-static int msc_bulk_submit(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t len, uint8_t direction)
-{
-    struct usb_core_driver *core = get_usb_core();
-    if (!core->bulk_transfer) return MSC_ERR_IO;
-    msc_puts("[MSC]  bulk ep=", MSC_COL_TRACE);
-    msc_hex8(endpoint, MSC_COL_DATA);
-    msc_puts(" dir=", MSC_COL_TRACE);
-    msc_puts(direction ? "IN" : "OUT", MSC_COL_DATA);
-    msc_puts(" len=", MSC_COL_TRACE);
-    msc_dec(len, MSC_COL_DATA);
-    msc_puts(" ...\n", MSC_COL_TRACE);
-    return core->bulk_transfer(d->usb_dev, endpoint, buf, len, direction);
-}
+#define MSC_XFER_OK 0
+#define MSC_XFER_STALL 1
+#define MSC_XFER_TIMEOUT 2
+#define MSC_XFER_ERROR 3
 
 static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t len, uint8_t direction)
 {
     struct usb_core_driver *core = get_usb_core();
     if (!core->bulk_transfer) {
         msc_puts("[MSC] msc_bulk: ERR bulk_transfer==NULL\n", MSC_COL_ERR);
-        return MSC_ERR_IO;
+        return MSC_XFER_ERROR;
     }
 
-    msc_puts("[MSC]  bulk ep=", MSC_COL_TRACE);
-    msc_hex8(endpoint, MSC_COL_DATA);
-    msc_puts(" dir=", MSC_COL_TRACE);
-    msc_puts(direction ? "IN" : "OUT", MSC_COL_DATA);
-    msc_puts(" len=", MSC_COL_TRACE);
-    msc_dec(len, MSC_COL_DATA);
-    msc_puts(" ...\n", MSC_COL_TRACE);
-
-    int ret;
+    int ret = -2;
     int attempts = 0;
-    for (int ms = 0; ms < 500; ms++) {
+    uint64_t t0 = uptime_ms ? uptime_ms() : 0;
+
+    for (unsigned poll = 0; ; poll++) {
         ret = core->bulk_transfer(d->usb_dev, endpoint, buf, len, direction);
         attempts++;
         if (ret != -2) break;
-        msc_wait_tick();
 
-        if ((ms & 63) == 63) {
-            struct usb_core_driver *_fcore = get_usb_core();
-            if (_fcore->poll_transfers) _fcore->poll_transfers();
+        uint64_t elapsed = uptime_ms ? (uptime_ms() - t0) : (uint64_t)poll;
+        if (elapsed >= MSC_BULK_TIMEOUT_MS) break;
+        if (!uptime_ms && poll >= 2000u) break;
+
+        msc_bulk_backoff(poll, elapsed);
+
+        if (poll >= MSC_BULK_HOT_POLLS && (poll & 63u) == 63u) {
+            if (core->poll_transfers) core->poll_transfers();
         }
     }
 
-    if (ret == -2) {
+    if (ret == 0) return MSC_XFER_OK;
 
+    if (ret == -2) {
         msc_puts("[MSC]  bulk TIMEOUT after ", MSC_COL_ERR);
         msc_dec(attempts, MSC_COL_DATA);
         msc_puts(" polls, ep=", MSC_COL_ERR);
         msc_hex8(endpoint, MSC_COL_DATA);
         msc_puts("\n", MSC_COL_ERR);
 
-        {
-            struct usb_core_driver *_rc = get_usb_core();
-            if (_rc->reset_endpoint_toggle)
-                _rc->reset_endpoint_toggle(d->usb_dev, endpoint);
-        }
-        return MSC_ERR_TIMEOUT;
+        if (core->reset_endpoint_toggle)
+            core->reset_endpoint_toggle(d->usb_dev, endpoint);
+        return MSC_XFER_TIMEOUT;
     }
-    if (ret == MSC_ERR_TIMEOUT ) {
 
-        msc_puts("[MSC]  bulk STALL/ERR after ", MSC_COL_ERR);
+    if (ret == -1) {
+        msc_puts("[MSC]  bulk STALL after ", MSC_COL_WARN);
         msc_dec(attempts, MSC_COL_DATA);
-        msc_puts(" polls, ep=", MSC_COL_ERR);
+        msc_puts(" polls, ep=", MSC_COL_WARN);
         msc_hex8(endpoint, MSC_COL_DATA);
-        msc_puts(" xhci_cc=", MSC_COL_ERR);
+        msc_puts(" cc=", MSC_COL_WARN);
         msc_dec((uint64_t)(int32_t)xhci_get_last_error_code(), MSC_COL_DATA);
-        msc_puts(" USBSTS=", MSC_COL_ERR);
-        msc_hex32(xhci_get_last_usbsts(), MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        msc_puts("\n", MSC_COL_WARN);
         msc_check_fatal_usbsts();
-        return MSC_ERR_IO;
+        return MSC_XFER_STALL;
     }
 
-    if (ret != 0) {
-        msc_puts("[MSC]  bulk ERR ret=", MSC_COL_ERR);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts(" ep=", MSC_COL_ERR);
-        msc_hex8(endpoint, MSC_COL_DATA);
-        msc_puts(" after ", MSC_COL_ERR);
-        msc_dec(attempts, MSC_COL_DATA);
-        msc_puts(" polls\n", MSC_COL_ERR);
-    } else {
-        msc_puts("[MSC]  bulk OK polls=", MSC_COL_TRACE);
-        msc_dec(attempts, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_TRACE);
-    }
-    return ret;
+    msc_puts("[MSC]  bulk ERR ret=", MSC_COL_ERR);
+    msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
+    msc_puts(" ep=", MSC_COL_ERR);
+    msc_hex8(endpoint, MSC_COL_DATA);
+    msc_puts("\n", MSC_COL_ERR);
+    return MSC_XFER_ERROR;
 }
 
 static int msc_control(usb_msc_device_t *d, uint8_t type, uint8_t req, uint16_t val, uint16_t idx, uint16_t len, void *data)
@@ -369,9 +391,26 @@ static void msc_bot_reset(usb_msc_device_t *d)
     msc_puts("[MSC] BOT Reset: done\n", MSC_COL_OK);
 }
 
+static void msc_clear_halt(usb_msc_device_t *d, uint8_t ep)
+{
+    msc_puts("[MSC]  clear halt ep=", MSC_COL_WARN);
+    msc_hex8(ep, MSC_COL_DATA);
+    msc_puts("\n", MSC_COL_WARN);
+
+    msc_control(d, 0x02, 0x01, 0x0000, ep, 0, NULL);
+
+    struct usb_core_driver *core = get_usb_core();
+    if (core->reset_endpoint_toggle)
+        core->reset_endpoint_toggle(d->usb_dev, ep);
+}
+
 static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len, void *data, uint32_t data_len, uint8_t direction)
 {
-    int ret;
+    if (!d || !d->usb_dev || !cmd || cmd_len == 0 || cmd_len > 16)
+        return MSC_ERR_PARAM;
+    if (data_len > 0xFFFFu) return MSC_ERR_PARAM;
+
+    msc_bot_enter();
 
     msc_puts("[MSC]  execute: CDB len=", MSC_COL_DBG);
     msc_dec(cmd_len, MSC_COL_DATA);
@@ -383,8 +422,10 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
     msc_dec(data_len, MSC_COL_DATA);
     msc_puts("\n", MSC_COL_DBG);
 
+    uint32_t tag = ++d->cbw_tag;
+
     g_cbw.dCBWSignature = CBW_SIGNATURE;
-    g_cbw.dCBWTag = ++d->cbw_tag;
+    g_cbw.dCBWTag = tag;
     g_cbw.dCBWDataTransferLength = data_len;
     g_cbw.bmCBWFlags = direction;
     g_cbw.bCBWLUN = d->lun;
@@ -392,163 +433,106 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
     for (int i = 0; i < 16; i++)
         g_cbw.CBWCB[i] = (i < cmd_len) ? cmd[i] : 0;
 
-    msc_puts("[MSC]  CBW: tag=", MSC_COL_DBG);
-    msc_hex32(g_cbw.dCBWTag, MSC_COL_DATA);
-    msc_puts(" sig=", MSC_COL_DBG);
-    msc_hex32(g_cbw.dCBWSignature, MSC_COL_DATA);
-    msc_puts(" lun=", MSC_COL_DBG);
-    msc_dec(g_cbw.bCBWLUN, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
     msc_hexdump("[MSC]  CBW bytes: ", (const uint8_t *)&g_cbw,
                 sizeof(g_cbw), MSC_COL_TRACE);
 
-    msc_puts("[MSC]  >> sending CBW (" , MSC_COL_DBG);
-    msc_dec(sizeof(g_cbw), MSC_COL_DATA);
-    msc_puts(" bytes) to ep_out=", MSC_COL_DBG);
-    msc_hex8(d->ep_bulk_out, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+    int xr = msc_bulk(d, d->ep_bulk_out, &g_cbw, sizeof(g_cbw), 0);
+    if (xr != MSC_XFER_OK) {
 
-    ret = msc_bulk(d, d->ep_bulk_out, &g_cbw, sizeof(g_cbw), 0 );
-    if (ret != 0) {
-        msc_puts("[MSC]  CBW FAILED ret=", MSC_COL_ERR);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts(", invoking BOT reset\n", MSC_COL_ERR);
+        if (xr == MSC_XFER_STALL) msc_clear_halt(d, d->ep_bulk_out);
+
+        msc_puts("[MSC]  CBW not accepted, BOT reset\n", MSC_COL_ERR);
         msc_bot_reset(d);
+        msc_bot_leave();
         return MSC_ERR_IO;
     }
-    msc_puts("[MSC]  CBW sent OK\n", MSC_COL_DBG);
 
     if (data && data_len > 0) {
-        uint8_t ep = (direction == CBW_FLAGS_IN) ? d->ep_bulk_in
-        : d->ep_bulk_out;
+        uint8_t ep = (direction == CBW_FLAGS_IN) ? d->ep_bulk_in : d->ep_bulk_out;
         uint8_t dir = (direction == CBW_FLAGS_IN) ? 1 : 0;
-        uint16_t xfer_len = (uint16_t)(data_len > 0xFFFF ? 0xFFFF : data_len);
 
-        msc_puts("[MSC]  >> data phase ep=", MSC_COL_DBG);
-        msc_hex8(ep, MSC_COL_DATA);
-        msc_puts(" dir=", MSC_COL_DBG);
-        msc_puts(dir ? "IN" : "OUT", MSC_COL_DATA);
-        msc_puts(" xfer_len=", MSC_COL_DBG);
-        msc_dec(xfer_len, MSC_COL_DATA);
-        if (data_len > 0xFFFF) {
-            msc_puts(" (TRUNCATED from ", MSC_COL_WARN);
-            msc_dec(data_len, MSC_COL_DATA);
-            msc_puts(")", MSC_COL_WARN);
-        }
-        msc_puts("\n", MSC_COL_DBG);
+        xr = msc_bulk(d, ep, data, (uint16_t)data_len, dir);
 
-        int data_ok = 0;
-        for (int _dr = 0; _dr < 3; _dr++) {
-            if (_dr > 0) {
-                msc_puts("[MSC]  data phase retry ", MSC_COL_WARN);
-                msc_dec(_dr + 1, MSC_COL_DATA);
-                msc_puts("/3 ep=", MSC_COL_WARN);
-                msc_hex8(ep, MSC_COL_DATA);
-                msc_puts(" clearing STALL\n", MSC_COL_WARN);
-                msc_control(d, 0x02, 0x01 , 0x0000, ep, 0, NULL);
-                {
-                    struct usb_core_driver *_rc = get_usb_core();
-                    if (_rc->reset_endpoint_toggle)
-                        _rc->reset_endpoint_toggle(d->usb_dev, ep);
-                }
-                if (delay_ms) delay_ms(10);
-            }
-            ret = msc_bulk(d, ep, data, xfer_len, dir);
-            if (ret == 0) { data_ok = 1; break; }
+        if (xr == MSC_XFER_STALL) {
 
-            msc_puts("[MSC]  data phase attempt ", MSC_COL_WARN);
-            msc_dec(_dr + 1, MSC_COL_DATA);
-            msc_puts(" failed ret=", MSC_COL_WARN);
-            msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-            msc_puts("\n", MSC_COL_WARN);
-        }
-        if (!data_ok) {
-            msc_puts("[MSC]  data phase FAILED after 3 retries\n", MSC_COL_ERR);
+            msc_clear_halt(d, ep);
+        } else if (xr != MSC_XFER_OK) {
+
+            msc_puts("[MSC]  data phase unrecoverable, BOT reset\n", MSC_COL_ERR);
             msc_bot_reset(d);
+            msc_bot_leave();
             return MSC_ERR_IO;
         }
-        msc_puts("[MSC]  data phase OK\n", MSC_COL_DBG);
-    } else {
-        msc_puts("[MSC]  >> no data phase (data_len=0 or buf=NULL)\n", MSC_COL_TRACE);
     }
 
-    for (int i = 0; i < (int)sizeof(g_csw); i++)
-        ((uint8_t *)&g_csw)[i] = 0;
+    int cr = MSC_XFER_ERROR;
+    for (int csw_try = 0; csw_try < 2; csw_try++) {
+        for (int i = 0; i < (int)sizeof(g_csw); i++)
+            ((uint8_t *)&g_csw)[i] = 0;
 
-    msc_puts("[MSC]  >> receiving CSW (", MSC_COL_DBG);
-    msc_dec(sizeof(g_csw), MSC_COL_DATA);
-    msc_puts(" bytes) from ep_in=", MSC_COL_DBG);
-    msc_hex8(d->ep_bulk_in, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+        cr = msc_bulk(d, d->ep_bulk_in, &g_csw, sizeof(g_csw), 1);
+        if (cr == MSC_XFER_OK) break;
 
-    ret = msc_bulk(d, d->ep_bulk_in, &g_csw, sizeof(g_csw), 1 );
-    if (ret != 0) {
-        msc_puts("[MSC]  CSW recv FAILED ret=", MSC_COL_ERR);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        if (cr == MSC_XFER_STALL && csw_try == 0) {
+            msc_clear_halt(d, d->ep_bulk_in);
+            continue;
+        }
+        break;
+    }
+
+    if (cr != MSC_XFER_OK) {
+        msc_puts("[MSC]  CSW recv FAILED\n", MSC_COL_ERR);
         msc_bot_reset(d);
+        msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     msc_hexdump("[MSC]  CSW bytes: ", (const uint8_t *)&g_csw,
                 sizeof(g_csw), MSC_COL_TRACE);
-    msc_puts("[MSC]  CSW: sig=", MSC_COL_DBG);
-    msc_hex32(g_csw.dCSWSignature, MSC_COL_DATA);
-    msc_puts(" tag=", MSC_COL_DBG);
-    msc_hex32(g_csw.dCSWTag, MSC_COL_DATA);
-    msc_puts(" residue=", MSC_COL_DBG);
-    msc_hex32(g_csw.dCSWDataResidue, MSC_COL_DATA);
-    msc_puts(" status=", MSC_COL_DBG);
-    msc_hex8(g_csw.bCSWStatus, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
 
-    if (g_csw.dCSWSignature != CSW_SIGNATURE) {
-        msc_puts("[MSC]  ERR CSW bad signature: got=", MSC_COL_ERR);
+    if (g_csw.dCSWSignature != CSW_SIGNATURE || g_csw.dCSWTag != tag) {
+        msc_puts("[MSC]  CSW invalid: sig=", MSC_COL_ERR);
         msc_hex32(g_csw.dCSWSignature, MSC_COL_DATA);
-        msc_puts(" expected=", MSC_COL_ERR);
-        msc_hex32(CSW_SIGNATURE, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
-        msc_bot_reset(d);
-        return MSC_ERR_IO;
-    }
-
-    if (g_csw.dCSWTag != d->cbw_tag) {
-        msc_puts("[MSC]  ERR CSW tag mismatch: got=", MSC_COL_ERR);
+        msc_puts(" tag=", MSC_COL_ERR);
         msc_hex32(g_csw.dCSWTag, MSC_COL_DATA);
-        msc_puts(" expected=", MSC_COL_ERR);
-        msc_hex32(d->cbw_tag, MSC_COL_DATA);
+        msc_puts(" want=", MSC_COL_ERR);
+        msc_hex32(tag, MSC_COL_DATA);
         msc_puts("\n", MSC_COL_ERR);
         msc_bot_reset(d);
+        msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     if (g_csw.bCSWStatus == CSW_STATUS_PHASE_ERROR) {
-        msc_puts("[MSC]  ERR CSW phase error (protocol violation)\n", MSC_COL_ERR);
+        msc_puts("[MSC]  CSW phase error, BOT reset\n", MSC_COL_ERR);
         msc_bot_reset(d);
+        msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     if (g_csw.bCSWStatus != CSW_STATUS_GOOD) {
-        msc_puts("[MSC]  CSW status FAILED=", MSC_COL_ERR);
+        msc_puts("[MSC]  CSW status=", MSC_COL_WARN);
         msc_hex8(g_csw.bCSWStatus, MSC_COL_DATA);
-        msc_puts(" residue=", MSC_COL_ERR);
+        msc_puts(" residue=", MSC_COL_WARN);
         msc_hex32(g_csw.dCSWDataResidue, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        msc_puts("\n", MSC_COL_WARN);
+        msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     if (g_csw.dCSWDataResidue != 0) {
-        msc_puts("[MSC]  residue=", MSC_COL_DBG);
+        msc_puts("[MSC]  short transfer, residue=", MSC_COL_DBG);
         msc_hex32(g_csw.dCSWDataResidue, MSC_COL_DATA);
-        msc_puts(" (short transfer?)\n", MSC_COL_WARN);
+        msc_puts("\n", MSC_COL_DBG);
     }
 
-    msc_puts("[MSC]  execute: OK\n", MSC_COL_DBG);
+    msc_bot_leave();
     return MSC_OK;
 }
 
 static int msc_scsi_inquiry(usb_msc_device_t *d)
 {
+    msc_bot_enter();
     msc_sep("SCSI INQUIRY");
     uint8_t cdb[6] = { SCSI_INQUIRY, 0, 0, 0, 36, 0 };
     msc_puts("[MSC] INQUIRY: CDB alloc_len=36\n", MSC_COL_DBG);
@@ -559,6 +543,7 @@ static int msc_scsi_inquiry(usb_msc_device_t *d)
         msc_puts("[MSC] INQUIRY FAILED ret=", MSC_COL_ERR);
         msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
         msc_puts("\n", MSC_COL_ERR);
+        msc_bot_leave();
         return ret;
     }
 
@@ -584,6 +569,8 @@ static int msc_scsi_inquiry(usb_msc_device_t *d)
     msc_puts(" revision=", MSC_COL_INFO); msc_puts(revision, MSC_COL_DATA);
     msc_puts("\n", MSC_COL_INFO);
 
+    msc_bot_leave();
+
     return MSC_OK;
 }
 
@@ -604,6 +591,7 @@ static int msc_scsi_test_unit_ready(usb_msc_device_t *d)
 
 static int msc_scsi_request_sense(usb_msc_device_t *d)
 {
+    msc_bot_enter();
     msc_puts("[MSC] REQUEST SENSE\n", MSC_COL_DBG);
     uint8_t cdb[6] = { SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0 };
     for (int i = 0; i < 18; i++) g_scsi_buf[i] = 0;
@@ -613,6 +601,7 @@ static int msc_scsi_request_sense(usb_msc_device_t *d)
         msc_puts("[MSC] REQUEST SENSE failed ret=", MSC_COL_ERR);
         msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
         msc_puts("\n", MSC_COL_ERR);
+        msc_bot_leave();
         return ret;
     }
 
@@ -655,11 +644,14 @@ static int msc_scsi_request_sense(usb_msc_device_t *d)
     else if (sense_key == 0x00)
         msc_puts("[MSC] SENSE: no sense (all good)\n", MSC_COL_OK);
 
+    msc_bot_leave();
+
     return MSC_OK;
 }
 
 static int msc_scsi_read_capacity(usb_msc_device_t *d)
 {
+    msc_bot_enter();
     msc_sep("SCSI READ CAPACITY(10)");
     uint8_t cdb[10] = { SCSI_READ_CAPACITY_10, 0,0,0,0,0,0,0,0,0 };
     for (int i = 0; i < 8; i++) g_scsi_buf[i] = 0;
@@ -669,6 +661,7 @@ static int msc_scsi_read_capacity(usb_msc_device_t *d)
         msc_puts("[MSC] READ CAPACITY FAILED ret=", MSC_COL_ERR);
         msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
         msc_puts("\n", MSC_COL_ERR);
+        msc_bot_leave();
         return ret;
     }
 
@@ -724,6 +717,8 @@ static int msc_scsi_read_capacity(usb_msc_device_t *d)
     }
     msc_puts(")\n", MSC_COL_INFO);
 
+    msc_bot_leave();
+
     return MSC_OK;
 }
 
@@ -735,14 +730,16 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
 
     if (d->sector_size == 0) return MSC_ERR_IO;
 
-    msc_lock_acquire(&msc_lock);
+    msc_bot_enter();
 
     uint8_t *dst = (uint8_t *)buf;
     uint32_t done = 0;
 
     while (done < count) {
 
-        uint32_t max_sectors = MSC_DMA_CHUNK / d->sector_size;
+        uint32_t limit = d->max_xfer ? d->max_xfer : MSC_XFER_CHUNK_DEFAULT;
+        if (limit > MSC_DMA_CHUNK) limit = MSC_DMA_CHUNK;
+        uint32_t max_sectors = limit / d->sector_size;
         if (max_sectors == 0) max_sectors = 1;
         uint32_t n = count - done;
         if (n > max_sectors) n = max_sectors;
@@ -750,7 +747,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
         uint64_t cur_lba = lba + done;
         uint32_t byte_len = n * d->sector_size;
         if (byte_len > MSC_DMA_CHUNK) {
-            spin_unlock(&msc_lock);
+            msc_bot_leave();
             return MSC_ERR_PARAM;
         }
 
@@ -767,7 +764,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
         int ret = msc_execute(d, cdb, 10, g_dma_buf, byte_len, CBW_FLAGS_IN);
         if (ret != 0) {
             msc_scsi_request_sense(d);
-            spin_unlock(&msc_lock);
+            msc_bot_leave();
             return ret;
         }
         memcpy(dst, g_dma_buf, byte_len);
@@ -776,7 +773,7 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
         done += n;
     }
 
-    spin_unlock(&msc_lock);
+    msc_bot_leave();
     return MSC_OK;
 }
 
@@ -788,13 +785,15 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
 
     if (d->sector_size == 0) return MSC_ERR_IO;
 
-    msc_lock_acquire(&msc_lock);
+    msc_bot_enter();
 
     uint8_t *src = (uint8_t *)buf;
     uint32_t done = 0;
 
     while (done < count) {
-        uint32_t max_sectors = MSC_DMA_CHUNK / d->sector_size;
+        uint32_t limit = d->max_xfer ? d->max_xfer : MSC_XFER_CHUNK_DEFAULT;
+        if (limit > MSC_DMA_CHUNK) limit = MSC_DMA_CHUNK;
+        uint32_t max_sectors = limit / d->sector_size;
         if (max_sectors == 0) max_sectors = 1;
         uint32_t n = count - done;
         if (n > max_sectors) n = max_sectors;
@@ -802,7 +801,7 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
         uint64_t cur_lba = lba + done;
         uint32_t byte_len = n * d->sector_size;
         if (byte_len > MSC_DMA_CHUNK) {
-            spin_unlock(&msc_lock);
+            msc_bot_leave();
             return MSC_ERR_PARAM;
         }
         memcpy(g_dma_buf, src, byte_len);
@@ -820,7 +819,7 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
         int ret = msc_execute(d, cdb, 10, g_dma_buf, byte_len, CBW_FLAGS_OUT);
         if (ret != 0) {
             msc_scsi_request_sense(d);
-            spin_unlock(&msc_lock);
+            msc_bot_leave();
             return ret;
         }
 
@@ -828,7 +827,7 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
         done += n;
     }
 
-    spin_unlock(&msc_lock);
+    msc_bot_leave();
     return MSC_OK;
 }
 
@@ -873,7 +872,16 @@ static int find_free_msc_slot(void) {
     return -1;
 }
 
+static void msc_init_device_locked(struct usb_device *dev);
+
 static void msc_init_device(struct usb_device *dev)
+{
+    msc_bot_enter();
+    msc_init_device_locked(dev);
+    msc_bot_leave();
+}
+
+static void msc_init_device_locked(struct usb_device *dev)
 {
     msc_sep("MSC DEVICE INIT");
 
@@ -900,6 +908,10 @@ static void msc_init_device(struct usb_device *dev)
     d->usb_dev = dev;
     d->lun = 0;
     d->cbw_tag = 0;
+
+    d->max_xfer = MSC_XFER_CHUNK_DEFAULT;
+    if (dev->ctrl && dev->ctrl->type == USB_TYPE_XHCI)
+        d->max_xfer = MSC_XFER_CHUNK_XHCI;
 
     msc_puts("[MSC] scanning bulk endpoints:\n", MSC_COL_DBG);
     for (int i = 0; i < dev->bulk_ep_count; i++) {
@@ -1186,6 +1198,8 @@ static void *msc_driver_init(void)
         struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
         if (tsc) {
             delay_ms = tsc->sleep_tsc_ms;
+            delay_us = tsc->sleep_tsc_us;
+            uptime_ms = tsc->get_tsc_uptime_ms;
             msc_puts("[MSC] delay_ms resolved OK (tsc=", MSC_COL_OK);
             msc_hex32((uint32_t)(uintptr_t)tsc, MSC_COL_DATA);
             msc_puts(")\n", MSC_COL_OK);

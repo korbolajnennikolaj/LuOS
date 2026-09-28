@@ -57,6 +57,6 @@ void irq_register_handler(uint8_t vector, irq_handler_t handler);
 
 void irq_unregister_handler(uint8_t vector);
 
-void isr_handler(struct registers *regs);
+void isr_handler(struct registers *regs, void *fx);
 
 #endif

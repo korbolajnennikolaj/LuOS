@@ -19,6 +19,7 @@
 #include "shared/runtime/pyexec.h"
 #include "stdio.h"
 #include "components/Memory/heap.h" // For kmalloc
+#include "kernel/scheduler/scheduler.h"
 
 #define MP_LUOS_HEAP_SIZE (64 * 1024)
 
@@ -71,11 +72,28 @@ mp_lexer_t *mp_lexer_new_from_file(qstr filename) {
 // Initialization / deinitialization
 // ----------------------------------------------------------------------
 
+#define MP_LUOS_STACK_MARGIN (48 * 1024)
+
+static void mp_luos_bind_stack(void *here) {
+    uintptr_t lo = 0, hi = 0;
+    if (scheduler_current_stack(&lo, &hi) &&
+        (uintptr_t)here > lo && (uintptr_t)here <= hi) {
+        size_t size = hi - lo;
+        size_t limit = (size > MP_LUOS_STACK_MARGIN + 16 * 1024)
+            ? size - MP_LUOS_STACK_MARGIN : size / 2;
+        mp_stack_top_ptr = (char *)hi;
+        mp_stack_set_top((void *)hi);
+        mp_stack_set_limit(limit);
+    } else {
+        mp_stack_top_ptr = (char *)here;
+        mp_stack_set_top(here);
+        mp_stack_set_limit(32 * 1024);
+    }
+}
+
 void mp_luos_init(void) {
     int stack_dummy;
-    mp_stack_top_ptr = (char *)&stack_dummy;
-    mp_stack_set_top(&stack_dummy);
-    mp_stack_set_limit(32 * 1024);
+    mp_luos_bind_stack(&stack_dummy);
 
     // Allocate the MicroPython heap out of the kernel heap.
     mp_heap = (char *)kmalloc(MP_LUOS_HEAP_SIZE);
@@ -98,6 +116,8 @@ void mp_luos_deinit(void) {
 // Used by the "python"/"py" command of the kernel's interactive shell —
 // the same way luos_lua_dostring() is used by the "lua" command.
 int mp_luos_exec_str(const char *src) {
+    int stack_dummy;
+    mp_luos_bind_stack(&stack_dummy);
     nlr_buf_t nlr;
     if (nlr_push(&nlr) == 0) {
         mp_lexer_t *lex = mp_lexer_new_from_str_len(MP_QSTR__lt_stdin_gt_, src, strlen(src), 0);
@@ -122,6 +142,8 @@ const char *mp_luos_version_string(void) {
 // shared/readline). Used when a classic REPL style is needed on top of
 // mp_hal_stdin_rx_chr/mp_hal_stdout_tx_strn (see mphalport.c).
 void mp_luos_run_repl(void) {
+    int stack_dummy;
+    mp_luos_bind_stack(&stack_dummy);
     printf("\nMicroPython REPL on LuOS\n");
     printf("Type \"import luos; luos.reboot()\" to test bridges.\n\n");
 

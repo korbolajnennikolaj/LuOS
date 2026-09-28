@@ -5,6 +5,9 @@
 #include "kernel/console.h"          // shared line/key input (see src/kernel/console.c)
 #include "py/misc.h"                  // vstr_t / vstr_add_strn
 #include "shared/readline/readline.h" // CHAR_CTRL_C, CHAR_CTRL_D
+#include "components/drivers.h"
+#include "drivers/Timer/timer.h"
+#include "kernel/scheduler/scheduler.h"
 
 // ----------------------------------------------------------------------
 // Output
@@ -82,35 +85,46 @@ int mp_hal_stdin_rx_chr(void) {
 
 // ----------------------------------------------------------------------
 // Time / delays
-//
-// TODO: hook up a real time source (e.g.
-// return_tsc_driver()->get_tsc_uptime_ms()) — at the time this port was
-// written, the TSC driver was initialized later than MicroPython, so a
-// rough software delay counter via an HLT loop is used for now, good
-// enough for the REPL to work but not for accurate timing.
 // ----------------------------------------------------------------------
 
+static struct tsc_driver *mp_hal_tsc(void) {
+    static struct tsc_driver *tsc = NULL;
+    if (!tsc) tsc = (struct tsc_driver *)get_self_driver(TIMER_DRIVER, TSC_TIMER);
+    return tsc;
+}
+
 mp_uint_t mp_hal_ticks_ms(void) {
-    return 0;
+    struct tsc_driver *t = mp_hal_tsc();
+    return t ? (mp_uint_t)t->get_tsc_uptime_ms() : 0;
 }
 
 mp_uint_t mp_hal_ticks_us(void) {
-    return 0;
+    struct tsc_driver *t = mp_hal_tsc();
+    return (t && t->get_tsc_uptime_us) ? (mp_uint_t)t->get_tsc_uptime_us() : 0;
 }
 
 mp_uint_t mp_hal_ticks_cpu(void) {
-    return 0;
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((mp_uint_t)hi << 32) | lo;
 }
 
 void mp_hal_delay_ms(mp_uint_t ms) {
-    // A rough software delay (no CPU-frequency calibration).
-    for (volatile mp_uint_t i = 0; i < ms * 100000u; i++) {
-        asm volatile("nop");
+    if (current_task()) {
+        scheduler_sleep_ms(ms);
+        return;
     }
+    struct tsc_driver *t = mp_hal_tsc();
+    if (t) { t->sleep_tsc_ms(ms); return; }
+    for (volatile mp_uint_t i = 0; i < ms * 100000u; i++) asm volatile("nop");
 }
 
 void mp_hal_delay_us(mp_uint_t us) {
-    for (volatile mp_uint_t i = 0; i < us * 100u; i++) {
-        asm volatile("nop");
+    if (us >= 2000 && current_task()) {
+        scheduler_sleep_ms(us / 1000);
+        return;
     }
+    struct tsc_driver *t = mp_hal_tsc();
+    if (t) { t->sleep_tsc_us(us); return; }
+    for (volatile mp_uint_t i = 0; i < us * 100u; i++) asm volatile("nop");
 }

@@ -15,6 +15,8 @@
 #include "drivers/USB/usb_log.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/limine.h"
+#include "kernel/scheduler/scheduler.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <ports.h>
 #include <stddef.h>
@@ -82,7 +84,7 @@ static void dbg_dec(int v) { (void)v; }
 #define TD_CS_LS (1u << 26)
 #define TD_CS_CERR3 (3u << 27)
 #define TD_CS_SPD (1u << 29)
-#define TD_CS_ERROR_MASK (TD_CS_STALL | TD_CS_BUFERR | TD_CS_BABBLE | TD_CS_NAK | TD_CS_TIMEOUTCRC | TD_CS_BITSTUFF)
+#define TD_CS_ERROR_MASK (TD_CS_STALL | TD_CS_BUFERR | TD_CS_BABBLE | TD_CS_TIMEOUTCRC | TD_CS_BITSTUFF)
 #define TD_CS_FATAL_MASK (TD_CS_STALL | TD_CS_BUFERR | TD_CS_BABBLE | TD_CS_TIMEOUTCRC | TD_CS_BITSTUFF)
 
 #define TD_F_IOC 0x01u
@@ -177,6 +179,21 @@ static inline void irq_restore(uint64_t flags) {
         asm volatile("sti" ::: "memory");
 }
 
+static spinlock_t uhci_qh_lock[MAX_UHCI_CONTROLLERS];
+static void *volatile uhci_ctrl_owner[MAX_UHCI_CONTROLLERS];
+static volatile uint32_t uhci_ctrl_depth[MAX_UHCI_CONTROLLERS];
+
+static uint64_t (*uhci_now_us_fn)(void) = NULL;
+
+static inline uint64_t uhci_now_us(void) {
+    return uhci_now_us_fn ? uhci_now_us_fn() : 0;
+}
+
+static void uhci_sleep_ms(uint64_t ms) {
+    if (current_task()) scheduler_sleep_ms(ms);
+    else if (delay_ms) delay_ms(ms);
+}
+
 static inline uint16_t uhci_readw(struct uhci_controller *u, uint16_t r) {
     return inw((uint16_t)(u->io_base + r));
 }
@@ -196,6 +213,45 @@ static inline int uhci_res_index(struct uhci_controller *u) {
         if (&uhci_resources[i].ctrl == u) return i;
     }
     return -1;
+}
+
+static uint64_t uhci_qh_lock_acquire(int res_idx) {
+    return spin_lock_irqsave(&uhci_qh_lock[res_idx]);
+}
+
+static void uhci_qh_lock_release(int res_idx, uint64_t flags) {
+    spin_unlock_irqrestore(&uhci_qh_lock[res_idx], flags);
+}
+
+static void uhci_ctrl_enter(struct uhci_controller *u) {
+    int r = uhci_res_index(u);
+    if (r < 0) return;
+    void *me = (void *)current_task();
+    if (!me) me = (void *)u;
+    unsigned spins = 0;
+    for (;;) {
+        uint64_t f = spin_lock_irqsave(&u->lock);
+        if (uhci_ctrl_depth[r] == 0 || uhci_ctrl_owner[r] == me) {
+            uhci_ctrl_owner[r] = me;
+            uhci_ctrl_depth[r]++;
+            spin_unlock_irqrestore(&u->lock, f);
+            return;
+        }
+        spin_unlock_irqrestore(&u->lock, f);
+        ++spins;
+        if (spins < 256u || !current_task()) { asm volatile("pause"); continue; }
+        if (spins < 256u + 16u) scheduler_yield();
+        else scheduler_sleep_ms(1);
+    }
+}
+
+static void uhci_ctrl_leave(struct uhci_controller *u) {
+    int r = uhci_res_index(u);
+    if (r < 0) return;
+    uint64_t f = spin_lock_irqsave(&u->lock);
+    if (uhci_ctrl_depth[r] > 0) uhci_ctrl_depth[r]--;
+    if (uhci_ctrl_depth[r] == 0) uhci_ctrl_owner[r] = NULL;
+    spin_unlock_irqrestore(&u->lock, f);
 }
 
 int uhci_controller_index(struct uhci_controller *u) {
@@ -456,12 +512,6 @@ static int uhci_qh_poll_batch(int res_idx, int qi, uint16_t *added) {
             *added = total;
             return -1;
         }
-        if (cs & TD_CS_NAK) {
-            uhci_qh_halt(res_idx, qi);
-            *added = total;
-            return -1;
-        }
-
         uint16_t requested = uhci_td_requested_len(&ring[i]);
         uint16_t actual = uhci_td_actual_len(cs);
         total += actual;
@@ -574,12 +624,13 @@ static int uhci_queued_transfer(struct uhci_controller *u, uint8_t dev_addr, uin
     if (res_idx < 0) return -1;
 
     uint8_t ep_num = endpoint & 0x0Fu;
+
+    uint64_t fl = uhci_qh_lock_acquire(res_idx);
+
     int qi = uhci_qh_find_or_alloc(res_idx, dev_addr, ep_num, direction, xfer_kind);
-    if (qi < 0) return -1;
+    if (qi < 0) { uhci_qh_lock_release(res_idx, fl); return -1; }
 
     uhci_qh_meta_t *m = &uhci_resources[res_idx].qh_meta[qi];
-
-    uint64_t fl = irq_save();
 
     if (m->active)
         uhci_qh_service(res_idx, qi);
@@ -587,7 +638,7 @@ static int uhci_queued_transfer(struct uhci_controller *u, uint8_t dev_addr, uin
     if (m->result_ready) {
         m->result_ready = 0;
         int last_result = m->last_result;
-        irq_restore(fl);
+        uhci_qh_lock_release(res_idx, fl);
         return last_result;
     }
 
@@ -621,7 +672,7 @@ static int uhci_queued_transfer(struct uhci_controller *u, uint8_t dev_addr, uin
         else uhci_qh_submit_batch(res_idx, qi);
     }
 
-    irq_restore(fl);
+    uhci_qh_lock_release(res_idx, fl);
     return -2;
 }
 
@@ -629,20 +680,14 @@ static int uhci_bulk_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8
                               void *data, uint16_t data_len, uint8_t direction)
 {
     if (!u) return -1;
-    spin_lock(&u->lock);
-    int ret = uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_BULK);
-    spin_unlock(&u->lock);
-    return ret;
+    return uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_BULK);
 }
 
 static int uhci_interrupt_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
                                    void *data, uint16_t data_len, uint8_t direction)
 {
     if (!u) return -1;
-    spin_lock(&u->lock);
-    int ret = uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_INTERRUPT);
-    spin_unlock(&u->lock);
-    return ret;
+    return uhci_queued_transfer(u, dev_addr, endpoint, data, data_len, direction, UHCI_XFER_INTERRUPT);
 }
 
 #define UHCI_RUN_COMPLETE 0
@@ -666,7 +711,8 @@ static int uhci_ctrl_run(int res_idx, struct uhci_td *ring, uint8_t nt, int *sto
     asm volatile("mfence" ::: "memory");
 
     int result = UHCI_RUN_TIMEOUT;
-    for (int ms = 0; ms < UHCI_CTRL_TIMEOUT_MS; ms++) {
+    uint64_t t0 = uhci_now_us();
+    for (int ms = 0; ; ms++) {
         int pending = 0;
 
         for (uint8_t i = 0; i < nt; i++) {
@@ -685,7 +731,11 @@ static int uhci_ctrl_run(int res_idx, struct uhci_td *ring, uint8_t nt, int *sto
 
         if (result != UHCI_RUN_TIMEOUT) break;
         if (!pending) { result = UHCI_RUN_COMPLETE; break; }
-        delay_ms(1);
+
+        uint64_t el_us = uhci_now_us_fn ? (uhci_now_us() - t0) : (uint64_t)ms * 1000u;
+        if (el_us >= (uint64_t)UHCI_CTRL_TIMEOUT_MS * 1000u) break;
+        if (uhci_now_us_fn && el_us < 1000u) { asm volatile("pause"); continue; }
+        uhci_sleep_ms(1);
     }
 
     hw->element = LP_TERMINATE;
@@ -820,9 +870,9 @@ static int uhci_control_transfer(struct uhci_controller *u, uint8_t dev_addr, ui
                                  uint16_t data_len, uint8_t direction)
 {
     if (!u) return -1;
-    spin_lock(&u->lock);
+    uhci_ctrl_enter(u);
     int ret = uhci_control_transfer_impl(u, dev_addr, endpoint, setup_packet, setup_len, data, data_len, direction);
-    spin_unlock(&u->lock);
+    uhci_ctrl_leave(u);
     return ret;
 }
 
@@ -935,16 +985,16 @@ static int uhci_iso_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_
                              const uint16_t *frame_lens, uint8_t direction)
 {
     if (!u) return -1;
-    spin_lock(&u->lock);
+    int r = uhci_res_index(u);
+    if (r < 0) return -1;
+    uint64_t fl = uhci_qh_lock_acquire(r);
     int ret = uhci_iso_transfer_impl(u, dev_addr, endpoint, data, total_len, n_frames, frame_lens, direction);
-    spin_unlock(&u->lock);
+    uhci_qh_lock_release(r, fl);
     return ret;
 }
 
-void uhci_poll_iso(struct uhci_controller *u) {
-    if (!u || !u->initialized) return;
-    int res_idx = uhci_res_index(u);
-    if (res_idx < 0 || !s_uhci_iso(res_idx).active) return;
+static void uhci_poll_iso_locked(struct uhci_controller *u, int res_idx) {
+    if (!s_uhci_iso(res_idx).active) return;
 
     for (uint8_t fi = 0; fi < s_uhci_iso(res_idx).n_frames; fi++) {
         if (s_uhci_iso(res_idx).frame_reaped[fi]) continue;
@@ -998,6 +1048,15 @@ void uhci_poll_iso(struct uhci_controller *u) {
     }
 }
 
+void uhci_poll_iso(struct uhci_controller *u) {
+    if (!u || !u->initialized) return;
+    int res_idx = uhci_res_index(u);
+    if (res_idx < 0) return;
+    uint64_t fl = uhci_qh_lock_acquire(res_idx);
+    uhci_poll_iso_locked(u, res_idx);
+    uhci_qh_lock_release(res_idx, fl);
+}
+
 static void uhci_hc_start(struct uhci_controller *u) {
     int res_idx = uhci_res_index(u);
     if (res_idx < 0) return;
@@ -1048,14 +1107,15 @@ void uhci_irq(void) {
         dbg_str(" status="); dbg_hex32(status);
         dbg_str("\r\n");
 
+        uint64_t qfl = uhci_qh_lock_acquire(i);
         for (int qi = 0; qi < UHCI_QH_SLOTS; qi++) {
             if (!uhci_resources[i].qh_meta[qi].in_use) continue;
             if (!uhci_resources[i].qh_meta[qi].active) continue;
             dbg_str("[uhci] IRQ servicing qi="); dbg_dec(qi); dbg_str("\r\n");
             uhci_qh_service(i, qi);
         }
-
-        uhci_poll_iso(u);
+        uhci_poll_iso_locked(u, i);
+        uhci_qh_lock_release(i, qfl);
     }
 }
 
@@ -1238,19 +1298,43 @@ void uhci_reset_endpoint_toggle(struct uhci_controller *u, uint8_t dev_addr, uin
     uint8_t direction = (endpoint & 0x80u) ? 1 : 0;
 
     uhci_qh_meta_t *meta = uhci_resources[res_idx].qh_meta;
+
+    uint64_t fl = uhci_qh_lock_acquire(res_idx);
+
     for (int i = 0; i < UHCI_QH_SLOTS; i++) {
-        if (meta[i].in_use && meta[i].dev_addr == dev_addr &&
-            meta[i].ep_num == ep_num && meta[i].direction == direction) {
-            meta[i].data_toggle = 0;
-            meta[i].stalled = 0;
+        if (!meta[i].in_use) continue;
+        if (meta[i].dev_addr != dev_addr) continue;
+        if (meta[i].ep_num != ep_num) continue;
+        if (meta[i].direction != direction) continue;
+
+        uhci_qh_halt(res_idx, i);
+
+        struct uhci_td *ring = uhci_resources[res_idx].td_ring[i];
+        for (int t = 0; t < UHCI_QH_TD_RING; t++) {
+            ring[t].control_status &= ~(uint32_t)TD_CS_ACTIVE;
+            ring[t].link_ptr = LP_TERMINATE;
         }
+        asm volatile("mfence" ::: "memory");
+
+        meta[i].active = 0;
+        meta[i].result_ready = 0;
+        meta[i].last_result = -1;
+        meta[i].batch_count = 0;
+        meta[i].remaining = 0;
+        meta[i].xfer_ok_len = 0;
+        meta[i].cursor = NULL;
+        meta[i].data_toggle = 0;
+        meta[i].stalled = 0;
     }
+
+    uhci_qh_lock_release(res_idx, fl);
 }
 
 void uhci_notify_disconnect(struct usb_device *dev) {
     if (!dev) return;
     for (int ri = 0; ri < MAX_UHCI_CONTROLLERS; ri++) {
         uhci_qh_meta_t *meta = uhci_resources[ri].qh_meta;
+        uint64_t qfl = uhci_qh_lock_acquire(ri);
         for (int i = 0; i < UHCI_QH_SLOTS; i++) {
             if (!meta[i].in_use || meta[i].device != dev) continue;
 
@@ -1268,6 +1352,7 @@ void uhci_notify_disconnect(struct usb_device *dev) {
             meta[i].cursor = NULL;
             meta[i].remaining = 0;
         }
+        uhci_qh_lock_release(ri, qfl);
 
         if (ri < uhci_controller_count &&
             dev->ctrl == (struct usb_controller *)&uhci_resources[ri].ctrl) {
@@ -1299,6 +1384,8 @@ struct uhci_driver *return_uhci_driver(void) {
     if (!tsc || !tsc->sleep_tsc_ms) return &uhci_driver_loaded;
 
     delay_ms = tsc->sleep_tsc_ms;
+    uhci_now_us_fn = tsc->get_tsc_uptime_us;
+    for (int i = 0; i < MAX_UHCI_CONTROLLERS; i++) spin_lock_init(&uhci_qh_lock[i]);
 
     uhci_scan_pci();
     return &uhci_driver_loaded;

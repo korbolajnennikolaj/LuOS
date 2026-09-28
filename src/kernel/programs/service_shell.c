@@ -1641,6 +1641,96 @@ static void cmd_scheduler_test(struct limine_video_driver *video, const char *ar
     video->printf("\n======================\n\n", LIMINE_COLOR_CYAN);
 }
 
+static volatile int sched_fair_stop = 0;
+static volatile uint64_t sched_fair_count[2];
+
+static void sched_fair_worker(void *arg) {
+    int id = (int)(uintptr_t)arg;
+    uint64_t n = 0;
+    while (!__atomic_load_n(&sched_fair_stop, __ATOMIC_ACQUIRE)) {
+        for (volatile int k = 0; k < 2000; k++) { }
+        n++;
+        sched_fair_count[id] = n;
+    }
+}
+
+static void sched_fair_round(int prio_a, int prio_b, int core, uint64_t ms) {
+    sched_fair_stop = 0;
+    sched_fair_count[0] = sched_fair_count[1] = 0;
+    struct task *a = task_create_ex("fair-a", sched_fair_worker, (void *)0, prio_a, core, 0);
+    struct task *b = task_create_ex("fair-b", sched_fair_worker, (void *)1, prio_b, core, 0);
+    if (!a || !b) { printf_color(LIMINE_COLOR_LIGHT_RED, "  task_create failed\n"); return; }
+    uint32_t tid_a = a->tid, tid_b = b->tid;
+
+    scheduler_sleep_ms(ms);
+
+    static struct sched_task_info infos[MAX_TASKS];
+    int n = scheduler_snapshot(infos, MAX_TASKS);
+    uint64_t ra = 0, rb = 0;
+    for (int i = 0; i < n; i++) {
+        if (infos[i].tid == tid_a) ra = infos[i].run_ticks;
+        if (infos[i].tid == tid_b) rb = infos[i].run_ticks;
+    }
+    __atomic_store_n(&sched_fair_stop, 1, __ATOMIC_RELEASE);
+    scheduler_sleep_ms(50);
+
+    uint64_t tot = ra + rb;
+    unsigned pa = tot ? (unsigned)(ra * 100u / tot) : 0;
+    printf_color(LIMINE_COLOR_CYAN,
+                 "  core %d: level %2d -> %5llu ms (%u%%)   level %2d -> %5llu ms (%u%%)\n",
+                 core, prio_a, (unsigned long long)ra, pa,
+                 prio_b, (unsigned long long)rb, tot ? 100u - pa : 0u);
+}
+
+static void cmd_scheduler_fair(void)
+{
+    int core = scheduler_core_count() - 1;
+    printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n=== scheduler-fair (2 s per round, both tasks pinned to core %d) ===\n", core);
+    sched_fair_round(2, 12, core, 2000);
+    sched_fair_round(8, 8, core, 2000);
+    printf_color(LIMINE_COLOR_LIGHT_GRAY,
+                 "  expected: level 12 gets a small but non-zero share (aging),\n"
+                 "            equal levels split roughly 50/50\n\n");
+}
+
+static void cmd_ps(void)
+{
+    static struct sched_task_info infos[MAX_TASKS];
+    static const char *st_names[] = { "ready", "run", "block", "sleep", "zombie" };
+
+    int n = scheduler_snapshot(infos, MAX_TASKS);
+    uint64_t now = scheduler_ticks();
+
+    printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n  TID  NAME                 STATE   BASE PRIO CORE  CPU(ms)   SWITCH  STACK\n");
+    for (int i = 0; i < n; i++) {
+        struct sched_task_info *t = &infos[i];
+        const char *st = (t->state < 0) ? "idle"
+                       : (t->state <= 4 ? st_names[t->state] : "?");
+        char core[8];
+        if (t->affinity >= 0) { core[0] = '#'; core[1] = (char)('0' + (t->core % 10)); core[2] = 0; }
+        else { core[0] = (char)('0' + (t->core % 10)); core[1] = 0; }
+        printf_color(t->state == 1 ? LIMINE_COLOR_LIGHT_GREEN : LIMINE_COLOR_LIGHT_GRAY,
+                     "  %-4u %-20s %-7s %-4d %-4d %-5s %-9llu %-7llu %uK\n",
+                     (unsigned)t->tid, t->name, st, t->base_priority, t->priority, core,
+                     (unsigned long long)t->run_ticks, (unsigned long long)t->switches,
+                     (unsigned)(t->stack_size / 1024));
+    }
+
+    printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n  CORE  RUNNABLE  BUSY%%  STEALS  SWITCHES\n");
+    for (int c = 0; c < scheduler_core_count(); c++) {
+        struct sched_core_info ci;
+        if (scheduler_core_info(c, &ci) != 0) continue;
+        uint64_t tot = ci.busy_ticks + ci.idle_ticks;
+        unsigned busy = tot ? (unsigned)((ci.busy_ticks * 100u) / tot) : 0;
+        printf_color(LIMINE_COLOR_CYAN, "  %-5d %-9d %-6u %-7llu %llu\n",
+                     c, ci.nr_running, busy,
+                     (unsigned long long)ci.steals, (unsigned long long)ci.switches);
+    }
+    printf_color(LIMINE_COLOR_DARK_GRAY,
+                 "\n  uptime %llu ms; PRIO = current MLFQ level (0 = most urgent),"
+                 " #N = pinned to core N\n\n", (unsigned long long)now);
+}
+
 static void cmd_hid_test(struct limine_video_driver *video, struct keyboard_driver *kbd, struct mouse_driver *mouse, struct tsc_driver *tsc)
 {
     video->printf("\n=== HID Simultaneous Test (Keyboard + Mouse) ===\n",
@@ -2727,6 +2817,7 @@ static void shell_entry(void *arg) {
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "mouse         - live cursor/buttons from mouse service", "");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "hid-test      - kbd+mouse test (15s)", "hpet          - HPET info/self-test");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "scheduler-test [cores] [tasks] [iters] - scheduler/multitask test", "guess-game    - guess the number");
+            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "ps            - tasks, MLFQ levels, per-core load", "scheduler-fair - starvation/fairness demo");
 
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Lua / Python --\n");
             printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "lua-test      - Lua test suite", "lua-kernel-test - kernel.* bindings");
@@ -2828,6 +2919,8 @@ static void shell_entry(void *arg) {
         else if (str_cmp(cmd_buffer, "hid-test") == 0) { cmd_hid_test(video, kbd, mouse, tsc); }
         else if (str_starts_with(cmd_buffer, "scheduler-test ")) { cmd_scheduler_test(video, cmd_buffer + 15); }
         else if (str_cmp(cmd_buffer, "scheduler-test") == 0) { cmd_scheduler_test(video, ""); }
+        else if (str_cmp(cmd_buffer, "ps") == 0) { cmd_ps(); }
+        else if (str_cmp(cmd_buffer, "scheduler-fair") == 0) { cmd_scheduler_fair(); }
         else if (str_cmp(cmd_buffer, "hpet") == 0) { cmd_hpet(video); }
 
         else if (str_cmp(cmd_buffer, "lua-test") == 0) { cmd_lua_test(video); }
@@ -3005,6 +3098,7 @@ service_t *get_shell_service(void) {
         .dependency_count = 0,
         .restart_limit = SERVICE_RESTART_LIMIT_DEFAULT,
         .restart_count = 0,
+        .stack_size = 512 * 1024,
         .task = NULL
     };
 

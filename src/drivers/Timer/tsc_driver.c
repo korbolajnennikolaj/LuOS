@@ -34,12 +34,26 @@ uint64_t get_tsc_uptime_ms(void) {
     return current_tsc / tsc_ticks_per_ms;
 }
 
+uint64_t get_tsc_uptime_us(void) {
+    if (tsc_ticks_per_ms == 0) return 0;
+    uint64_t t = readTSC();
+    uint64_t ms = t / tsc_ticks_per_ms;
+    uint64_t rem = t % tsc_ticks_per_ms;
+    return ms * 1000u + (rem * 1000u) / tsc_ticks_per_ms;
+}
+
+uint64_t get_tsc_ticks_per_ms(void) {
+    return tsc_ticks_per_ms;
+}
+
 struct tsc_driver tsc_driver_loaded = {
     .get_tsc_ms = readTSC,
     .get_tsc_uptime_ms = get_tsc_uptime_ms,
     .sleep_tsc_ms = sleep_tsc_ms,
     .sleep_tsc_ticks = sleep_tsc_ticks,
     .sleep_tsc_us = sleep_tsc_us,
+    .get_tsc_uptime_us = get_tsc_uptime_us,
+    .get_tsc_ticks_per_ms = get_tsc_ticks_per_ms,
 };
 
 struct tsc_driver* return_tsc_driver(){

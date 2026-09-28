@@ -11,6 +11,8 @@ typedef struct tsc_driver {
     void (*sleep_tsc_ticks)(uint64_t ticks);
     void (*sleep_tsc_ms)(uint64_t ms);
     void (*sleep_tsc_us)(uint64_t us);
+    uint64_t (*get_tsc_uptime_us)(void);
+    uint64_t (*get_tsc_ticks_per_ms)(void);
 } tsc_driver;
 
 struct tsc_driver* return_tsc_driver(void);

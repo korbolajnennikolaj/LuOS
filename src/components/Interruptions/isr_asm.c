@@ -1,6 +1,6 @@
 #include "isr.h"
 
-extern void isr_handler(struct registers* regs);
+extern void isr_handler(struct registers* regs, void *fx);
 
 __attribute__((naked)) void isr_stub(void) {
     asm volatile(
@@ -364,9 +364,14 @@ __attribute__((naked)) void isr_common_stub(void) {
         "push %r15\n\t"
 
         "mov %rsp, %rdi\n\t"
-        "sub $8, %rsp\n\t"
+        "mov %rsp, %rbx\n\t"
+        "sub $512, %rsp\n\t"
+        "and $-16, %rsp\n\t"
+        "fxsave (%rsp)\n\t"
+        "mov %rsp, %rsi\n\t"
         "call isr_handler\n\t"
-        "add $8, %rsp\n\t"
+        "fxrstor (%rsp)\n\t"
+        "mov %rbx, %rsp\n\t"
 
         "pop %r15\n\t"
         "pop %r14\n\t"

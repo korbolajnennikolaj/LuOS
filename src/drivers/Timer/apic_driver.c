@@ -91,7 +91,7 @@ static void apic_calibrate(struct pit_driver *pit) {
 }
 
 static void apic_timer_isr(struct registers *regs) {
-    apic_milliseconds++;
+    if (current_core() == 0) apic_milliseconds++;
     scheduler_tick(regs);
 }
 

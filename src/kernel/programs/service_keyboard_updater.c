@@ -6,7 +6,7 @@
 #include "drivers/Input/keyboard_driver.h"
 #include "kernel/scheduler/scheduler.h"
 
-#define KEYBOARD_UPDATER_TICK_MS 20
+#define KEYBOARD_UPDATER_TICK_MS 10
 #define KEYBOARD_UPDATER_WATCHDOG_MS 4000
 
 static volatile uint64_t keyboard_updater_heartbeat = 0;

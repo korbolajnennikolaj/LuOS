@@ -262,16 +262,27 @@ void usb_event_unregister_for_device(void *device) {
     spin_unlock_irqrestore(&handlers_lock, flags);
 }
 
+static volatile int s_intr_dispatching = 0;
+
 void usb_event_dispatch_all(void) {
-    usb_event_t evt;
-    while (usb_pop_event(&evt)) {
-        if (evt.type == USB_EVENT_NONE) continue;
-        struct handler_entry snapshot[USB_EVENT_MAX_HANDLERS];
-        uint64_t flags = spin_lock_irqsave(&handlers_lock);
-        int count = s_intr_handler_count;
-        for (int i = 0; i < count; i++) snapshot[i] = s_intr_handlers[i];
-        spin_unlock_irqrestore(&handlers_lock, flags);
-        dispatch_to_table(snapshot, count, &evt);
+    for (;;) {
+        if (__atomic_exchange_n(&s_intr_dispatching, 1, __ATOMIC_ACQUIRE))
+            return;
+
+        usb_event_t evt;
+        while (usb_pop_event(&evt)) {
+            if (evt.type == USB_EVENT_NONE) continue;
+            struct handler_entry snapshot[USB_EVENT_MAX_HANDLERS];
+            uint64_t flags = spin_lock_irqsave(&handlers_lock);
+            int count = s_intr_handler_count;
+            for (int i = 0; i < count; i++) snapshot[i] = s_intr_handlers[i];
+            spin_unlock_irqrestore(&handlers_lock, flags);
+            dispatch_to_table(snapshot, count, &evt);
+        }
+
+        __atomic_store_n(&s_intr_dispatching, 0, __ATOMIC_RELEASE);
+
+        if (!usb_event_pending(&g_usb_event_ring)) return;
     }
 }
 

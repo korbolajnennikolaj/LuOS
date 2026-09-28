@@ -36,8 +36,7 @@ void ap_main(struct limine_smp_info *info) {
     scheduler_start();
 
     asm volatile("sti");
-    for (;;)
-        asm volatile("hlt");
+    scheduler_idle_loop();
 }
 
 __attribute__((naked)) static void ap_trampoline(struct limine_smp_info *info __attribute__((unused))) {
