@@ -109,7 +109,7 @@ scripts/          # linker script and build helpers
 
 | Plan | Description |
 |---|---|
-| SMP | Multiprocessing support |
+| Logger component | Kernel logging subsystem |
 | Network stack | Basic networking support |
 | Audio stack | Sound output support |
 | OHCI hardware testing | Buy a real OHCI device and test the driver against real hardware, not just emulation |
