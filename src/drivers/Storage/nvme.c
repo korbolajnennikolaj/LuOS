@@ -2,6 +2,7 @@
 
 #include "block_device.h"
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 #include "components/Memory/mm.h"
 #include "components/Memory/pmm.h"
@@ -9,83 +10,15 @@
 #include "components/pci.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
-#include "drivers/Video/limine_video_driver.h"
 
 #include <stddef.h>
 #include <string.h>
 
-static void nvme_puts(const char *s, uint32_t color) {
-    struct limine_video_driver *v = get_self_driver(LIMINE_VIDEO_DRIVER, 0);
-    v->printf(s, color);
-}
-
-static void nvme_hex32(uint32_t val, uint32_t color) {
-    const char h[] = "0123456789ABCDEF";
-    char buf[11] = "0x00000000";
-
-    for (int i = 9; i >= 2; i--) { buf[i] = h[val & 0xF]; val >>= 4; }
-    nvme_puts(buf, color);
-}
-
-static void nvme_hex64(uint64_t val, uint32_t color) {
-    const char h[] = "0123456789ABCDEF";
-    char buf[19] = "0x0000000000000000";
-    for (int i = 17; i >= 2; i--) { buf[i] = h[val & 0xF]; val >>= 4; }
-    nvme_puts(buf, color);
-}
-
-static void nvme_dec(uint64_t v, uint32_t color) {
-    char buf[21]; int i = 20; buf[20] = 0;
-    if (v == 0) { nvme_puts("0", color); return; }
-    while (v > 0 && i > 0) { buf[--i] = (char)('0' + v % 10); v /= 10; }
-    nvme_puts(buf + i, color);
-}
-
-#define NCOL_INFO LIMINE_COLOR_LIGHT_CYAN
-#define NCOL_OK LIMINE_COLOR_LIGHT_GREEN
-#define NCOL_ERR LIMINE_COLOR_LIGHT_RED
-#define NCOL_DATA LIMINE_COLOR_YELLOW
-
-#define ULOG(s) do { nvme_puts("[NVME] " s "\n", NCOL_INFO); } while(0)
-#define UERR(s) do { nvme_puts("[NVME] ERR " s "\n", NCOL_ERR); } while(0)
-
 #define NVME_DBG 0
 #if NVME_DBG
-#define NDBG_COM1 0x3F8
-static int ndbg_inited = 0;
-static inline void ndbg_outb(uint16_t port, uint8_t val) {
-    asm volatile("outb %0, %1" :: "a"(val), "Nd"(port));
-}
-static inline uint8_t ndbg_inb(uint16_t port) {
-    uint8_t r; asm volatile("inb %1, %0" : "=a"(r) : "Nd"(port)); return r;
-}
-static void ndbg_init(void) {
-    if (ndbg_inited) return;
-    ndbg_inited = 1;
-    ndbg_outb(NDBG_COM1 + 1, 0x00);
-    ndbg_outb(NDBG_COM1 + 3, 0x80);
-    ndbg_outb(NDBG_COM1 + 0, 0x03);
-    ndbg_outb(NDBG_COM1 + 1, 0x00);
-    ndbg_outb(NDBG_COM1 + 3, 0x03);
-    ndbg_outb(NDBG_COM1 + 2, 0xC7);
-    ndbg_outb(NDBG_COM1 + 4, 0x0B);
-}
-static void ndbg_putc(char c) {
-    ndbg_init();
-    for (int spin = 0; spin < 100000 && !(ndbg_inb(NDBG_COM1 + 5) & 0x20); spin++) {}
-    ndbg_outb(NDBG_COM1, (uint8_t)c);
-}
-static void ndbg_str(const char *s) { while (*s) ndbg_putc(*s++); }
-static void ndbg_hex64(uint64_t v) {
-    ndbg_str("0x");
-    for (int i = 15; i >= 0; i--) {
-        uint8_t nib = (v >> (i * 4)) & 0xF;
-        ndbg_putc(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
-    }
-}
+#define NVME_TRACE(...) LOG_DEBUG(__VA_ARGS__)
 #else
-static void ndbg_str(const char *s) { (void)s; }
-static void ndbg_hex64(uint64_t v) { (void)v; }
+#define NVME_TRACE(...) do { } while (0)
 #endif
 
 static inline void nvme_io_mb(void) {
@@ -99,7 +32,7 @@ static void (*delay_ms)(uint64_t);
 static void *nvme_alloc_aligned(size_t size, size_t align) {
     uint32_t pages = (uint32_t)((size + PAGE_SIZE - 1) / PAGE_SIZE + 1);
     uint64_t phys = pmm_alloc_pages(pages);
-    if (!phys) { UERR("nvme_alloc_aligned: pmm_alloc_pages failed"); return NULL; }
+    if (!phys) { LOG_ERROR("pmm_alloc_pages(%u) failed", pages); return NULL; }
 
     uint64_t virt = mm_phys_to_virt(phys);
     uint64_t aligned = (virt + align - 1) & ~(uint64_t)(align - 1);
@@ -137,7 +70,7 @@ static int nvme_submit_poll(nvme_queue_t *q, nvme_sqe_t *sqe) {
         delay_ms(1);
     }
     if (t <= 0) {
-        UERR("nvme_submit_poll: completion timeout");
+        LOG_ERROR("completion timeout for opcode 0x%02x cid %u", (unsigned)(sqe->cdw0 & 0xFF), (unsigned)cid);
         spin_unlock(&q->lock);
         return BLOCK_ERR_TIMEOUT;
     }
@@ -153,9 +86,8 @@ static int nvme_submit_poll(nvme_queue_t *q, nvme_sqe_t *sqe) {
     nvme_io_mb();
 
     if (sc != 0 || sct != 0) {
-        nvme_puts("[NVME] ERR cmd failed SCT=", NCOL_INFO); nvme_hex32(sct, NCOL_DATA);
-        nvme_puts(" SC=", NCOL_INFO); nvme_hex32(sc, NCOL_DATA);
-        nvme_puts(" status=", NCOL_INFO); nvme_hex32(status, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
+        LOG_ERROR("opcode 0x%02x failed: SCT=0x%x SC=0x%02x status=0x%04x",
+                  (unsigned)(sqe->cdw0 & 0xFF), sct, sc, (unsigned)status);
         spin_unlock(&q->lock);
         return BLOCK_ERR_IO;
     }
@@ -195,10 +127,10 @@ static void nvme_build_prp(void *buf, uint32_t total_bytes, uint64_t *prp_list,
 static bool nvme_queue_alloc(nvme_controller_t *ctrl, nvme_queue_t *q,
                               uint32_t entries, uint32_t qid) {
     q->sq = (nvme_sqe_t *)nvme_alloc_aligned(entries * sizeof(nvme_sqe_t), PAGE_SIZE);
-    if (!q->sq) { UERR("nvme_queue_alloc: sq alloc failed"); return false; }
+    if (!q->sq) { LOG_ERROR("queue %u: submission queue allocation failed", qid); return false; }
 
     q->cq = (nvme_cqe_t *)nvme_alloc_aligned(entries * sizeof(nvme_cqe_t), PAGE_SIZE);
-    if (!q->cq) { UERR("nvme_queue_alloc: cq alloc failed"); return false; }
+    if (!q->cq) { LOG_ERROR("queue %u: completion queue allocation failed", qid); return false; }
 
     q->sq_entries = entries;
     q->cq_entries = entries;
@@ -208,6 +140,8 @@ static bool nvme_queue_alloc(nvme_controller_t *ctrl, nvme_queue_t *q,
     q->next_cid = (uint16_t)(qid * 1000);
     q->sq_doorbell = nvme_doorbell(ctrl, qid, false);
     q->cq_doorbell = nvme_doorbell(ctrl, qid, true);
+    LOG_DEBUG("queue %u: %u entries, sq=0x%llx cq=0x%llx", qid, entries,
+              (unsigned long long)mm_ptr_to_phys(q->sq), (unsigned long long)mm_ptr_to_phys(q->cq));
     return true;
 }
 
@@ -262,7 +196,14 @@ static int nvme_rw(nvme_controller_t *ctrl, nvme_namespace_t *ns, bool write,
     sqe.cdw11 = (uint32_t)(lba >> 32);
     sqe.cdw12 = (count - 1) & 0xFFFF;
 
-    return nvme_submit_poll(&ctrl->io_q, &sqe);
+    NVME_TRACE("ns %u: %s lba=%llu count=%u prp1=0x%llx prp2=0x%llx", ns->nsid, write ? "write" : "read",
+               (unsigned long long)lba, count, (unsigned long long)prp1, (unsigned long long)prp2);
+
+    int ret = nvme_submit_poll(&ctrl->io_q, &sqe);
+    if (ret != BLOCK_OK)
+        LOG_ERROR("%s: %s lba=%llu count=%u failed (%d)", ns->blkdev.name, write ? "write" : "read",
+                  (unsigned long long)lba, count, ret);
+    return ret;
 }
 
 static int nvme_blk_read(struct block_device *self, uint64_t lba, uint32_t count, void *buf) {
@@ -284,38 +225,30 @@ static int nvme_blk_flush(struct block_device *self) {
 static struct nvme_driver drv_nvme;
 
 static bool nvme_controller_init(nvme_controller_t *ctrl, struct pci_device *dev, int *disk_idx) {
-    ndbg_str("\n[nvme] controller_init enter\n");
     pci_enable_bus_mastering(dev);
-    ndbg_str("[nvme] bus mastering enabled\n");
-
-    ndbg_str("[nvme] bar0="); ndbg_hex64(dev->bar0); ndbg_str(" bar1="); ndbg_hex64(dev->bar1); ndbg_str("\n");
+    NVME_TRACE("bus mastering enabled, bar0=0x%llx bar1=0x%llx",
+               (unsigned long long)dev->bar0, (unsigned long long)dev->bar1);
 
     bool bar_is_io = false;
     uint64_t bar_phys = pci_bar_phys(dev, 0, &bar_is_io);
     if (bar_is_io || !bar_phys) {
-        UERR("BAR0 is not a usable memory BAR, skipping");
+        LOG_ERROR("BAR0 is not a usable memory BAR (io=%d phys=0x%llx), skipping",
+                  (int)bar_is_io, (unsigned long long)bar_phys);
         return false;
     }
-    ndbg_str("[nvme] bar_phys="); ndbg_hex64(bar_phys); ndbg_str("\n");
-
-    nvme_puts("[NVME] BAR0 phys=", NCOL_INFO); nvme_hex64(bar_phys, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
 
     uint64_t bar_virt = vmm_map_mmio(bar_phys, PAGE_SIZE * 4, 0);
     if (!bar_virt) {
-        UERR("failed to map BAR0 MMIO window");
+        LOG_ERROR("failed to map BAR0 MMIO window at 0x%llx", (unsigned long long)bar_phys);
         return false;
     }
-    nvme_puts("[NVME] BAR0 virt=", NCOL_INFO); nvme_hex64(bar_virt, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
-    ndbg_str("[nvme] BAR0 mapped into page tables\n");
+    LOG_DEBUG("BAR0 phys=0x%llx virt=0x%llx", (unsigned long long)bar_phys, (unsigned long long)bar_virt);
 
     ctrl->regs = (volatile nvme_regs_t *)bar_virt;
-    ndbg_str("[nvme] regs virt="); ndbg_hex64((uint64_t)ctrl->regs); ndbg_str("\n");
     uint64_t cap = ctrl->regs->cap;
-    ndbg_str("[nvme] cap read OK cap="); ndbg_hex64(cap); ndbg_str("\n");
 
     if (cap == 0xFFFFFFFFFFFFFFFFULL || cap == 0) {
-        nvme_puts("[NVME] ERR CAP reads back as ", NCOL_ERR); nvme_hex64(cap, NCOL_DATA);
-        nvme_puts(" - controller not responding, skipping\n", NCOL_ERR);
+        LOG_ERROR("CAP reads back as 0x%016llx - controller not responding, skipping", (unsigned long long)cap);
         return false;
     }
     ctrl->dstrd = NVME_CAP_DSTRD(cap);
@@ -323,13 +256,11 @@ static bool nvme_controller_init(nvme_controller_t *ctrl, struct pci_device *dev
     uint32_t to_ms = NVME_CAP_TO(cap) * 500;
     if (to_ms == 0) to_ms = NVME_RESET_TIMEOUT_MS;
 
-    nvme_puts("[NVME] CAP=", NCOL_INFO); nvme_hex64(cap, NCOL_DATA);
-    nvme_puts(" DSTRD=", NCOL_INFO); nvme_dec(ctrl->dstrd, NCOL_DATA);
-    nvme_puts(" MQES=", NCOL_INFO); nvme_dec(mqes, NCOL_DATA);
-    nvme_puts(" TO=", NCOL_INFO); nvme_dec(to_ms, NCOL_DATA); nvme_puts("ms\n", NCOL_INFO);
+    LOG_DEBUG("CAP=0x%016llx DSTRD=%u MQES=%u TO=%u ms VS=0x%08x",
+              (unsigned long long)cap, (unsigned)ctrl->dstrd, mqes, to_ms, ctrl->regs->vs);
 
     if (!NVME_CAP_CSS_NVM(cap)) {
-        UERR("controller does not advertise the NVM command set, skipping");
+        LOG_ERROR("controller does not advertise the NVM command set, skipping");
         return false;
     }
 
@@ -338,7 +269,7 @@ static bool nvme_controller_init(nvme_controller_t *ctrl, struct pci_device *dev
         int t = (int)to_ms;
         while ((ctrl->regs->csts & NVME_CSTS_RDY) && t-- > 0) delay_ms(1);
         if (ctrl->regs->csts & NVME_CSTS_RDY) {
-            UERR("controller never went not-ready after CC.EN=0");
+            LOG_ERROR("controller never went not-ready after CC.EN=0, CSTS=0x%08x", ctrl->regs->csts);
             return false;
         }
     }
@@ -364,49 +295,61 @@ static bool nvme_controller_init(nvme_controller_t *ctrl, struct pci_device *dev
         int t = (int)to_ms;
         while (!(ctrl->regs->csts & NVME_CSTS_RDY) && t-- > 0) {
             if (ctrl->regs->csts & NVME_CSTS_CFS) {
-                UERR("controller reported fatal status (CSTS.CFS) during enable");
+                LOG_ERROR("controller reported fatal status (CSTS.CFS) during enable, CSTS=0x%08x", ctrl->regs->csts);
                 return false;
             }
             delay_ms(1);
         }
         if (!(ctrl->regs->csts & NVME_CSTS_RDY)) {
-            UERR("controller never became ready (CSTS.RDY) after CC.EN=1");
+            LOG_ERROR("controller never became ready after CC.EN=1, CSTS=0x%08x", ctrl->regs->csts);
             return false;
         }
     }
-    ULOG("controller ready (CSTS.RDY=1)");
+    LOG_DEBUG("controller ready (CSTS.RDY=1), admin queue %u entries", admin_entries);
 
     void *idbuf = nvme_alloc_aligned(4096, 4096);
-    if (!idbuf) { UERR("identify buffer alloc failed"); return false; }
+    if (!idbuf) { LOG_ERROR("identify buffer allocation failed"); return false; }
 
     if (nvme_do_identify(ctrl, NVME_IDENTIFY_CNS_CONTROLLER, 0, idbuf) != BLOCK_OK) {
-        UERR("IDENTIFY CONTROLLER failed");
+        LOG_ERROR("IDENTIFY CONTROLLER failed");
         return false;
     }
     uint8_t *idc = (uint8_t *)idbuf;
     uint32_t nn = *(uint32_t *)(idc + 516);
-    nvme_puts("[NVME] IDENTIFY CONTROLLER: NN=", NCOL_INFO); nvme_dec(nn, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
+    {
+        char model[41];
+        char serial[21];
+        memcpy(model, idc + 24, 40);
+        memcpy(serial, idc + 4, 20);
+        model[40] = '\0';
+        serial[20] = '\0';
+        for (int i = 39; i >= 0 && model[i] == ' '; i--) model[i] = '\0';
+        for (int i = 19; i >= 0 && serial[i] == ' '; i--) serial[i] = '\0';
+        LOG_INFO("controller \"%s\" serial \"%s\", %u namespace(s)", model, serial, nn);
+    }
 
     if (!nvme_queue_alloc(ctrl, &ctrl->io_q, NVME_IO_QUEUE_ENTRIES, NVME_IO_QUEUE_ID)) {
         return false;
     }
-    if (nvme_create_io_cq(ctrl) != BLOCK_OK) { UERR("CREATE I/O CQ failed"); return false; }
-    if (nvme_create_io_sq(ctrl) != BLOCK_OK) { UERR("CREATE I/O SQ failed"); return false; }
-    ULOG("I/O queue pair created");
+    if (nvme_create_io_cq(ctrl) != BLOCK_OK) { LOG_ERROR("CREATE I/O CQ failed"); return false; }
+    if (nvme_create_io_sq(ctrl) != BLOCK_OK) { LOG_ERROR("CREATE I/O SQ failed"); return false; }
+    LOG_DEBUG("I/O queue pair created");
 
     if (nn > 32) nn = 32;
 
     for (uint32_t nsid = 1; nsid <= nn && *disk_idx < NVME_MAX_DISKS; nsid++) {
         memset(idbuf, 0, 4096);
         if (nvme_do_identify(ctrl, NVME_IDENTIFY_CNS_NAMESPACE, nsid, idbuf) != BLOCK_OK) {
-            nvme_puts("[NVME] namespace ", NCOL_INFO); nvme_dec(nsid, NCOL_DATA);
-            nvme_puts(": identify FAILED, skipping\n", NCOL_INFO);
+            LOG_WARNING("namespace %u: identify failed, skipping", nsid);
             continue;
         }
 
         uint64_t nsze;
         memcpy(&nsze, idc, 8);
-        if (nsze == 0) continue;
+        if (nsze == 0) {
+            LOG_DEBUG("namespace %u: inactive", nsid);
+            continue;
+        }
 
         uint8_t flbas = idc[26] & 0xF;
         uint32_t lbaf_off = 128 + (uint32_t)flbas * 4;
@@ -435,11 +378,9 @@ static bool nvme_controller_init(nvme_controller_t *ctrl, struct pci_device *dev
         bd->write_sectors = nvme_blk_write;
         bd->flush = nvme_blk_flush;
 
-        nvme_puts("[NVME] namespace ", NCOL_INFO); nvme_dec(nsid, NCOL_DATA);
-        nvme_puts(": init OK -> nd", NCOL_INFO);
-        { char _dl[2] = { (char)('a' + *disk_idx), 0 }; nvme_puts(_dl, NCOL_OK); }
-        nvme_puts(" sectors=", NCOL_INFO); nvme_dec(ns->sector_count, NCOL_DATA);
-        nvme_puts(" sector_size=", NCOL_INFO); nvme_dec(ns->sector_size, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
+        LOG_INFO("namespace %u -> %s: %llu sectors x %u bytes (%llu MB)", nsid, bd->name,
+                 (unsigned long long)ns->sector_count, ns->sector_size,
+                 (unsigned long long)((ns->sector_count * ns->sector_size) >> 20));
 
         block_device_register(bd);
         (*disk_idx)++;
@@ -484,16 +425,11 @@ static struct nvme_driver drv_nvme = {
 };
 
 struct nvme_driver *return_nvme_driver(void) {
-    ndbg_str("\n[nvme] return_nvme_driver ENTER\n");
-    ULOG("=== NVMe init start ===");
-
     pci_init();
-    ndbg_str("[nvme] pci_init done\n");
 
     struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
-    if (!tsc) { UERR("no TSC driver"); return NULL; }
+    if (!tsc) { LOG_ERROR("no TSC driver, NVMe disabled"); return NULL; }
     delay_ms = tsc->sleep_tsc_ms;
-    ndbg_str("[nvme] got tsc driver, delay_ms set\n");
 
     int disk_idx = 0;
 
@@ -504,24 +440,21 @@ struct nvme_driver *return_nvme_driver(void) {
         struct pci_device *dev = (struct pci_device *)device_table[PCI_DEVICE][i];
         if (!dev) continue;
 
-        ndbg_str("[nvme] pci scan i="); ndbg_hex64(i);
-        ndbg_str(" class="); ndbg_hex64(dev->class_code);
-        ndbg_str(" subclass="); ndbg_hex64(dev->subclass);
-        ndbg_str(" progif="); ndbg_hex64(dev->prog_if); ndbg_str("\n");
+        NVME_TRACE("pci %d class=0x%02x subclass=0x%02x progif=0x%02x", i,
+                   (unsigned)dev->class_code, (unsigned)dev->subclass, (unsigned)dev->prog_if);
 
         if (dev->class_code != 0x01) continue;
         if (dev->subclass != 0x08) continue;
         if (dev->prog_if != 0x02) continue;
 
-        ndbg_str("[nvme] MATCH found at i="); ndbg_hex64(i); ndbg_str("\n");
+        if (drv_nvme.controller_count >= NVME_MAX_CONTROLLERS) {
+            LOG_WARNING("more than %d NVMe controllers, ignoring the rest", NVME_MAX_CONTROLLERS);
+            break;
+        }
 
-        if (drv_nvme.controller_count >= NVME_MAX_CONTROLLERS) break;
-
-        nvme_puts("[NVME] found controller ", NCOL_INFO);
-        nvme_hex32(dev->vendor_id, NCOL_DATA); nvme_puts(":", NCOL_INFO); nvme_hex32(dev->device_id, NCOL_DATA);
-        nvme_puts(" @ bus=", NCOL_INFO); nvme_dec(dev->bus, NCOL_DATA);
-        nvme_puts(" slot=", NCOL_INFO); nvme_dec(dev->slot, NCOL_DATA);
-        nvme_puts(" func=", NCOL_INFO); nvme_dec(dev->func, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
+        LOG_INFO("found controller %04x:%04x at %02x:%02x.%x",
+                 (unsigned)dev->vendor_id, (unsigned)dev->device_id,
+                 (unsigned)dev->bus, (unsigned)dev->slot, (unsigned)dev->func);
 
         nvme_controller_t *ctrl = &drv_nvme.controllers[drv_nvme.controller_count];
         memset(ctrl, 0, sizeof(*ctrl));
@@ -529,12 +462,12 @@ struct nvme_driver *return_nvme_driver(void) {
         if (nvme_controller_init(ctrl, dev, &disk_idx)) {
             drv_nvme.controller_count++;
         } else {
-            nvme_puts("[NVME] controller init FAILED, skipping\n", NCOL_ERR);
+            LOG_ERROR("controller at %02x:%02x.%x failed to initialize, skipping",
+                      (unsigned)dev->bus, (unsigned)dev->slot, (unsigned)dev->func);
         }
     }
 
-    nvme_puts("[NVME] init done, disks=", NCOL_INFO); nvme_dec(disk_idx, NCOL_DATA); nvme_puts("\n", NCOL_INFO);
-    ULOG("=== NVMe init end ===");
+    LOG_INFO("NVMe init done, %d controller(s), %d disk(s)", drv_nvme.controller_count, disk_idx);
 
     drv_nvme.disk_count = disk_idx;
     return disk_idx > 0 ? &drv_nvme : NULL;

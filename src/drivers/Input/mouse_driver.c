@@ -1,6 +1,7 @@
 #include "drivers/Input/mouse_driver.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 
 #include <stddef.h>
 
@@ -103,7 +104,11 @@ static int vmouse_get_active_type(void) {
 
 static int vmouse_register_backend(enum MOUSE_TYPE type, void *drv)
 {
-    if (!drv || vmouse.backend_count >= MOUSE_MAX_BACKENDS) return -1;
+    if (!drv || vmouse.backend_count >= MOUSE_MAX_BACKENDS) {
+        LOG_WARNING("cannot register %s mouse backend (%s)",
+                    type == PS2_MOUSE ? "PS/2" : "USB", drv ? "table full" : "NULL driver");
+        return -1;
+    }
     struct mouse_backend *b = &vmouse.backends[vmouse.backend_count];
     b->type = type;
     b->active = true;
@@ -111,6 +116,7 @@ static int vmouse_register_backend(enum MOUSE_TYPE type, void *drv)
         b->drv.ps2 = (struct ps2_mouse_driver *)drv;
     else
         b->drv.usb = (struct usb_mouse_driver *)drv;
+    LOG_DEBUG("backend %u: %s mouse", (unsigned)vmouse.backend_count, type == PS2_MOUSE ? "PS/2" : "USB");
     return (int)vmouse.backend_count++;
 }
 
@@ -131,6 +137,10 @@ struct mouse_driver *return_mouse_driver(void) {
     struct usb_mouse_driver *usb =
         (struct usb_mouse_driver *)get_self_driver(MOUSE_DRIVER, USB_MOUSE);
     if (usb) vmouse.register_backend(USB_MOUSE, usb);
+    if (vmouse.backend_count == 0)
+        LOG_WARNING("no mouse backends available");
+    else
+        LOG_INFO("virtual mouse ready with %u backend(s)", (unsigned)vmouse.backend_count);
     return &vmouse;
 }
 

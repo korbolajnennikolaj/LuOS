@@ -1,6 +1,7 @@
 #include "service_usb_hotplug.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/USB/usb_core.h"
 #include "kernel/scheduler/scheduler.h"
 
@@ -44,14 +45,23 @@ static void usb_hotplug_survey(void) {
     if (!tracked_valid) {
         for (int i = 0; i < limit; i++) tracked[i] = current[i];
         tracked_valid = true;
+        LOG_DEBUG("tracking %d USB device(s)", count);
         return;
     }
 
     for (int i = 0; i < limit; i++) {
         if (current[i] == tracked[i]) continue;
 
-        if (tracked[i] != NULL) usb_hotplug_disconnects++;
-        if (current[i] != NULL) usb_hotplug_connects++;
+        if (tracked[i] != NULL) {
+            usb_hotplug_disconnects++;
+            LOG_DEBUG("USB device slot %d gone", i);
+        }
+        if (current[i] != NULL) {
+            struct usb_device *dev = (struct usb_device *)current[i];
+            usb_hotplug_connects++;
+            LOG_DEBUG("USB device slot %d now %04x:%04x addr %u", i,
+                      (unsigned)dev->desc.idVendor, (unsigned)dev->desc.idProduct, (unsigned)dev->address);
+        }
 
         tracked[i] = current[i];
     }
@@ -67,12 +77,15 @@ static void usb_hotplug_entry(void *arg) {
     struct usb_core_driver *usb = get_self_driver(USB_DRIVER, USB_CORE_SLOT);
     uint32_t tick = 0;
 
+    if (!usb) LOG_WARNING("USB core not available yet, hotplug polling idle");
+
     while (!service_stop_requested(svc->id)) {
         if (!usb) usb = get_self_driver(USB_DRIVER, USB_CORE_SLOT);
 
         if (usb_hotplug_forced && usb && usb->scan_all) {
             usb_hotplug_forced = false;
             usb_hotplug_scanning = true;
+            LOG_INFO("forced USB rescan");
             usb->scan_all();
             usb_hotplug_scanning = false;
             usb_hotplug_rescans++;
@@ -99,7 +112,11 @@ static bool usb_hotplug_update(void *arg) {
     (void)arg;
     if (usb_hotplug_last_beat_ms == 0) return true;
     if (usb_hotplug_scanning) return true;
-    return (service_uptime_ms() - usb_hotplug_last_beat_ms) < USB_HOTPLUG_WATCHDOG_MS;
+    uint64_t silent = service_uptime_ms() - usb_hotplug_last_beat_ms;
+    if (silent < USB_HOTPLUG_WATCHDOG_MS) return true;
+    LOG_WARNING("hotplug loop silent for %llu ms (watchdog %u ms)",
+                (unsigned long long)silent, USB_HOTPLUG_WATCHDOG_MS);
+    return false;
 }
 
 int usb_hotplug_device_count(void) {

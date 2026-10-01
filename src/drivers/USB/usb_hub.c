@@ -3,7 +3,6 @@
 #include "components/drivers.h"
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core_internal.h"
-#include "drivers/USB/usb_log.h"
 #include "drivers/USB/xhci.h"
 
 #include <stdbool.h>
@@ -92,11 +91,17 @@ static int hub_bringup_port(struct usb_device *hub, int hub_slot, uint8_t port, 
         hub_get_port_status(hub, port, &change, NULL);
         if (change & (1u << HUB_CBIT_RESET)) { reset_ok = 1; break; }
     }
-    if (!reset_ok) return -1;
+    if (!reset_ok) {
+        LOG_WARNING("hub addr %u port %u: port reset did not complete", (unsigned)hub->address, (unsigned)port);
+        return -1;
+    }
     hub_clear_port_feature(hub, port, USB_HUB_FEAT_C_PORT_RESET);
 
     status = hub_get_port_status(hub, port, NULL, NULL);
-    if (!(status & USB_HUB_PORTSTS_CONNECTION)) return -1;
+    if (!(status & USB_HUB_PORTSTS_CONNECTION)) {
+        LOG_WARNING("hub addr %u port %u: device lost after reset", (unsigned)hub->address, (unsigned)port);
+        return -1;
+    }
 
     uint8_t psiv;
     if (status & USB_HUB_PORTSTS_LOW_SPEED) psiv = 2;
@@ -104,6 +109,10 @@ static int hub_bringup_port(struct usb_device *hub, int hub_slot, uint8_t port, 
     else psiv = 1;
 
     bool child_is_xhci = (hub->ctrl && hub->ctrl->type == USB_TYPE_XHCI);
+
+    LOG_DEBUG("hub addr %u port %u: status 0x%04x, %s speed, depth %u",
+              (unsigned)hub->address, (unsigned)port, (unsigned)status,
+              psiv == 2 ? "low" : psiv == 3 ? "high" : "full", (unsigned)(hub->hub_depth + 1));
 
     int before = usb_get_device_count();
     usb_init_device_topo(hub->ctrl, port, child_is_xhci,
@@ -116,6 +125,7 @@ static int hub_bringup_port(struct usb_device *hub, int hub_slot, uint8_t port, 
         if (port <= USB_HUB_MAX_PORTS) s_hub[hub_slot].child_slot[port] = (int8_t)child_slot;
         return child_slot;
     }
+    LOG_WARNING("hub addr %u port %u: child enumeration failed", (unsigned)hub->address, (unsigned)port);
     return -1;
 }
 
@@ -134,6 +144,10 @@ void usb_hub_attach(struct usb_device *hub_dev, int hub_slot) {
     uint32_t pwron_ms = (hd_ret == 0) ? (uint32_t)hub_desc[5] * 2 : 100;
     if (pwron_ms < 20) pwron_ms = 20;
 
+    if (hd_ret != 0)
+        LOG_WARNING("hub addr %u: GET_HUB_DESCRIPTOR failed (%d), assuming %u ports",
+                    (unsigned)hub_dev->address, hd_ret, (unsigned)port_count);
+
     s_hub[hub_slot].in_use = 1;
     s_hub[hub_slot].port_count = port_count;
     s_hub[hub_slot].pwron_ms = pwron_ms;
@@ -147,19 +161,14 @@ void usb_hub_attach(struct usb_device *hub_dev, int hub_slot) {
         }
     }
 
-    usb_logrow_begin(USB_LOG_HUB, USB_LOG_INFO);
-    usb_logrow_str("hub slot "); usb_logrow_dec(hub_slot);
-    usb_logrow_str(": "); usb_logrow_dec(port_count);
-    usb_logrow_str(" ports, pwron="); usb_logrow_dec((int32_t)pwron_ms);
-    usb_logrow_str("ms");
-    usb_logrow_end();
+    LOG_INFO("hub slot %d: %u ports, power-on delay %u ms", hub_slot, (unsigned)port_count, pwron_ms);
 
     for (uint8_t port = 1; port <= port_count; port++) {
         int child = hub_bringup_port(hub_dev, hub_slot, port, pwron_ms);
         if (child >= 0) {
             uint16_t change = 0;
             uint16_t status = hub_get_port_status(hub_dev, port, &change, NULL);
-            usb_log_port_event(USB_LOG_HUB, hub_slot, port, "connect",
+            usb_log_port_event(USB_PORT_LOG_HUB, LOGGER_LEVEL_INFO, hub_slot, port, "connect",
                 ((uint32_t)change << 16) | status, 0xFF);
         }
     }
@@ -185,6 +194,7 @@ static void hub_remove_subtree(int slot) {
 }
 
 void usb_hub_detach(int slot) {
+    LOG_DEBUG("detaching device slot %d", slot);
     hub_remove_subtree(slot);
 }
 
@@ -231,22 +241,25 @@ void usb_hub_poll(void) {
                 if (status & USB_HUB_PORTSTS_CONNECTION) {
 
                     int child = hub_bringup_port(dev, i, port, s_hub[i].pwron_ms);
-                    usb_log_port_event(USB_LOG_HUB, i, port,
+                    usb_log_port_event(USB_PORT_LOG_HUB,
+                        (child >= 0) ? LOGGER_LEVEL_INFO : LOGGER_LEVEL_WARNING, i, port,
                         (child >= 0) ? "connect" : "enum-failed", packed, 0xFF);
                 } else if (port <= USB_HUB_MAX_PORTS) {
 
                     int child = s_hub[i].child_slot[port];
                     if (child >= 0) hub_remove_subtree(child);
                     s_hub[i].child_slot[port] = -1;
-                    usb_log_port_event(USB_LOG_HUB, i, port, "disconnect", packed, 0xFF);
+                    usb_log_port_event(USB_PORT_LOG_HUB, LOGGER_LEVEL_INFO, i, port, "disconnect", packed, 0xFF);
                 }
             }
 
             if (change & (1u << HUB_CBIT_ENABLE))
                 hub_clear_port_feature(dev, port, USB_HUB_FEAT_C_PORT_ENABLE);
 
-            if (change & (1u << HUB_CBIT_OVER_CURRENT))
+            if (change & (1u << HUB_CBIT_OVER_CURRENT)) {
+                LOG_WARNING("hub slot %d port %u: over-current change, status 0x%04x", i, (unsigned)port, (unsigned)status);
                 hub_clear_port_feature(dev, port, USB_HUB_FEAT_C_PORT_OVER_CURRENT);
+            }
 
             if (change & (1u << HUB_CBIT_RESET))
                 hub_clear_port_feature(dev, port, USB_HUB_FEAT_C_PORT_RESET);
@@ -257,6 +270,8 @@ void usb_hub_poll(void) {
 
         if (any_get_status_failed) {
             if (s_hub[i].fail_streak < 0xFFFFu) s_hub[i].fail_streak++;
+            if (s_hub[i].fail_streak == 1 || (s_hub[i].fail_streak % 64) == 0)
+                LOG_WARNING("hub slot %d: port status read failing, streak %u", i, (unsigned)s_hub[i].fail_streak);
         } else {
             s_hub[i].fail_streak = 0;
         }

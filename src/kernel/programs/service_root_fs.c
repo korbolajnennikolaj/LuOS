@@ -1,6 +1,7 @@
 #include "service_root_fs.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Storage/block_device.h"
 #include "kernel/scheduler/scheduler.h"
 #include "kernel/scheduler/spinlock.h"
@@ -19,6 +20,9 @@ static spinlock_t rootfs_lock = SPINLOCK_INIT;
 static char g_cwd[FS_MAX_PATH] = "/";
 
 static bool auto_mount_allowed = true;
+
+static struct block_device *auto_mount_reported[MAX_BLOCK_DEVICES];
+static uint32_t auto_mount_reported_devices = 0;
 
 static volatile uint64_t root_fs_last_beat_ms = 0;
 
@@ -194,7 +198,13 @@ static int rootfs_prepare_point(const char *mount_point) {
     return ROOTFS_OK;
 }
 
+static int rootfs_mount_device_ex(const char *device_name, const char *mount_point, int *out_fs_err, bool verbose);
+
 int rootfs_mount_device(const char *device_name, const char *mount_point, int *out_fs_err) {
+    return rootfs_mount_device_ex(device_name, mount_point, out_fs_err, true);
+}
+
+static int rootfs_mount_device_ex(const char *device_name, const char *mount_point, int *out_fs_err, bool verbose) {
     if (out_fs_err) *out_fs_err = FS_OK;
     if (!device_name || !device_name[0] || !mount_point || mount_point[0] != '/') return ROOTFS_ERR_PARAM;
     if (strlen(mount_point) >= ROOTFS_MOUNT_PATH_MAX) return ROOTFS_ERR_PARAM;
@@ -235,6 +245,7 @@ int rootfs_mount_device(const char *device_name, const char *mount_point, int *o
     int prep = rootfs_prepare_point(point);
     if (prep != ROOTFS_OK) {
         mount_pending[slot] = false;
+        LOG_WARNING("cannot prepare mount point %s for '%s' (%d)", point, device_name, prep);
         return prep;
     }
 
@@ -243,6 +254,7 @@ int rootfs_mount_device(const char *device_name, const char *mount_point, int *o
     if (r != FS_OK) {
         mount_pending[slot] = false;
         if (out_fs_err) *out_fs_err = r;
+        if (verbose) LOG_WARNING("cannot mount '%s' at %s, no supported filesystem (error %d)", device_name, point, r);
         return ROOTFS_ERR_FS;
     }
 
@@ -257,6 +269,8 @@ int rootfs_mount_device(const char *device_name, const char *mount_point, int *o
     spin_unlock(&rootfs_lock);
 
     if (slot == 0) rootfs_set_cwd("/");
+    LOG_INFO("'%s' mounted at %s (%s)%s", device_name, point, rootfs_type_name(fs.type),
+             verbose ? "" : ", automatic root mount");
     return ROOTFS_OK;
 }
 
@@ -299,6 +313,7 @@ int rootfs_unmount_point(const char *mount_point) {
         auto_mount_allowed = false;
         rootfs_set_cwd("/");
     }
+    LOG_INFO("%s unmounted%s", point, slot == 0 ? ", automatic root mount disabled" : "");
     return ROOTFS_OK;
 }
 
@@ -309,6 +324,8 @@ static void rootfs_drop_lost_mounts(void) {
         uint32_t idx = get_disk_index_from_name(mounts[i].device);
         struct block_device *dev = (idx == UINT32_MAX) ? NULL : block_device_get(idx);
         if (dev && dev == mounts[i].fs.dev) continue;
+
+        LOG_WARNING("device '%s' disappeared, dropping mount %s", mounts[i].device, mounts[i].path);
 
         spin_lock(&rootfs_lock);
         mounts[i].mounted = false;
@@ -324,6 +341,11 @@ static void rootfs_try_auto_mount(void) {
     if (!auto_mount_allowed || mounts[0].mounted) return;
 
     uint32_t count = get_device_count();
+    if (count != auto_mount_reported_devices) {
+        for (int i = 0; i < MAX_BLOCK_DEVICES; i++) auto_mount_reported[i] = NULL;
+        auto_mount_reported_devices = count;
+    }
+
     for (uint32_t i = 0; i < count; i++) {
         struct block_device *dev = block_device_get(i);
         if (!dev) continue;
@@ -334,7 +356,14 @@ static void rootfs_try_auto_mount(void) {
         }
         if (taken) continue;
 
-        if (rootfs_mount_device(dev->name, "/", NULL) == ROOTFS_OK) return;
+        int fs_err = FS_OK;
+        int r = rootfs_mount_device_ex(dev->name, "/", &fs_err, false);
+        if (r == ROOTFS_OK) return;
+
+        if (i < MAX_BLOCK_DEVICES && auto_mount_reported[i] != dev) {
+            auto_mount_reported[i] = dev;
+            LOG_DEBUG("auto-mount skipped '%s' (rootfs %d, fs %d)", dev->name, r, fs_err);
+        }
     }
 }
 
@@ -360,7 +389,11 @@ static void root_fs_entry(void *arg) {
 static bool root_fs_update(void *arg) {
     (void)arg;
     if (root_fs_last_beat_ms == 0) return true;
-    return (service_uptime_ms() - root_fs_last_beat_ms) < ROOT_FS_WATCHDOG_MS;
+    uint64_t silent = service_uptime_ms() - root_fs_last_beat_ms;
+    if (silent < ROOT_FS_WATCHDOG_MS) return true;
+    LOG_WARNING("root_fs loop silent for %llu ms (watchdog %u ms)",
+                (unsigned long long)silent, ROOT_FS_WATCHDOG_MS);
+    return false;
 }
 
 service_t *get_root_fs_service(void) {

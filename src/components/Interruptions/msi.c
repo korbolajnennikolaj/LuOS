@@ -1,6 +1,7 @@
 #include "components/Interruptions/msi.h"
 
 #include "components/Interruptions/idt.h"
+#include "components/logger.h"
 #include "kernel/limine.h"
 
 #include <ports.h>
@@ -87,7 +88,10 @@ bool msi_is_available(uint8_t bus, uint8_t dev, uint8_t func) {
 
 bool msi_enable(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector, uint8_t lapic_id, void (*handler)(void))
 {
-    if (s_vector_count >= MSI_MAX_VECTORS) return false;
+    if (s_vector_count >= MSI_MAX_VECTORS) {
+        LOG_WARNING("%02x:%02x.%x: MSI vector table full (%d)", (unsigned)bus, (unsigned)dev, (unsigned)func, MSI_MAX_VECTORS);
+        return false;
+    }
 
     uint8_t cap = msi_find_cap(bus, dev, func, PCI_CAP_ID_MSI);
     bool msix = false;
@@ -95,7 +99,10 @@ bool msi_enable(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector, uint8_t 
         cap = msi_find_cap(bus, dev, func, PCI_CAP_ID_MSIX);
         msix = true;
     }
-                if (!cap) { return false; }
+                if (!cap) {
+                    LOG_DEBUG("%02x:%02x.%x has no MSI/MSI-X capability", (unsigned)bus, (unsigned)dev, (unsigned)func);
+                    return false;
+                }
 
     if (!msix) {
 
@@ -127,7 +134,11 @@ bool msi_enable(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector, uint8_t 
         uint32_t tbl_off = tbl_info & ~0x7U;
 
         uint32_t bar_lo = pci_read_config(bus, dev, func, 0x10 + bir * 4);
-        if (bar_lo & 1) return false;
+        if (bar_lo & 1) {
+            LOG_WARNING("%02x:%02x.%x: MSI-X table BAR%u is I/O space, unsupported",
+                        (unsigned)bus, (unsigned)dev, (unsigned)func, (unsigned)bir);
+            return false;
+        }
 
         uint64_t tbl_base;
         if (((bar_lo >> 1) & 0x3) == 0x2) {
@@ -169,6 +180,9 @@ bool msi_enable(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector, uint8_t 
     s_vectors[idx].is_msix = msix;
     s_vectors[idx].enabled = true;
     s_vectors[idx].handler = handler;
+    LOG_DEBUG("%02x:%02x.%x: %s enabled, vector 0x%02x -> LAPIC %u, cap at 0x%02x",
+              (unsigned)bus, (unsigned)dev, (unsigned)func, msix ? "MSI-X" : "MSI",
+              (unsigned)vector, (unsigned)lapic_id, (unsigned)cap);
           return true;
 }
 
@@ -178,6 +192,9 @@ void msi_disable(uint8_t bus, uint8_t dev, uint8_t func) {
         if (v->pci_bus != bus || v->pci_dev != dev || v->pci_func != func)
             continue;
         if (!v->enabled) continue;
+
+        LOG_DEBUG("%02x:%02x.%x: disabling %s vector 0x%02x", (unsigned)bus, (unsigned)dev, (unsigned)func,
+                  v->is_msix ? "MSI-X" : "MSI", (unsigned)v->vector);
 
         if (!v->is_msix) {
             uint16_t ctrl = pci_read16(bus, dev, func, v->cap_offset + 2);
@@ -198,6 +215,7 @@ void msi_dispatch(uint8_t vector) {
             static uint8_t dbg_once[256] = {0};
             if (!dbg_once[vector]) {
                 dbg_once[vector] = 1;
+                LOG_DEBUG("first interrupt on vector 0x%02x", (unsigned)vector);
             }
             if (s_vectors[i].handler)
                 s_vectors[i].handler();
@@ -207,5 +225,6 @@ void msi_dispatch(uint8_t vector) {
     static uint8_t no_handler_warned[256] = {0};
     if (!no_handler_warned[vector]) {
         no_handler_warned[vector] = 1;
+        LOG_WARNING("interrupt on vector 0x%02x with no registered MSI handler", (unsigned)vector);
     }
 }

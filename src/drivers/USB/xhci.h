@@ -185,6 +185,4 @@ struct xhci_driver* return_xhci_driver(void);
 struct driver* return_meta_xhci_driver(void);
 void xhci_irq(void);
 
-void xhci_debug_port(const char *msg, uint32_t port, uint32_t val);
-
 #endif

@@ -3,13 +3,13 @@
 #include "acpi.h"
 #include "acpi_types.h"
 #include "checksum.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 #include "fadt.h"
 #include "tables.h"
 
 #include <ports.h>
 #include <stddef.h>
-#include <stdio.h>
 
 static bool acpi_parse_s5_in_bytes(const uint8_t *bytes, uint32_t len, uint8_t *out_a, uint8_t *out_b) {
     if (!bytes || len < 9) return false;
@@ -97,35 +97,42 @@ static void acpi_enable_if_needed(const ACPI_FADT *fadt) {
     }
 
     if (!fadt->SMICommandPort || !fadt->AcpiEnable) {
+        LOG_WARNING("SCI_EN is clear but FADT has no SMI command to enable ACPI mode");
         return;
     }
 
+    LOG_DEBUG("switching to ACPI mode via SMI port 0x%x", (unsigned)fadt->SMICommandPort);
     outb((uint16_t)fadt->SMICommandPort, fadt->AcpiEnable);
 
     for (volatile int i = 0; i < 1000000; i++) {
         if (read_pm1a_control(fadt) & ACPI_PM1_CNT_SCI_EN) break;
     }
+
+    if (!(read_pm1a_control(fadt) & ACPI_PM1_CNT_SCI_EN))
+        LOG_WARNING("ACPI mode enable did not set SCI_EN");
 }
 
 bool acpi_shutdown(void) {
     if (!acpi_init()) {
-        printf("[ACPI] shutdown failed: ACPI not available\n");
+        LOG_ERROR("shutdown failed: ACPI not available");
         return false;
     }
 
     const ACPI_FADT *fadt = acpi_get_fadt();
     if (!fadt || !fadt_has_fixed_hardware(fadt)) {
-        printf("[ACPI] shutdown failed: no FADT / fixed hardware PM1 block\n");
+        LOG_ERROR("shutdown failed: no FADT / fixed hardware PM1 block");
         return false;
     }
 
     uint8_t slp_typa, slp_typb;
     if (!acpi_find_s5_sleep_type(&slp_typa, &slp_typb)) {
-        printf("[ACPI] shutdown failed: could not find \\_S5 in DSDT/SSDT\n");
+        LOG_ERROR("shutdown failed: could not find \\_S5 in DSDT/SSDT");
         return false;
     }
 
     acpi_enable_if_needed(fadt);
+
+    LOG_INFO("entering S5 (SLP_TYPa=%u SLP_TYPb=%u)", (unsigned)slp_typa, (unsigned)slp_typb);
 
     uint16_t val_a = (uint16_t)((slp_typa << ACPI_PM1_CNT_SLP_TYP_SHIFT) | ACPI_PM1_CNT_SLP_EN);
     uint16_t val_b = (uint16_t)((slp_typb << ACPI_PM1_CNT_SLP_TYP_SHIFT) | ACPI_PM1_CNT_SLP_EN);
@@ -166,16 +173,16 @@ void acpi_reboot(void) {
 
     const ACPI_FADT *fadt = acpi_get_fadt();
     if (fadt && (fadt->Flags & ACPI_FADT_RESET_REG_SUP)) {
-        printf("[ACPI] resetting via FADT reset register\n");
+        LOG_INFO("resetting via FADT reset register");
         fadt_reset_system(fadt);
     }
 
-    printf("[ACPI] FADT reset unavailable/ineffective, trying 8042 controller\n");
+    LOG_WARNING("FADT reset unavailable/ineffective, trying 8042 controller");
     reboot_via_8042();
 
     for (volatile int i = 0; i < 10000000; i++) { }
 
-    printf("[ACPI] 8042 reset ineffective, forcing a triple fault\n");
+    LOG_WARNING("8042 reset ineffective, forcing a triple fault");
     reboot_via_triple_fault();
 
     for (;;) {

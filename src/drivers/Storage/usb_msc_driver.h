@@ -114,6 +114,7 @@ typedef struct usb_msc_driver {
 } usb_msc_driver;
 
 int usb_msc_set_verbose(int on);
+int usb_msc_get_verbose(void);
 
 struct usb_msc_driver *return_usb_msc_driver(void);
 struct driver *return_meta_usb_msc_driver(void);

@@ -1,12 +1,9 @@
 #include "fs/exfat.h"
 
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 
-#include <stdio.h>
 #include <string.h>
-
-#define XLOG(fmt, ...) printf_color(0xFF55FFFF, "[exfat] " fmt, ##__VA_ARGS__)
-#define XERR(fmt, ...) printf_color(0xFFFF5555, "[exfat] ERR " fmt, ##__VA_ARGS__)
 
 #define EXFAT_CLUSTER_EOC_MIN 0xFFFFFFF8u
 #define EXFAT_CLUSTER_BAD 0xFFFFFFF7u
@@ -17,15 +14,19 @@ static inline uint64_t cluster_to_lba(exfat_fs_t *fs, uint32_t cluster) {
 
 static int read_cluster(exfat_fs_t *fs, uint32_t cluster, void *buf) {
     if (cluster < 2) return FS_ERR_PARAM;
-    if (fs->dev->read_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf) != 0)
+    if (fs->dev->read_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf) != 0) {
+        LOG_ERROR("%s: failed to read cluster %u", fs->dev->name, cluster);
         return FS_ERR_IO;
+    }
     return FS_OK;
 }
 
 static int write_cluster(exfat_fs_t *fs, uint32_t cluster, const void *buf) {
     if (cluster < 2) return FS_ERR_PARAM;
-    if (fs->dev->write_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, (void *)buf) != 0)
+    if (fs->dev->write_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, (void *)buf) != 0) {
+        LOG_ERROR("%s: failed to write cluster %u", fs->dev->name, cluster);
         return FS_ERR_IO;
+    }
     return FS_OK;
 }
 
@@ -36,7 +37,11 @@ static uint32_t get_fat_entry(exfat_fs_t *fs, uint32_t cluster) {
 
     uint8_t *buf = kmalloc(fs->bytes_per_sector);
     if (!buf) return EXFAT_CLUSTER_EOC_MIN;
-    if (fs->dev->read_sectors(fs->dev, sector, 1, buf) != 0) { kfree(buf); return EXFAT_CLUSTER_EOC_MIN; }
+    if (fs->dev->read_sectors(fs->dev, sector, 1, buf) != 0) {
+        LOG_ERROR("%s: failed to read FAT sector %u", fs->dev->name, sector);
+        kfree(buf);
+        return EXFAT_CLUSTER_EOC_MIN;
+    }
     uint32_t raw;
     memcpy(&raw, buf + off, 4);
     kfree(buf);
@@ -454,7 +459,11 @@ static int load_bootsector(struct block_device *dev, exfat_bootsector_t *out) {
     uint32_t sector_size = dev->sector_size ? dev->sector_size : 512;
     uint8_t *buf = kmalloc(sector_size);
     if (!buf) return FS_ERR_NOMEM;
-    if (dev->read_sectors(dev, 0, 1, buf) != 0) { kfree(buf); return FS_ERR_IO; }
+    if (dev->read_sectors(dev, 0, 1, buf) != 0) {
+        LOG_ERROR("%s: failed to read boot sector", dev->name);
+        kfree(buf);
+        return FS_ERR_IO;
+    }
 
     if (buf[EXFAT_BOOT_SIG_OFFSET] != EXFAT_BOOT_SIG_0 ||
         buf[EXFAT_BOOT_SIG_OFFSET + 1] != EXFAT_BOOT_SIG_1) {
@@ -520,7 +529,7 @@ int exfat_mount(struct block_device *dev, fs_t *out) {
 
     if (fs->bytes_per_sector < 512 || fs->cluster_size == 0 || fs->root_cluster < 2) {
         kfree(fs);
-        XERR("invalid boot sector fields\n");
+        LOG_ERROR("invalid boot sector fields");
         return FS_ERR_CORRUPT;
     }
 
@@ -533,7 +542,7 @@ int exfat_mount(struct block_device *dev, fs_t *out) {
     strncpy(out->label, fs->label[0] ? fs->label : "", sizeof(out->label) - 1);
     out->label[sizeof(out->label) - 1] = '\0';
 
-    XLOG("mounted volume '%s', cluster=%u bytes, clusters=%u\n",
+    LOG_DEBUG("mounted volume '%s', cluster=%u bytes, clusters=%u",
          fs->label[0] ? fs->label : "(no label)",
          (unsigned)fs->cluster_size, (unsigned)fs->cluster_count);
 

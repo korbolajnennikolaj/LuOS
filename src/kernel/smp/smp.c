@@ -1,6 +1,7 @@
 #include "kernel/smp/smp.h"
 
 #include "kernel/limine.h"
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 #include "components/GDT/gdt.h"
 #include "components/Interruptions/idt.h"
@@ -30,6 +31,7 @@ void ap_main(struct limine_smp_info *info) {
 
     uint32_t logical = __atomic_fetch_add(&next_logical_id, 1, __ATOMIC_SEQ_CST);
     scheduler_register_core(apic_get_lapic_id(), (int)logical);
+    LOG_DEBUG("AP with LAPIC %u online as core %u", (unsigned)apic_get_lapic_id(), logical);
 
     __atomic_fetch_add(&cpus_online, 1, __ATOMIC_SEQ_CST);
 
@@ -56,18 +58,30 @@ __attribute__((naked)) static void ap_trampoline(struct limine_smp_info *info __
 
 void smp_init(void) {
     struct limine_smp_request *req = get_smp_request();
-    if (!req || !req->response) return;
+    if (!req || !req->response) {
+        LOG_WARNING("bootloader provided no SMP information, running on the BSP only");
+        return;
+    }
 
     struct limine_smp_response *resp = req->response;
     total_cpus = (uint32_t)resp->cpu_count;
-    if (total_cpus <= 1) return;
+    if (total_cpus <= 1) {
+        LOG_INFO("single CPU system, BSP LAPIC %u", (unsigned)resp->bsp_lapic_id);
+        return;
+    }
+
+    LOG_INFO("starting %u application processor(s), BSP LAPIC %u",
+             total_cpus - 1, (unsigned)resp->bsp_lapic_id);
 
     for (uint64_t i = 0; i < resp->cpu_count; i++) {
         struct limine_smp_info *cpu = resp->cpus[i];
         if (cpu->lapic_id == resp->bsp_lapic_id) continue;
 
         void *stack = kmalloc(AP_STACK_SIZE);
-        if (!stack) continue;
+        if (!stack) {
+            LOG_ERROR("no memory for AP stack, LAPIC %u stays offline", (unsigned)cpu->lapic_id);
+            continue;
+        }
 
         cpu->extra_argument = (uint64_t)stack + AP_STACK_SIZE;
         __atomic_store_n(&cpu->goto_address, ap_trampoline, __ATOMIC_SEQ_CST);
@@ -76,6 +90,12 @@ void smp_init(void) {
     uint64_t timeout = 200000000ull;
     while (__atomic_load_n(&cpus_online, __ATOMIC_SEQ_CST) < total_cpus && timeout--)
         asm volatile("pause");
+
+    uint32_t online = __atomic_load_n(&cpus_online, __ATOMIC_SEQ_CST);
+    if (online < total_cpus)
+        LOG_WARNING("only %u of %u CPUs came online", online, total_cpus);
+    else
+        LOG_INFO("all %u CPUs online", online);
 }
 
 int smp_cpu_count(void) {

@@ -1,17 +1,16 @@
 #include "fs/iso9660.h"
 
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 
-#include <stdio.h>
 #include <string.h>
-
-#define ILOG(fmt, ...) printf_color(0xFF55FFFF, "[iso9660] " fmt, ##__VA_ARGS__)
-#define IERR(fmt, ...) printf_color(0xFFFF5555, "[iso9660] ERR " fmt, ##__VA_ARGS__)
 
 static int read_iso_block(iso9660_fs_t *fs, uint32_t iso_lba, void *buf) {
     uint64_t dev_lba = (uint64_t)iso_lba * fs->sectors_per_block;
-    if (fs->dev->read_sectors(fs->dev, dev_lba, fs->sectors_per_block, buf) != 0)
+    if (fs->dev->read_sectors(fs->dev, dev_lba, fs->sectors_per_block, buf) != 0) {
+        LOG_ERROR("%s: failed to read ISO block %u", fs->dev->name, iso_lba);
         return FS_ERR_IO;
+    }
     return FS_OK;
 }
 
@@ -368,7 +367,7 @@ int iso9660_mount(struct block_device *dev, fs_t *out) {
     strncpy(out->label, fs->label, sizeof(out->label) - 1);
     out->label[sizeof(out->label) - 1] = '\0';
 
-    ILOG("mounted volume '%s' (read-only), root_extent=%u, size=%u bytes\n",
+    LOG_DEBUG("mounted volume '%s' (read-only), root_extent=%u, size=%u bytes",
          fs->label[0] ? fs->label : "(no label)",
          (unsigned)fs->root_extent_lba, (unsigned)fs->root_data_length);
 

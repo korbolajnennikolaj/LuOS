@@ -1,6 +1,7 @@
 #include "idt.h"
 
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "isr.h"
 
 static struct idt_entry idt[256] __attribute__((aligned(16)));
@@ -95,6 +96,7 @@ void init_idt(void) {
     idt_set_gate(255, isr_spurious, 0x8E);
 
     asm volatile("lidt %0" : : "m"(idtp));
+    LOG_DEBUG("IDT loaded at 0x%llx, limit %u", (unsigned long long)idtp.base, (unsigned)idtp.limit);
 }
 
 void load_idt(void) {

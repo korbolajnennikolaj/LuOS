@@ -2,6 +2,7 @@
 
 #include "components/drivers.h"
 #include "components/Interruptions/isr.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "kernel/scheduler/scheduler.h"
 
@@ -87,7 +88,10 @@ static void apic_calibrate(struct pit_driver *pit) {
 
     uint32_t elapsed = 0xFFFFFFFF - apic_read(APIC_REG_TIMER_CUR);
     ticks_per_ms = elapsed / 10;
-    if (!ticks_per_ms) ticks_per_ms = 10000;
+    if (!ticks_per_ms) {
+        LOG_WARNING("LAPIC timer calibration failed, using fallback 10000 ticks/ms");
+        ticks_per_ms = 10000;
+    }
 }
 
 static void apic_timer_isr(struct registers *regs) {
@@ -117,6 +121,7 @@ void apic_enable_this_core(void) {
     apic_write(APIC_REG_LVT_TIMER, APIC_TIMER_VECTOR | APIC_TIMER_PERIODIC);
     apic_write(APIC_REG_TIMER_DIV, 0x3);
     apic_write(APIC_REG_TIMER_INIT, ticks_per_ms ? ticks_per_ms : 10000);
+    LOG_DEBUG("LAPIC %u enabled, periodic timer on vector 0x%x", (unsigned)apic_get_lapic_id(), APIC_TIMER_VECTOR);
 }
 
 struct apic_driver *return_apic_driver(void) {
@@ -125,12 +130,16 @@ struct apic_driver *return_apic_driver(void) {
     outb(0x21, 0xFF);
     outb(0xA1, 0xFF);
 
-    if (!apic_supported())
+    if (!apic_supported()) {
+        LOG_ERROR("CPU has no local APIC");
         return NULL;
+    }
 
     apic_enable();
     apic_write(APIC_REG_EOI, 0);
     apic_calibrate(pit_local);
+    LOG_INFO("LAPIC %u at 0x%llx, timer %u ticks/ms, legacy PIC masked",
+             (unsigned)apic_get_lapic_id(), (unsigned long long)(uintptr_t)apic_base, ticks_per_ms);
 
     irq_register_handler(APIC_TIMER_VECTOR, apic_timer_isr);
 

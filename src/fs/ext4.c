@@ -1,16 +1,15 @@
 #include "fs/ext4.h"
 
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 
-#include <stdio.h>
 #include <string.h>
 
-#define ELOG(fmt, ...) printf_color(0xFF55FFFF, "[ext4] " fmt, ##__VA_ARGS__)
-#define EERR(fmt, ...) printf_color(0xFFFF5555, "[ext4] ERR " fmt, ##__VA_ARGS__)
-
 static int read_block(ext4_fs_t *fs, uint64_t block, void *buf) {
-    if (fs->dev->read_sectors(fs->dev, block * fs->sectors_per_block, fs->sectors_per_block, buf) != 0)
+    if (fs->dev->read_sectors(fs->dev, block * fs->sectors_per_block, fs->sectors_per_block, buf) != 0) {
+        LOG_ERROR("%s: failed to read block %llu", fs->dev->name, (unsigned long long)block);
         return FS_ERR_IO;
+    }
     return FS_OK;
 }
 
@@ -383,7 +382,11 @@ static int load_superblock(struct block_device *dev, uint32_t sector_size, ext4_
     if (!buf) return FS_ERR_NOMEM;
 
     uint64_t start_lba = EXT4_SUPERBLOCK_OFFSET / sector_size;
-    if (dev->read_sectors(dev, start_lba, sectors, buf) != 0) { kfree(buf); return FS_ERR_IO; }
+    if (dev->read_sectors(dev, start_lba, sectors, buf) != 0) {
+        LOG_ERROR("%s: failed to read superblock", dev->name);
+        kfree(buf);
+        return FS_ERR_IO;
+    }
 
     uint32_t sb_off_in_buf = EXT4_SUPERBLOCK_OFFSET % sector_size;
     memcpy(out, buf + sb_off_in_buf, sizeof(ext4_superblock_t));
@@ -412,7 +415,7 @@ int ext4_mount(struct block_device *dev, fs_t *out) {
     if (r != FS_OK) return r;
 
     if (!(sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS)) {
-        EERR("volume without extent inodes (ext2/3 format too old) is not supported\n");
+        LOG_ERROR("volume without extent inodes (ext2/3 format too old) is not supported");
         return FS_ERR_NOSUPP;
     }
 
@@ -442,7 +445,7 @@ int ext4_mount(struct block_device *dev, fs_t *out) {
     strncpy(out->label, sb.s_volume_name, 16);
     out->label[16] = '\0';
 
-    ELOG("mounted (read-only) volume '%s', block=%u bytes, groups=%u\n",
+    LOG_DEBUG("mounted (read-only) volume '%s', block=%u bytes, groups=%u",
          sb.s_volume_name[0] ? sb.s_volume_name : "(no label)",
          (unsigned)fs->block_size, (unsigned)fs->num_groups);
 

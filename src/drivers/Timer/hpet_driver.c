@@ -2,6 +2,7 @@
 
 #include "components/ACPI/hpet_acpi.h"
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "kernel/limine.h"
 #include "pit_driver.h"
@@ -212,6 +213,10 @@ struct hpet_driver *return_hpet_driver() {
     if (initialized) return &hpet_driver_loaded;
 
     uint64_t acpi_addr = hpet_acpi_get_physical_address(acpi_get_hpet());
+    if (acpi_addr)
+        LOG_DEBUG("ACPI HPET table points to 0x%llx", (unsigned long long)acpi_addr);
+    else
+        LOG_DEBUG("no ACPI HPET table, probing well-known addresses");
 
     uint64_t addrs[5];
     int addr_count = 0;
@@ -234,18 +239,27 @@ struct hpet_driver *return_hpet_driver() {
         uint64_t caps = candidate->general_capabilities;
 
         uint16_t vendor = (uint16_t)((caps >> HPET_CAP_VENDOR_SHIFT) & HPET_CAP_VENDOR_MASK);
-        if (vendor == 0x0000 || vendor == 0xFFFF)
+        if (vendor == 0x0000 || vendor == 0xFFFF) {
+            LOG_DEBUG("no HPET at 0x%llx (vendor 0x%04x)", (unsigned long long)addrs[i], (unsigned)vendor);
             continue;
+        }
 
         uint32_t period_fs = (uint32_t)(caps >> HPET_CAP_PERIOD_SHIFT);
-        if (period_fs < HPET_PERIOD_FS_MIN || period_fs > HPET_PERIOD_FS_MAX)
+        if (period_fs < HPET_PERIOD_FS_MIN || period_fs > HPET_PERIOD_FS_MAX) {
+            LOG_DEBUG("HPET at 0x%llx has invalid period %u fs", (unsigned long long)addrs[i], period_fs);
             continue;
+        }
+
+        LOG_DEBUG("HPET found at 0x%llx, vendor 0x%04x", (unsigned long long)addrs[i], (unsigned)vendor);
 
         hpet_regs = candidate;
         break;
     }
 
-    if (!hpet_regs) return NULL;
+    if (!hpet_regs) {
+        LOG_WARNING("no usable HPET found");
+        return NULL;
+    }
 
     uint64_t caps = hpet_regs->general_capabilities;
     timer_count = (uint32_t)((caps >> HPET_CAP_TIMERS_SHIFT) & HPET_CAP_TIMERS_MASK) + 1;
@@ -261,6 +275,7 @@ struct hpet_driver *return_hpet_driver() {
     calibrate_hpet_with_pit(pit_local);
 
     if (hpet_ticks_per_ms == 0) {
+        LOG_ERROR("HPET calibration failed");
         hpet_regs = NULL;
         return NULL;
     }
@@ -271,12 +286,15 @@ struct hpet_driver *return_hpet_driver() {
 
     if (t1 <= t0) {
 
+        LOG_ERROR("HPET main counter is not running, disabling");
         hpet_regs->general_configuration &= ~HPET_CONF_ENABLE;
         hpet_regs = NULL;
         return NULL;
     }
 
     initialized = true;
+    LOG_INFO("HPET %llu Hz, %u comparators, %s counter",
+             (unsigned long long)hpet_frequency, timer_count, is_64bit_counter ? "64-bit" : "32-bit");
     return &hpet_driver_loaded;
 }
 

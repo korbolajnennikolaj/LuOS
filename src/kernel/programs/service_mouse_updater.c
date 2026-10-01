@@ -3,6 +3,7 @@
 #include "service_usb_hotplug.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Input/mouse_driver.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/scheduler/scheduler.h"
@@ -94,13 +95,19 @@ static void mouse_updater_entry(void *arg) {
     mouse_updater_load_limits();
 
     struct mouse_driver *mouse = get_self_driver(MOUSE_DRIVER, VIRTUAL_MOUSE);
+    if (!mouse) LOG_WARNING("virtual mouse not available yet");
 
     while (!service_stop_requested(svc->id)) {
         if (!mouse) mouse = get_self_driver(MOUSE_DRIVER, VIRTUAL_MOUSE);
 
         if (mouse) {
             if (mouse->mouse_handler) mouse->mouse_handler();
-            if (mouse->get_active_type) mouse_updater_type = mouse->get_active_type();
+            if (mouse->get_active_type) {
+                int type = mouse->get_active_type();
+                if (type != mouse_updater_type)
+                    LOG_INFO("active mouse: %s", type == USB_MOUSE ? "USB" : type == PS2_MOUSE ? "PS/2" : "none");
+                mouse_updater_type = type;
+            }
 
             if (mouse->get_state) {
                 mouse_updater_absorb(mouse->get_state());
@@ -119,7 +126,11 @@ static bool mouse_updater_update(void *arg) {
     (void)arg;
     if (mouse_updater_last_beat_ms == 0) return true;
     if (usb_hotplug_busy()) return true;
-    return (service_uptime_ms() - mouse_updater_last_beat_ms) < MOUSE_UPDATER_WATCHDOG_MS;
+    uint64_t silent = service_uptime_ms() - mouse_updater_last_beat_ms;
+    if (silent < MOUSE_UPDATER_WATCHDOG_MS) return true;
+    LOG_WARNING("mouse pump silent for %llu ms (watchdog %u ms)",
+                (unsigned long long)silent, MOUSE_UPDATER_WATCHDOG_MS);
+    return false;
 }
 
 int32_t mouse_updater_x(void) {

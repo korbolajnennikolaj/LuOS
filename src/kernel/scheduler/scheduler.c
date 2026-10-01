@@ -6,6 +6,7 @@
 #include "components/Interruptions/isr.h"
 #include "components/panic.h"
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 
 #include <string.h>
@@ -322,6 +323,7 @@ static void reap_zombies(void) {
     spin_unlock_irqrestore(&g_tasks_lock, f);
 
     for (int i = 0; i < nd; i++) {
+        LOG_DEBUG("reaped task '%s' tid %u", dead[i]->name, dead[i]->tid);
         if (dead[i]->kstack) kfree(dead[i]->kstack);
         kfree(dead[i]);
     }
@@ -355,10 +357,13 @@ void scheduler_init(void) {
     if (tsc && tsc->get_tsc_uptime_ms && tsc->get_tsc_uptime_ms() != 0) {
         g_clock_ms = tsc->get_tsc_uptime_ms;
         g_ticks = g_clock_ms();
+    } else {
+        LOG_WARNING("TSC unavailable, scheduler clock falls back to tick counting");
     }
 
     scheduler_register_core(apic_get_lapic_id(), 0);
     irq_register_handler(SCHEDULER_YIELD_VECTOR, scheduler_yield_isr);
+    LOG_DEBUG("scheduler initialized, BSP LAPIC %u, max %d tasks", (unsigned)apic_get_lapic_id(), MAX_TASKS);
 }
 
 void scheduler_start(void) {
@@ -385,6 +390,8 @@ void scheduler_start(void) {
     rq->current = main_task;
     rq->online = 1;
     spin_unlock_irqrestore(&rq->lock, f);
+
+    LOG_DEBUG("core %d run queue online, main tid %u, idle tid %u", core, main_task->tid, idle->tid);
 }
 
 struct task *task_create_ex(const char *name, void (*entry)(void *), void *arg,
@@ -393,7 +400,10 @@ struct task *task_create_ex(const char *name, void (*entry)(void *), void *arg,
 
     if (!stack_size) stack_size = TASK_STACK_SIZE;
     struct task *t = task_alloc(name, priority, stack_size);
-    if (!t) return NULL;
+    if (!t) {
+        LOG_ERROR("cannot allocate task '%s' with %u byte stack", name ? name : "task", stack_size);
+        return NULL;
+    }
     t->entry = entry;
     t->arg = arg;
 
@@ -407,6 +417,7 @@ struct task *task_create_ex(const char *name, void (*entry)(void *), void *arg,
     }
 
     if (register_task(t) != 0) {
+        LOG_ERROR("task table full (%d), '%s' not created", MAX_TASKS, t->name);
         kfree(t->kstack);
         kfree(t);
         return NULL;
@@ -420,6 +431,8 @@ struct task *task_create_ex(const char *name, void (*entry)(void *), void *arg,
         rq->need_resched = 1;
     spin_unlock_irqrestore(&rq->lock, flags);
 
+    LOG_DEBUG("task '%s' tid %u created on core %d, priority %d, stack %u",
+              t->name, t->tid, t->core, t->priority, t->stack_size);
     return t;
 }
 
@@ -446,6 +459,10 @@ void task_trampoline(void) {
 }
 
 void task_exit(void) {
+    struct task *self = current_task();
+    if (self && !self->is_idle)
+        LOG_DEBUG("task '%s' tid %u exiting on core %d", self->name, self->tid, current_core());
+
     asm volatile("cli");
     struct task *t = current_task();
     if (t) t->state = TASK_ZOMBIE;

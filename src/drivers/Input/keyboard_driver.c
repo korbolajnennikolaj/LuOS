@@ -1,6 +1,7 @@
 #include "drivers/Input/keyboard_driver.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "kernel/scheduler/scheduler.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
@@ -433,7 +434,11 @@ static void vkbd_input(const char *prompt, char *buffer, uint32_t max_len, uint3
 
 static int vkbd_register_backend(enum KEYBOARD_TYPE type, void *drv)
 {
-    if (!drv || vkbd.backend_count >= KEYBOARD_MAX_BACKENDS) return -1;
+    if (!drv || vkbd.backend_count >= KEYBOARD_MAX_BACKENDS) {
+        LOG_WARNING("cannot register %s keyboard backend (%s)",
+                    type == PS2_KEYBOARD ? "PS/2" : "USB", drv ? "table full" : "NULL driver");
+        return -1;
+    }
     struct keyboard_backend *b = &vkbd.backends[vkbd.backend_count];
     b->type = type;
     b->active = true;
@@ -441,6 +446,7 @@ static int vkbd_register_backend(enum KEYBOARD_TYPE type, void *drv)
         b->drv.ps2 = (struct ps2_keyboard_driver *)drv;
     else
         b->drv.usb = (struct usb_keyboard_driver *)drv;
+    LOG_DEBUG("backend %u: %s keyboard", (unsigned)vkbd.backend_count, type == PS2_KEYBOARD ? "PS/2" : "USB");
     return (int)vkbd.backend_count++;
 }
 
@@ -819,6 +825,10 @@ struct keyboard_driver *return_keyboard_driver(void) {
     struct usb_keyboard_driver *usb =
         (struct usb_keyboard_driver *)get_self_driver(KEYBOARD_DRIVER, USB_KEYBOARD);
     if (usb) vkbd.register_backend(USB_KEYBOARD, usb);
+    if (vkbd.backend_count == 0)
+        LOG_WARNING("no keyboard backends available");
+    else
+        LOG_INFO("virtual keyboard ready with %u backend(s)", (unsigned)vkbd.backend_count);
     return &vkbd;
 }
 

@@ -2,16 +2,23 @@
 
 #include "components/drivers.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "components/panic.h"
+#include "kernel/scheduler/scheduler.h"
 
 static irq_handler_t s_irq_handlers[256];
 
 void irq_register_handler(uint8_t vector, irq_handler_t handler) {
+    if (s_irq_handlers[vector] && s_irq_handlers[vector] != handler)
+        LOG_WARNING("vector 0x%02x handler replaced (%p -> %p)", (unsigned)vector,
+                    (void *)s_irq_handlers[vector], (void *)handler);
     s_irq_handlers[vector] = handler;
+    LOG_DEBUG("vector 0x%02x handler %p registered", (unsigned)vector, (void *)handler);
 }
 
 void irq_unregister_handler(uint8_t vector) {
     s_irq_handlers[vector] = (irq_handler_t)0;
+    LOG_DEBUG("vector 0x%02x handler unregistered", (unsigned)vector);
 }
 
 extern void apic_send_eoi(void);
@@ -121,6 +128,12 @@ static void isr_dispatch(struct registers *regs)
 
     if (s_irq_handlers[vec]) {
         s_irq_handlers[vec](regs);
+    } else {
+        static uint8_t unhandled_warned[256];
+        if (!unhandled_warned[vec]) {
+            unhandled_warned[vec] = 1;
+            LOG_WARNING("unhandled interrupt vector 0x%02x on core %d", (unsigned)vec, current_core());
+        }
     }
 
     if (vec == 0x41) return;

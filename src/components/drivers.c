@@ -5,10 +5,12 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "components/pci.h"
 #include "components/ACPI/madt.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Input/mouse_driver.h"
+#include "drivers/Serial/uart_driver.h"
 #include "drivers/Storage/ahci.h"
 #include "drivers/Storage/ata.h"
 #include "drivers/Storage/block_device.h"
@@ -27,13 +29,12 @@ struct driver* driver_table[AMOUNT_DRIVERS_TYPE][MAX_DRIVERS_PER_TYPE] = {0};
 spinlock_t driver_lock = SPINLOCK_INIT;
 
 void register_driver(struct driver* drv) {
-    struct limine_video_driver* video_main_driver = get_self_driver(LIMINE_VIDEO_DRIVER, 0);
     if (!drv){
-        if (video_main_driver != NULL) {
-            video_main_driver->printf("Failed to register driver: NULL pointer\n", LIMINE_COLOR_LIGHT_RED);
-        }
+        LOG_ERROR("Failed to register driver: NULL pointer");
         return;
     }
+
+    LOG_DEBUG("Registering driver %s (type %d, sub type %d)", drv->name, (int)drv->type, drv->sub_type);
 
     for (int i = 0; i < drv->dependency_count; i++){
         struct dependency* dep = drv->dependencies[i];
@@ -41,11 +42,9 @@ void register_driver(struct driver* drv) {
         int dep_met = driver_table[dep->type][dep->sub_type] != 0;
         spin_unlock(&driver_lock);
         if (!dep_met) {
-            if (video_main_driver != NULL) {
-                video_main_driver->printf("Failed to register driver ", LIMINE_COLOR_LIGHT_RED);
-                video_main_driver->printf(drv->name, LIMINE_COLOR_LIGHT_CYAN);
-                video_main_driver->printf(", dependency not met\n", LIMINE_COLOR_LIGHT_RED);
-            }
+            drv->status = DRIVER_STATUS_FAILED;
+            LOG_ERROR("Failed to register driver %s, dependency not met (type %d, sub type %d)",
+                      drv->name, (int)dep->type, dep->sub_type);
             return;
         }
     }
@@ -53,23 +52,16 @@ void register_driver(struct driver* drv) {
     spin_lock(&driver_lock);
     if (driver_table[drv->type][drv->sub_type]) {
         spin_unlock(&driver_lock);
-        if (video_main_driver != NULL) {
-            video_main_driver->printf("Failed to register driver ", LIMINE_COLOR_LIGHT_RED);
-            video_main_driver->printf(drv->name, LIMINE_COLOR_LIGHT_CYAN);
-            video_main_driver->printf(", slot already occupied\n", LIMINE_COLOR_LIGHT_RED);
-        }
+        LOG_ERROR("Failed to register driver %s, slot already occupied", drv->name);
         return;
     }
     driver_table[drv->type][drv->sub_type] = drv;
     spin_unlock(&driver_lock);
 
+    drv->status = DRIVER_STATUS_INITIALIZING;
     if (drv->init) drv->init();
     drv->status = DRIVER_STATUS_READY;
-    if (video_main_driver != NULL) {
-        video_main_driver->printf("Driver ", LIMINE_COLOR_GOLD);
-        video_main_driver->printf(drv->name, LIMINE_COLOR_LIGHT_CYAN);
-        video_main_driver->printf(" registered successfully\n", LIMINE_COLOR_GOLD);
-    }
+    LOG_INFO("Driver %s registered successfully", drv->name);
 
     return;
 }
@@ -88,6 +80,8 @@ struct driver* get_meta_driver(enum DRIVER_TYPE type, int sub_type) {
 
 void init_drivers() {
     asm volatile("cli");
+
+    register_driver(return_meta_uart_driver());
 
     init_ioapic();
     init_idt();
@@ -110,9 +104,24 @@ void init_drivers() {
 
     uint32_t kbd_gsi = madt_remap_isa_irq(1);
     if (kbd_gsi <= 23) ioapic_unmask_irq((uint8_t)kbd_gsi);
+    else LOG_WARNING("PS/2 keyboard IRQ1 remapped to GSI %u, outside IOAPIC range", kbd_gsi);
 
     uint32_t mouse_gsi = madt_remap_isa_irq(12);
     if (mouse_gsi <= 23) ioapic_unmask_irq((uint8_t)mouse_gsi);
+    else LOG_WARNING("PS/2 mouse IRQ12 remapped to GSI %u, outside IOAPIC range", mouse_gsi);
+
+    LOG_DEBUG("PS/2 IRQs routed: keyboard GSI %u, mouse GSI %u", kbd_gsi, mouse_gsi);
+
+    struct uart_driver *uart = (struct uart_driver *)get_self_driver(SERIAL_DRIVER, UART_COM1);
+    bool uart_ready = uart && uart->is_present();
+    uint32_t uart_gsi = madt_remap_isa_irq(UART_COM1_IRQ);
+    bool uart_irq = uart_ready && uart_gsi <= 23;
+    if (uart_irq) {
+        ioapic_unmask_irq((uint8_t)uart_gsi);
+        LOG_DEBUG("COM1 IRQ%u routed to GSI %u", UART_COM1_IRQ, uart_gsi);
+    } else if (uart_ready) {
+        LOG_WARNING("COM1 IRQ%u remapped to GSI %u, outside IOAPIC range", UART_COM1_IRQ, uart_gsi);
+    }
 
     msi_init();
 
@@ -134,11 +143,20 @@ void init_drivers() {
 
     {
         uint32_t disk_count = get_device_count();
+        LOG_INFO("Scanning %u block device(s) for partitions", disk_count);
         for (uint32_t i = 0; i < disk_count; i++) {
             struct block_device *dev = block_device_get(i);
             if (dev) partition_register_all(dev);
         }
     }
 
+    LOG_INFO("Driver initialization complete");
+
     asm volatile("sti");
+
+    if (uart_irq) {
+        if (!uart->enable_irq()) ioapic_mask_irq((uint8_t)uart_gsi);
+    } else if (uart_ready) {
+        uart->set_sync_mode();
+    }
 }

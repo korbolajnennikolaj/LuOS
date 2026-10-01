@@ -1,5 +1,6 @@
 #include "tsc_driver.h"
 
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 
 #include <stddef.h>
@@ -61,6 +62,12 @@ struct tsc_driver* return_tsc_driver(){
     uint64_t start_tsc = readTSC();
     pit->sleep_pit_ms(10);
     tsc_ticks_per_ms = (readTSC() - start_tsc) / 10;
+
+    if (tsc_ticks_per_ms == 0)
+        LOG_ERROR("TSC calibration failed, counter did not advance");
+    else
+        LOG_INFO("TSC calibrated against PIT: %llu ticks/ms (~%llu MHz)",
+                 (unsigned long long)tsc_ticks_per_ms, (unsigned long long)(tsc_ticks_per_ms / 1000));
 
     return &tsc_driver_loaded;
 };

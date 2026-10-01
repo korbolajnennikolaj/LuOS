@@ -1,17 +1,9 @@
 #include "fs/fat32.h"
 
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 
-#include <stdio.h>
 #include <string.h>
-
-#define FAT32_COL_INFO 0xFF55FFFF
-#define FAT32_COL_OK 0xFF55FF55
-#define FAT32_COL_ERR 0xFFFF5555
-#define FAT32_COL_DATA 0xFFFFFF55
-
-#define FLOG(fmt, ...) printf_color(FAT32_COL_INFO, "[FAT32] " fmt, ##__VA_ARGS__)
-#define FERR(fmt, ...) printf_color(FAT32_COL_ERR,  "[FAT32] ERR " fmt, ##__VA_ARGS__)
 
 #define FAT32_MAX_ENTRY_RUN 21
 
@@ -26,15 +18,19 @@ static inline uint64_t cluster_to_lba(fat32_fs_t *fs, uint32_t cluster) {
 
 static int read_cluster(fat32_fs_t *fs, uint32_t cluster, void *buf) {
     if (cluster < 2) return FS_ERR_PARAM;
-    if (fs->dev->read_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf) != 0)
+    if (fs->dev->read_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, buf) != 0) {
+        LOG_ERROR("%s: failed to read cluster %u", fs->dev->name, cluster);
         return FS_ERR_IO;
+    }
     return FS_OK;
 }
 
 static int write_cluster(fat32_fs_t *fs, uint32_t cluster, const void *buf) {
     if (cluster < 2) return FS_ERR_PARAM;
-    if (fs->dev->write_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, (void *)buf) != 0)
+    if (fs->dev->write_sectors(fs->dev, cluster_to_lba(fs, cluster), fs->sectors_per_cluster, (void *)buf) != 0) {
+        LOG_ERROR("%s: failed to write cluster %u", fs->dev->name, cluster);
         return FS_ERR_IO;
+    }
     return FS_OK;
 }
 
@@ -55,6 +51,7 @@ static uint32_t get_fat_entry(fat32_fs_t *fs, uint32_t cluster) {
     uint8_t *buf = kmalloc(fs->bytes_per_sector);
     if (!buf) return FAT32_CLUSTER_EOC;
     if (fs->dev->read_sectors(fs->dev, sector, 1, buf) != 0) {
+        LOG_ERROR("%s: failed to read FAT sector %u", fs->dev->name, sector);
         kfree(buf);
         return FAT32_CLUSTER_EOC;
     }
@@ -85,6 +82,7 @@ static int set_fat_entry(fat32_fs_t *fs, uint32_t cluster, uint32_t value) {
         if (fs->dev->write_sectors(fs->dev, sector, 1, buf) != 0) { ret = FS_ERR_IO; break; }
     }
     kfree(buf);
+    if (ret != FS_OK) LOG_ERROR("%s: failed to update FAT entry for cluster %u", fs->dev->name, cluster);
     return ret;
 }
 
@@ -102,6 +100,7 @@ static uint32_t alloc_cluster(fat32_fs_t *fs) {
         }
         cluster++;
     }
+    LOG_WARNING("%s: no free clusters left", fs->dev->name);
     return 0;
 }
 
@@ -1081,7 +1080,10 @@ const fs_ops_t fat32_ops = {
 };
 
 static int read_and_validate_bpb(struct block_device *dev, uint8_t *sector_buf, fat32_bpb_t **out_bpb) {
-    if (dev->read_sectors(dev, 0, 1, sector_buf) != 0) return FS_ERR_IO;
+    if (dev->read_sectors(dev, 0, 1, sector_buf) != 0) {
+        LOG_ERROR("%s: failed to read boot sector", dev->name);
+        return FS_ERR_IO;
+    }
 
     if (sector_buf[FAT32_BOOT_SIG_OFFSET] != FAT32_BOOT_SIG_0 ||
         sector_buf[FAT32_BOOT_SIG_OFFSET + 1] != FAT32_BOOT_SIG_1)
@@ -1156,7 +1158,7 @@ int fat32_mount(struct block_device *dev, fs_t *out) {
     strncpy(out->label, fs->label, sizeof(out->label) - 1);
     out->label[sizeof(out->label) - 1] = '\0';
 
-    FLOG("mounted volume '%s', cluster=%u bytes, clusters=%u\n",
+    LOG_DEBUG("mounted volume '%s', cluster=%u bytes, clusters=%u",
          fs->label[0] ? fs->label : "(no label)",
          (unsigned)fs->cluster_size, (unsigned)fs->total_clusters);
 

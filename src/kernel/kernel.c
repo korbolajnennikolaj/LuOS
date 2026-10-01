@@ -1,6 +1,7 @@
 #include "kernel.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "components/panic.h"
 #include "components/GDT/gdt.h"
 
@@ -9,6 +10,7 @@
 #include "kernel/smp/smp.h"
 
 #include "kernel/programs/programs.h"
+#include "kernel/kernel_info.h"
 
 #include "components/Memory/pmm.h"
 #include "components/Memory/vmm.h"
@@ -26,6 +28,11 @@ void _start(void){
     init_gdt();
 
     fpu_init();
+
+    logger_init();
+    LOG_INFO("LuOS kernel %s (built %s, %s)", KERNEL_VERSION, KERNEL_COMPILATION_DATE, KERNEL_COMPILER);
+    LOG_DEBUG("GDT loaded, FPU/SSE enabled");
+
     pmm_init();
     vmm_init();
 
@@ -41,15 +48,20 @@ void _start(void){
     }
 
     heap_init(heap_virt, heap_size);
+    LOG_INFO("Heap at 0x%llx, %llu KiB (%llu of %llu free pages)",
+             (unsigned long long)heap_virt, (unsigned long long)(heap_size / 1024),
+             (unsigned long long)heap_pages_count, (unsigned long long)free_pages);
 
     init_drivers();
 
     scheduler_init();
     smp_init();
     scheduler_start();
+    LOG_INFO("Scheduler started on %d core(s)", scheduler_core_count());
 
     stdio_register_video_stream();
 
+    LOG_INFO("Starting service manager");
     start_service_manager();
 
     scheduler_idle_loop();

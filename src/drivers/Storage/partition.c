@@ -1,13 +1,10 @@
 #include "drivers/Storage/partition.h"
 
+#include "components/logger.h"
 #include "components/Memory/heap.h"
 #include "kernel/scheduler/spinlock.h"
 
-#include <stdio.h>
 #include <string.h>
-
-#define PLOG(fmt, ...) printf_color(0xFF55FFFF, "[PART] " fmt, ##__VA_ARGS__)
-#define PERR(fmt, ...) printf_color(0xFFFF5555, "[PART] ERR " fmt, ##__VA_ARGS__)
 
 typedef struct __attribute__((packed)) {
     uint8_t status;
@@ -22,7 +19,10 @@ typedef struct __attribute__((packed)) {
 #define MBR_SIG_OFFSET 0x1FE
 
 static int read_sector(struct block_device *disk, uint64_t lba, void *buf) {
-    if (disk->read_sectors(disk, lba, 1, buf) != 0) return -1;
+    if (disk->read_sectors(disk, lba, 1, buf) != 0) {
+        LOG_WARNING("%s: failed to read LBA %llu", disk->name, (unsigned long long)lba);
+        return -1;
+    }
     return 0;
 }
 
@@ -35,7 +35,11 @@ static int read_bytes_at(struct block_device *disk, uint64_t byte_off, void *out
 
     uint8_t *buf = kmalloc((size_t)sectors_needed * ss);
     if (!buf) return -1;
-    if (disk->read_sectors(disk, lba, sectors_needed, buf) != 0) { kfree(buf); return -1; }
+    if (disk->read_sectors(disk, lba, sectors_needed, buf) != 0) {
+        LOG_WARNING("%s: failed to read %u sector(s) at LBA %llu", disk->name, sectors_needed, (unsigned long long)lba);
+        kfree(buf);
+        return -1;
+    }
     memcpy(out, buf + off, len);
     kfree(buf);
     return 0;
@@ -79,7 +83,13 @@ static int scan_gpt(struct block_device *disk, partition_info_t *out, int max, i
 
     uint32_t entry_size = hdr.size_of_partition_entry ? hdr.size_of_partition_entry : 128;
     uint32_t num_entries = hdr.num_partition_entries;
-    if (num_entries > 512) num_entries = 512;
+    if (num_entries > 512) {
+        LOG_WARNING("%s: GPT claims %u entries, limiting to 512", disk->name, num_entries);
+        num_entries = 512;
+    }
+
+    LOG_DEBUG("%s: GPT revision 0x%08x, %u entries x %u bytes at LBA %llu", disk->name,
+              hdr.revision, num_entries, entry_size, (unsigned long long)hdr.partition_entry_lba);
 
     int count = 0;
     static const uint8_t zero_guid[16] = {0};
@@ -94,7 +104,11 @@ static int scan_gpt(struct block_device *disk, partition_info_t *out, int max, i
         uint64_t starting_lba, ending_lba;
         read_bytes_at(disk, entry_off + 32, &starting_lba, 8);
         read_bytes_at(disk, entry_off + 40, &ending_lba, 8);
-        if (ending_lba < starting_lba) continue;
+        if (ending_lba < starting_lba) {
+            LOG_WARNING("%s: GPT entry %u has end LBA %llu before start %llu, skipping", disk->name, i,
+                        (unsigned long long)ending_lba, (unsigned long long)starting_lba);
+            continue;
+        }
 
         partition_info_t *p = &out[count];
         memset(p, 0, sizeof(*p));
@@ -118,6 +132,8 @@ static int scan_mbr(struct block_device *disk, partition_info_t *out, int max, i
     if (read_sector(disk, 0, buf) != 0) { kfree(buf); return -1; }
 
     if (buf[MBR_SIG_OFFSET] != 0x55 || buf[MBR_SIG_OFFSET + 1] != 0xAA) {
+        LOG_DEBUG("%s: no MBR signature (0x%02x%02x)", disk->name,
+                  (unsigned)buf[MBR_SIG_OFFSET + 1], (unsigned)buf[MBR_SIG_OFFSET]);
         kfree(buf);
         return -1;
     }
@@ -129,13 +145,18 @@ static int scan_mbr(struct block_device *disk, partition_info_t *out, int max, i
     for (int i = 0; i < 4; i++) {
         if (entries[i].type == PART_TYPE_GPT_PROTECTIVE) {
             if (scan_gpt(disk, out, max, out_count) == 0) return 0;
+            LOG_WARNING("%s: protective MBR found but GPT header is invalid", disk->name);
             break;
         }
     }
 
     bool any_nonempty = false;
     for (int i = 0; i < 4; i++) {
-        if (!mbr_entry_plausible(&entries[i], disk->sector_count)) return -1;
+        if (!mbr_entry_plausible(&entries[i], disk->sector_count)) {
+            LOG_DEBUG("%s: MBR entry %d implausible (type 0x%02x, start %u, %u sectors), not a partition table",
+                      disk->name, i, (unsigned)entries[i].type, entries[i].lba_start, entries[i].num_sectors);
+            return -1;
+        }
         if (entries[i].type != 0) any_nonempty = true;
     }
     if (!any_nonempty) return -1;
@@ -178,6 +199,8 @@ static int scan_mbr(struct block_device *disk, partition_info_t *out, int max, i
                     next_ebr = 0;
                 }
             }
+            if (guard >= 128)
+                LOG_WARNING("%s: extended partition chain too long, stopped after 128 EBRs", disk->name);
             continue;
         }
 
@@ -292,7 +315,7 @@ int partition_register_all(struct block_device *disk) {
 
     for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
         if (g_partition_storage[i].parent == disk) {
-            PLOG("partitions for '%s' already registered\n", disk->name);
+            LOG_DEBUG("partitions for '%s' already registered", disk->name);
             spin_unlock(&partition_lock);
             return 0;
         }
@@ -301,7 +324,7 @@ int partition_register_all(struct block_device *disk) {
     partition_info_t infos[PART_MAX_PER_DISK];
     int n = 0;
     if (partition_scan(disk, infos, PART_MAX_PER_DISK, &n) != 0 || n == 0) {
-        PLOG("no partition table found on '%s' — use the disk directly\n", disk->name);
+        LOG_DEBUG("no partition table found on '%s', use the disk directly", disk->name);
         spin_unlock(&partition_lock);
         return 0;
     }
@@ -309,7 +332,10 @@ int partition_register_all(struct block_device *disk) {
     int registered = 0;
     for (int i = 0; i < n; i++) {
         int slot = partition_find_free_slot();
-        if (slot < 0) break;
+        if (slot < 0) {
+            LOG_WARNING("partition table full, %d partition(s) of '%s' not registered", n - i, disk->name);
+            break;
+        }
 
         partition_device_t *pd = &g_partition_storage[slot];
         struct block_device *bd = &g_partition_blkdevs[slot];
@@ -331,10 +357,11 @@ int partition_register_all(struct block_device *disk) {
         g_partition_count++;
         registered++;
 
-        PLOG("partition '%s': LBA %llu..%llu (%s)\n", bd->name,
-             (unsigned long long)infos[i].start_lba,
-             (unsigned long long)(infos[i].start_lba + infos[i].sector_count - 1),
-             infos[i].is_gpt ? "GPT" : "MBR");
+        LOG_INFO("partition '%s': LBA %llu..%llu (%llu MB, %s type 0x%02x)", bd->name,
+                 (unsigned long long)infos[i].start_lba,
+                 (unsigned long long)(infos[i].start_lba + infos[i].sector_count - 1),
+                 (unsigned long long)((infos[i].sector_count * (disk->sector_size ? disk->sector_size : 512)) >> 20),
+                 infos[i].is_gpt ? "GPT" : "MBR", (unsigned)infos[i].mbr_type);
     }
 
     spin_unlock(&partition_lock);

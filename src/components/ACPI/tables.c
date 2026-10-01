@@ -1,6 +1,7 @@
 #include "tables.h"
 
 #include "checksum.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 #include "rsdp.h"
 #include "xsdt.h"
@@ -27,10 +28,12 @@ static ACPI_RSDT *acpi_load_rsdt(ACPI_RSDP *rsdp) {
     ACPI_RSDT *rsdt = (ACPI_RSDT *)mm_phys_to_virt(rsdp->RsdtAddress);
 
     if (!acpi_signature_matches(rsdt->Header.Signature, ACPI_RSDT_SIGNATURE)) {
+        LOG_WARNING("RSDT at 0x%x has bad signature", rsdp->RsdtAddress);
         return NULL;
     }
 
     if (!acpi_checksum(rsdt, rsdt->Header.Length)) {
+        LOG_WARNING("RSDT at 0x%x has bad checksum", rsdp->RsdtAddress);
         return NULL;
     }
 
@@ -39,9 +42,13 @@ static ACPI_RSDT *acpi_load_rsdt(ACPI_RSDP *rsdp) {
 
 static void acpi_cache_add(ACPI_SDT_HEADER *hdr) {
     if (!hdr) return;
-    if (s_cached_count >= ACPI_MAX_CACHED_TABLES) return;
+    if (s_cached_count >= ACPI_MAX_CACHED_TABLES) {
+        LOG_WARNING("table cache full (%d), %.4s ignored", ACPI_MAX_CACHED_TABLES, hdr->Signature);
+        return;
+    }
 
     if (!acpi_checksum(hdr, hdr->Length)) {
+        LOG_WARNING("table %.4s has bad checksum, ignored", hdr->Signature);
         return;
     }
 

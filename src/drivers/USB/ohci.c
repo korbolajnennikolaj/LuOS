@@ -4,6 +4,7 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 #include "components/pci.h"
 #include "drivers/Timer/apic_driver.h"
@@ -12,7 +13,6 @@
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
-#include "drivers/USB/usb_log.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/limine.h"
 
@@ -404,11 +404,8 @@ static int ohci_service_bulk(int ri) {
     }
 
     if (!ok) {
-        usb_logrow_begin(USB_LOG_OHCI, USB_LOG_ERROR);
-        usb_logrow_str("bulk xfer addr="); usb_logrow_dec(pend->device ? pend->device->address : 0);
-        usb_logrow_str(" ep="); usb_logrow_hex32(pend->endpoint);
-        usb_logrow_str(" cc="); usb_logrow_dec(cc);
-        usb_logrow_end();
+        LOG_ERROR("bulk xfer addr=%u ep=0x%02x cc=%u",
+                  (unsigned)(pend->device ? pend->device->address : 0), (unsigned)pend->endpoint, (unsigned)cc);
     }
 
     usb_event_t evt = {
@@ -451,10 +448,7 @@ void ohci_irq(void) {
         ohci_write(o, REG_INT_STATUS, s);
 
         if (s & OHCI_INT_UE) {
-            usb_logrow_begin(USB_LOG_OHCI, USB_LOG_ERROR);
-            usb_logrow_str("controller "); usb_logrow_dec(i);
-            usb_logrow_str(" unrecoverable error, restarting");
-            usb_logrow_end();
+            LOG_ERROR("controller %d unrecoverable error, restarting", i);
             ohci_hc_go_operational(o);
             continue;
         }
@@ -585,12 +579,8 @@ static int ohci_control_transfer_impl(struct ohci_controller *o, uint8_t addr, u
         ohci_flush_range(data, got ? got : data_len);
 
     if (rc != 0) {
-        usb_logrow_begin(USB_LOG_OHCI, USB_LOG_ERROR);
-        usb_logrow_str("control xfer addr="); usb_logrow_dec(addr);
-        usb_logrow_str(" ep="); usb_logrow_dec(ep);
-        usb_logrow_str(cc ? ": completion code=" : ": timed out, code=");
-        usb_logrow_hex32(cc);
-        usb_logrow_end();
+        LOG_ERROR("control xfer addr=%u ep=%u: %s 0x%x",
+                  (unsigned)addr, (unsigned)ep, cc ? "completion code" : "timed out, code", (unsigned)cc);
     }
 
     return rc;
@@ -1050,11 +1040,16 @@ static void ohci_take_ownership(struct ohci_controller *o) {
     if (ctrl & OHCI_CTRL_IR) {
         ohci_write(o, REG_INT_ENABLE, OHCI_INT_OC);
         ohci_write(o, REG_COMMAND_STATUS, OHCI_CS_OCR);
-        for (int i = 0; i < 500; i++) {
+        int waited = 0;
+        for (; waited < 500; waited++) {
             if (!(ohci_read(o, REG_CONTROL) & OHCI_CTRL_IR)) break;
             delay_ms(1);
         }
         ohci_write(o, REG_INT_DISABLE, OHCI_INT_OC);
+        if (waited >= 500)
+            LOG_WARNING("SMM did not release controller at 0x%llx, continuing", (unsigned long long)o->base_addr);
+        else
+            LOG_DEBUG("took ownership from SMM after %d ms", waited);
         return;
     }
 
@@ -1075,10 +1070,12 @@ static void ohci_hc_reset(struct ohci_controller *o) {
     ohci_write(o, REG_INT_DISABLE, 0xFFFFFFFFu);
     ohci_write(o, REG_COMMAND_STATUS, OHCI_CS_HCR);
 
-    for (int i = 0; i < 30; i++) {
+    int i = 0;
+    for (; i < 30; i++) {
         if (!(ohci_read(o, REG_COMMAND_STATUS) & OHCI_CS_HCR)) break;
         delay_ms(1);
     }
+    if (i >= 30) LOG_WARNING("host controller reset did not complete, base 0x%llx", (unsigned long long)o->base_addr);
 
     ohci_write(o, REG_FM_INTERVAL, saved_fm);
 }
@@ -1125,7 +1122,14 @@ static void ohci_scan_pci(void) {
         uint32_t cmd = pci_read_config(pdev->bus, pdev->slot, pdev->func, 0x04);
         pci_write_config(pdev->bus, pdev->slot, pdev->func, 0x04, cmd | 0x06);
 
-        if (ohci_read(o, OHCI_HcRevision) == 0xFFFFFFFFu) continue;
+        LOG_INFO("found OHCI controller at %02x:%02x.%x, base 0x%llx",
+                 (unsigned)pdev->bus, (unsigned)pdev->slot, (unsigned)pdev->func,
+                 (unsigned long long)o->base_addr);
+
+        if (ohci_read(o, OHCI_HcRevision) == 0xFFFFFFFFu) {
+            LOG_ERROR("controller at 0x%llx does not respond (HcRevision reads 0xFFFFFFFF)", (unsigned long long)o->base_addr);
+            continue;
+        }
 
         ohci_take_ownership(o);
         ohci_hc_reset(o);
@@ -1138,20 +1142,18 @@ static void ohci_scan_pci(void) {
         uint8_t irq_vec = (uint8_t)(MSI_VECTOR_OHCI_BASE + vec_slot);
 
         uint8_t irq_line = pdev->irq_line;
-        if (irq_line != 0 && irq_line != 0xFF)
+        if (irq_line != 0 && irq_line != 0xFF) {
             ioapic_map_pci_irq(irq_line, irq_vec, lapic);
-        else
+        } else {
+            LOG_WARNING("controller %d has no PCI IRQ line, assuming IRQ 11", ri);
             ioapic_map_pci_irq(11, irq_vec, lapic);
+        }
 
         irq_register_handler(irq_vec, ohci_irq_handler);
 
         o->initialized = 1;
-        usb_logrow_begin(USB_LOG_OHCI, USB_LOG_INFO);
-        usb_logrow_str("controller "); usb_logrow_dec(ri);
-        usb_logrow_str(" ready, base=");
-        usb_logrow_hex64(o->base_addr);
-        usb_logrow_str(" ports="); usb_logrow_dec(o->num_ports);
-        usb_logrow_end();
+        LOG_INFO("controller %d ready, base 0x%llx, %u ports, IRQ vector 0x%02x",
+                 ri, (unsigned long long)o->base_addr, (unsigned)o->num_ports, (unsigned)irq_vec);
         ohci_controller_count++;
     }
 }
@@ -1307,10 +1309,14 @@ struct ohci_driver *return_ohci_driver(void) {
     pci_init();
 
     struct tsc_driver *tsc = (struct tsc_driver *)get_self_driver(TIMER_DRIVER, TSC_TIMER);
-    if (!tsc || !tsc->sleep_tsc_ms) return &ohci_driver_loaded;
+    if (!tsc || !tsc->sleep_tsc_ms) {
+        LOG_ERROR("TSC timer unavailable, OHCI disabled");
+        return &ohci_driver_loaded;
+    }
 
     delay_ms = tsc->sleep_tsc_ms;
     ohci_scan_pci();
+    LOG_INFO("%d OHCI controller(s) ready", ohci_controller_count);
 
     return &ohci_driver_loaded;
 }

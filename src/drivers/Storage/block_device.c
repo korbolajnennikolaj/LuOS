@@ -1,6 +1,7 @@
 #include "block_device.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 
 #include <string.h>
 
@@ -25,10 +26,13 @@ void block_device_register(block_device *dev) {
     }
     if (count >= MAX_BLOCK_DEVICES || count >= MAX_DEVICES_PER_TYPE) {
         spin_unlock(&driver_lock);
+        LOG_ERROR("block device table full, '%s' not registered", dev->name);
         return;
     }
     device_table[STORAGE_DEVICE][count] = dev;
     spin_unlock(&driver_lock);
+    LOG_DEBUG("block device '%s' registered as #%u (%llu sectors x %u bytes)", dev->name, count,
+              (unsigned long long)dev->sector_count, (unsigned)dev->sector_size);
 }
 
 void block_device_unregister(block_device *dev) {
@@ -36,10 +40,12 @@ void block_device_unregister(block_device *dev) {
 
     uint32_t limit = MAX_BLOCK_DEVICES < MAX_DEVICES_PER_TYPE
                      ? MAX_BLOCK_DEVICES : MAX_DEVICES_PER_TYPE;
+    bool found = false;
 
     spin_lock(&driver_lock);
     for (uint32_t i = 0; i < limit; i++) {
         if (device_table[STORAGE_DEVICE][i] != dev) continue;
+        found = true;
 
         uint32_t j = i;
         while (j + 1 < limit && device_table[STORAGE_DEVICE][j + 1]) {
@@ -50,6 +56,9 @@ void block_device_unregister(block_device *dev) {
         break;
     }
     spin_unlock(&driver_lock);
+
+    if (found) LOG_DEBUG("block device '%s' unregistered", dev->name);
+    else LOG_WARNING("block device '%s' was not registered", dev->name);
 }
 
 block_device* block_device_get(uint32_t index) {

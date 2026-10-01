@@ -4,6 +4,7 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 #include "components/pci.h"
 #include "drivers/Timer/apic_driver.h"
@@ -12,7 +13,6 @@
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
-#include "drivers/USB/usb_log.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/limine.h"
 #include "kernel/scheduler/scheduler.h"
@@ -23,44 +23,9 @@
 
 #define UHCI_DBG 0
 #if UHCI_DBG
-#define DBG_COM1 0x3F8
-static int dbg_inited = 0;
-static void dbg_init(void) {
-    if (dbg_inited) return;
-    dbg_inited = 1;
-    outb(DBG_COM1 + 1, 0x00);
-    outb(DBG_COM1 + 3, 0x80);
-    outb(DBG_COM1 + 0, 0x03);
-    outb(DBG_COM1 + 1, 0x00);
-    outb(DBG_COM1 + 3, 0x03);
-    outb(DBG_COM1 + 2, 0xC7);
-    outb(DBG_COM1 + 4, 0x0B);
-}
-static void dbg_putc(char c) {
-    dbg_init();
-    for (int spin = 0; spin < 100000 && !(inb(DBG_COM1 + 5) & 0x20); spin++) {}
-    outb(DBG_COM1, (uint8_t)c);
-}
-static void dbg_str(const char *s) { while (*s) dbg_putc(*s++); }
-static void dbg_hex32(uint32_t v) {
-    dbg_str("0x");
-    for (int i = 7; i >= 0; i--) {
-        uint8_t nib = (v >> (i * 4)) & 0xF;
-        dbg_putc(nib < 10 ? ('0' + nib) : ('a' + nib - 10));
-    }
-}
-static void dbg_dec(int v) {
-    char buf[12]; int n = 0; int neg = v < 0;
-    unsigned int uv = neg ? (unsigned int)(-v) : (unsigned int)v;
-    if (uv == 0) { dbg_putc('0'); return; }
-    while (uv) { buf[n++] = '0' + (uv % 10); uv /= 10; }
-    if (neg) dbg_putc('-');
-    while (n) dbg_putc(buf[--n]);
-}
+#define UHCI_TRACE(...) LOG_DEBUG(__VA_ARGS__)
 #else
-static void dbg_str(const char *s) { (void)s; }
-static void dbg_hex32(uint32_t v) { (void)v; }
-static void dbg_dec(int v) { (void)v; }
+#define UHCI_TRACE(...) do { } while (0)
 #endif
 
 #define TD_PID_SETUP 0x2D
@@ -411,12 +376,8 @@ static int uhci_qh_find_or_alloc(int res_idx, uint8_t dev_addr, uint8_t ep_num,
         uhci_resources[res_idx].qh_pool[i].element = LP_TERMINATE;
         asm volatile("mfence" ::: "memory");
 
-        dbg_str("[uhci] find_or_alloc NEW slot qi="); dbg_dec(i);
-        dbg_str(" dev="); dbg_dec(dev_addr);
-        dbg_str(" ep="); dbg_dec(ep_num);
-        dbg_str(" dir="); dbg_dec(direction);
-        dbg_str(" kind="); dbg_dec(xfer_kind);
-        dbg_str("\r\n");
+        UHCI_TRACE("new QH slot qi=%d dev=%u ep=%u dir=%u kind=%u",
+                   i, (unsigned)dev_addr, (unsigned)ep_num, (unsigned)direction, (unsigned)xfer_kind);
 
         if (!meta[i].linked) {
             uhci_qh_link_into_async(res_idx, &uhci_resources[res_idx].qh_pool[i]);
@@ -567,11 +528,8 @@ static void uhci_qh_rearm_periodic(int res_idx, int qi) {
     m->stalled = 0;
     m->active = 1;
     uhci_qh_arm_interrupt(res_idx, qi);
-    dbg_str("[uhci] rearm_periodic res="); dbg_dec(res_idx);
-    dbg_str(" qi="); dbg_dec(qi);
-    dbg_str(" toggle="); dbg_dec(m->data_toggle);
-    dbg_str(" active="); dbg_dec(m->active);
-    dbg_str("\r\n");
+    UHCI_TRACE("rearm periodic res=%d qi=%d toggle=%u active=%u",
+               res_idx, qi, (unsigned)m->data_toggle, (unsigned)m->active);
 }
 
 static void uhci_qh_service(int res_idx, int qi) {
@@ -584,21 +542,16 @@ static void uhci_qh_service(int res_idx, int qi) {
 
     m->xfer_ok_len += added;
 
-    dbg_str("[uhci] service res="); dbg_dec(res_idx);
-    dbg_str(" qi="); dbg_dec(qi);
-    dbg_str(" r="); dbg_dec(r);
-    dbg_str(" added="); dbg_dec(added);
-    dbg_str(" remaining="); dbg_dec(m->remaining);
-    dbg_str(" stalled="); dbg_dec(m->stalled);
-    dbg_str(" xfer_kind="); dbg_dec(m->xfer_kind);
-    dbg_str("\r\n");
+    UHCI_TRACE("service res=%d qi=%d r=%d added=%u remaining=%u stalled=%u kind=%u",
+               res_idx, qi, r, (unsigned)added, (unsigned)m->remaining,
+               (unsigned)m->stalled, (unsigned)m->xfer_kind);
 
     if (r < 0) {
         uhci_qh_report(res_idx, qi, 0);
         if (m->xfer_kind == UHCI_XFER_INTERRUPT && !m->stalled)
             uhci_qh_rearm_periodic(res_idx, qi);
         else
-            dbg_str("[uhci] NOT rearmed after error (stalled or not interrupt)\r\n");
+            UHCI_TRACE("res=%d qi=%d not rearmed after error (stalled or not interrupt)", res_idx, qi);
         return;
     }
 
@@ -612,7 +565,7 @@ static void uhci_qh_service(int res_idx, int qi) {
     if (m->xfer_kind == UHCI_XFER_INTERRUPT)
         uhci_qh_rearm_periodic(res_idx, qi);
     else
-        dbg_str("[uhci] NOT rearmed after success (not interrupt xfer_kind)\r\n");
+        UHCI_TRACE("res=%d qi=%d not rearmed after success (not interrupt)", res_idx, qi);
 }
 
 static int uhci_queued_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
@@ -746,16 +699,10 @@ static int uhci_ctrl_run(int res_idx, struct uhci_td *ring, uint8_t nt, int *sto
 static void uhci_ctrl_log_error(uint8_t dev_addr, uint8_t ep_num, int run,
                                 const struct uhci_td *td)
 {
-    usb_logrow_begin(USB_LOG_UHCI, USB_LOG_ERROR);
-    usb_logrow_str("control xfer addr="); usb_logrow_dec(dev_addr);
-    usb_logrow_str(" ep="); usb_logrow_dec(ep_num);
-    usb_logrow_str(run == UHCI_RUN_TIMEOUT ? ": timed out, status=" : ": TD error, status=");
-    usb_logrow_hex32(td ? td->control_status : 0);
-    if (td) {
-        usb_logrow_str(" token=");
-        usb_logrow_hex32(td->token);
-    }
-    usb_logrow_end();
+    LOG_ERROR("control xfer addr=%u ep=%u: %s, status=0x%08x token=0x%08x",
+              (unsigned)dev_addr, (unsigned)ep_num,
+              run == UHCI_RUN_TIMEOUT ? "timed out" : "TD error",
+              td ? td->control_status : 0, td ? td->token : 0);
 }
 
 static int uhci_control_transfer_impl(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
@@ -1084,34 +1031,25 @@ void uhci_irq(void) {
         uhci_writew(u, UHCI_STS, status);
 
         if (status & (UHCI_STS_HSE | UHCI_STS_HCPE)) {
-            usb_logrow_begin(USB_LOG_UHCI, USB_LOG_ERROR);
-            usb_logrow_str("controller "); usb_logrow_dec(i);
-            usb_logrow_str(" fatal, status=");
-            usb_logrow_hex32(status);
-            usb_logrow_end();
+            LOG_ERROR("controller %d fatal error, status=0x%04x, restarting", i, (unsigned)status);
             uhci_hc_start(u);
             continue;
         }
 
         if (status & UHCI_STS_HCH) {
-            usb_logrow_begin(USB_LOG_UHCI, USB_LOG_WARN);
-            usb_logrow_str("controller "); usb_logrow_dec(i);
-            usb_logrow_str(" halted, restarting");
-            usb_logrow_end();
+            LOG_WARNING("controller %d halted, restarting", i);
             uhci_hc_start(u);
         }
 
         if (!(status & (UHCI_STS_USBINT | UHCI_STS_USBERR))) continue;
 
-        dbg_str("[uhci] IRQ fired ctrl="); dbg_dec(i);
-        dbg_str(" status="); dbg_hex32(status);
-        dbg_str("\r\n");
+        UHCI_TRACE("IRQ ctrl=%d status=0x%04x", i, (unsigned)status);
 
         uint64_t qfl = uhci_qh_lock_acquire(i);
         for (int qi = 0; qi < UHCI_QH_SLOTS; qi++) {
             if (!uhci_resources[i].qh_meta[qi].in_use) continue;
             if (!uhci_resources[i].qh_meta[qi].active) continue;
-            dbg_str("[uhci] IRQ servicing qi="); dbg_dec(qi); dbg_str("\r\n");
+            UHCI_TRACE("IRQ servicing qi=%d", qi);
             uhci_qh_service(i, qi);
         }
         uhci_poll_iso_locked(u, i);
@@ -1189,12 +1127,7 @@ static int uhci_init_controller(struct uhci_controller *uhci, int res_index, str
     uhci_hc_start(uhci);
 
     uhci->initialized = 1;
-    usb_logrow_begin(USB_LOG_UHCI, USB_LOG_INFO);
-    usb_logrow_str("controller "); usb_logrow_dec(res_index);
-    usb_logrow_str(" ready, io_base=0x");
-    usb_logrow_hex32(uhci->io_base);
-    usb_logrow_str(" ports="); usb_logrow_dec(uhci->num_ports);
-    usb_logrow_end();
+    LOG_INFO("controller %d ready, io base 0x%x, %u ports", res_index, (unsigned)uhci->io_base, (unsigned)uhci->num_ports);
     return 0;
 }
 
@@ -1245,7 +1178,13 @@ static void uhci_scan_pci(void) {
         struct pci_device *pdev = ctrls[i].pci;
         pci_enable_bus_mastering(pdev);
 
-        if (uhci_init_controller(u, uhci_controller_count, pdev) != 0) continue;
+        LOG_INFO("found UHCI controller at %02x:%02x.%x, io base 0x%x",
+                 (unsigned)pdev->bus, (unsigned)pdev->slot, (unsigned)pdev->func, (unsigned)u->io_base);
+
+        if (uhci_init_controller(u, uhci_controller_count, pdev) != 0) {
+            LOG_ERROR("controller at io 0x%x failed to initialize", (unsigned)u->io_base);
+            continue;
+        }
 
         uint8_t lapic = apic_get_lapic_id();
         int vec_slot = (uhci_controller_count < UHCI_MAX_IRQ_VECTORS)
@@ -1253,12 +1192,16 @@ static void uhci_scan_pci(void) {
         uint8_t irq_vec = (uint8_t)(MSI_VECTOR_UHCI_BASE + vec_slot);
 
         uint8_t irq_line = pdev->irq_line;
-        if (irq_line != 0 && irq_line != 0xFF)
+        if (irq_line != 0 && irq_line != 0xFF) {
             ioapic_map_pci_irq(irq_line, irq_vec, lapic);
-        else
+        } else {
+            LOG_WARNING("controller %d has no PCI IRQ line, assuming IRQ 11", uhci_controller_count);
             ioapic_map_pci_irq(11, irq_vec, lapic);
+        }
 
         irq_register_handler(irq_vec, uhci_irq_handler);
+        LOG_DEBUG("controller %d: IRQ line %u on vector 0x%02x", uhci_controller_count,
+                  (unsigned)irq_line, (unsigned)irq_vec);
 
         uhci_controller_count++;
     }
@@ -1381,13 +1324,17 @@ struct uhci_driver *return_uhci_driver(void) {
     pci_init();
 
     struct tsc_driver *tsc = (struct tsc_driver *)get_self_driver(TIMER_DRIVER, TSC_TIMER);
-    if (!tsc || !tsc->sleep_tsc_ms) return &uhci_driver_loaded;
+    if (!tsc || !tsc->sleep_tsc_ms) {
+        LOG_ERROR("TSC timer unavailable, UHCI disabled");
+        return &uhci_driver_loaded;
+    }
 
     delay_ms = tsc->sleep_tsc_ms;
     uhci_now_us_fn = tsc->get_tsc_uptime_us;
     for (int i = 0; i < MAX_UHCI_CONTROLLERS; i++) spin_lock_init(&uhci_qh_lock[i]);
 
     uhci_scan_pci();
+    LOG_INFO("%d UHCI controller(s) ready", uhci_controller_count);
     return &uhci_driver_loaded;
 }
 

@@ -2,6 +2,7 @@
 
 #include "components/drivers.h"
 #include "components/Interruptions/isr.h"
+#include "components/logger.h"
 #include "kernel/scheduler/spinlock.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
@@ -109,11 +110,17 @@ static void keyboard_set_leds(bool caps, bool num, bool scroll) {
     ps2_bus_release(flags);
 }
 
+static uint32_t key_buffer_overflows = 0;
+
 static bool key_buffer_push(uint8_t key) {
     uint16_t head = buffer_head;
     uint16_t tail = __atomic_load_n(&buffer_tail, __ATOMIC_ACQUIRE);
     uint16_t next = (head + 1) % PS2_KEYBOARD_BUFFER_SIZE;
-    if (next == tail) return false;
+    if (next == tail) {
+        if ((key_buffer_overflows++ % 64) == 0)
+            LOG_WARNING("key buffer full, dropped %u key(s) so far", key_buffer_overflows);
+        return false;
+    }
     key_buffer[head] = key;
     __atomic_store_n(&buffer_head, next, __ATOMIC_RELEASE);
     return true;
@@ -323,13 +330,18 @@ static void keyboard_init(void) {
 
     for (int i = 0; i < 128; i++) { key_held[i] = false; ext_held[i] = false; }
 
-    while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL)
+    int drained = 0;
+    while ((inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) && drained < 64) {
         inb(PS2_DATA_PORT);
+        drained++;
+    }
+    if (drained) LOG_DEBUG("drained %d stale byte(s) from the PS/2 output buffer", drained);
 
     outb(PS2_COMMAND_PORT, 0xAD);
     outb(PS2_COMMAND_PORT, 0x20);
     wait_able_read();
     uint8_t config = inb(PS2_DATA_PORT);
+    uint8_t old_config = config;
     config |= (uint8_t)(1 << 0);
     config |= (uint8_t)(1 << 6);
     config &= ~(uint8_t)(1 << 4);
@@ -341,9 +353,16 @@ static void keyboard_init(void) {
     outb(PS2_DATA_PORT, 0xF4);
 
     wait_able_read();
-    inb(PS2_DATA_PORT);
+    uint8_t ack = inb(PS2_DATA_PORT);
 
     irq_register_handler(33, ps2_keyboard_irq_wrapper);
+
+    if (old_config == 0xFF)
+        LOG_WARNING("PS/2 controller config byte reads 0xFF, controller may be absent or emulated");
+    if (ack != PS2_ACK)
+        LOG_WARNING("keyboard did not ACK enable scanning (got 0x%02x)", (unsigned)ack);
+    LOG_INFO("PS/2 keyboard ready, controller config 0x%02x -> 0x%02x, IRQ1 on vector 33",
+             (unsigned)old_config, (unsigned)config);
 }
 
 static struct ps2_keyboard_driver drv = {

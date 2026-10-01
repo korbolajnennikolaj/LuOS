@@ -1,6 +1,7 @@
 #include "xhci_hub.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "kernel/limine.h"
@@ -56,8 +57,8 @@ uint32_t xhci_hub_exec(struct xhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
             if (!c->op_base) return 0;
             uint32_t reg_off = 0x400 + (port - 1) * 0x10;
             uint32_t ps = x_read(c->op_base, reg_off);
-            xhci_debug_port("PORTSC before reset", port, ps);
-            if (!(ps & 1u)) { xhci_debug_port("no CCS, aborting reset", port, ps); return 0; }
+            LOG_DEBUG("port %u PORTSC before reset 0x%08x", (unsigned)port, ps);
+            if (!(ps & 1u)) { LOG_WARNING("port %u: no CCS, aborting reset (PORTSC=0x%08x)", (unsigned)port, ps); return 0; }
 
             volatile uint32_t *preg = (volatile uint32_t *)(
                 (c->op_base + (hhdm_req.response ? hhdm_req.response->offset : 0))
@@ -80,7 +81,7 @@ uint32_t xhci_hub_exec(struct xhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
             xhci_real_delay_ms(20);
 
             ps = x_read(c->op_base, reg_off);
-            xhci_debug_port("PORTSC after Hot Reset", port, ps);
+            LOG_DEBUG("port %u PORTSC after Hot Reset 0x%08x", (unsigned)port, ps);
 
             if (ps & XHCI_PORTSC_CHANGE_MASK) {
                 *preg = xhci_portsc_neutral(ps) | (ps & XHCI_PORTSC_CHANGE_MASK);
@@ -89,7 +90,7 @@ uint32_t xhci_hub_exec(struct xhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
 
             if ((ps & 1u) && !(ps & (1u << 1))) {
                 uint32_t speed = (ps >> 10) & 0xFu;
-                xhci_debug_port("connected but not Enabled after Hot Reset, speed id", port, speed);
+                LOG_WARNING("port %u connected but not Enabled after Hot Reset, speed id %u", (unsigned)port, speed);
                 if (speed >= 4u) {
                     for (int attempt = 0;
                          attempt < 3 && (ps & XHCI_PORTSC_CCS) && !(ps & XHCI_PORTSC_PED);
@@ -107,15 +108,17 @@ uint32_t xhci_hub_exec(struct xhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
                             *preg = xhci_portsc_neutral(ps) | (ps & XHCI_PORTSC_CHANGE_MASK);
                             ps = x_read(c->op_base, reg_off);
                         }
-                        xhci_debug_port("Warm Reset attempt #", port, (uint32_t)attempt);
-                        xhci_debug_port("PORTSC after that attempt", port, ps);
+                        LOG_DEBUG("port %u Warm Reset attempt %d, PORTSC=0x%08x", (unsigned)port, attempt, ps);
                     }
                 } else {
-                    xhci_debug_port("not a SuperSpeed-class port, no Warm Reset attempted", port, speed);
+                    LOG_DEBUG("port %u is not SuperSpeed-class (speed id %u), no Warm Reset attempted", (unsigned)port, speed);
                 }
             }
 
-            xhci_debug_port(((ps & 1u) && (ps & (1u << 1))) ? "reset result: ENABLED" : "reset result: FAILED (final PORTSC)", port, ps);
+            if ((ps & 1u) && (ps & (1u << 1)))
+                LOG_DEBUG("port %u reset result: ENABLED, PORTSC=0x%08x", (unsigned)port, ps);
+            else
+                LOG_WARNING("port %u reset result: FAILED, PORTSC=0x%08x", (unsigned)port, ps);
             return ((ps & 1u) && (ps & (1u << 1))) ? 1u : 0u;
         }
 

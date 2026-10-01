@@ -5,6 +5,8 @@
 #include "uhci_hub.h"
 #include "xhci_hub.h"
 
+#include "components/logger.h"
+
 #include <stddef.h>
 
 uint32_t root_hub_exec(struct root_hub* hub, enum USB_HUB_CMD cmd, uint32_t a, uint32_t b) {
@@ -55,6 +57,8 @@ bool root_hub_init(struct root_hub* hub, int type, void* backend) {
     }
 
     hub->port_count = root_hub_exec(hub, HUB_CMD_PORT_COUNT, 0, 0);
+    if (hub->port_count == 0)
+        LOG_WARNING("root hub of type %d reports no ports", type);
     return hub->port_count > 0;
 }
 

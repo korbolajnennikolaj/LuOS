@@ -4,6 +4,7 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 #include "components/pci.h"
 #include "drivers/Timer/apic_driver.h"
@@ -12,7 +13,6 @@
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
-#include "drivers/USB/usb_log.h"
 #include "kernel/limine.h"
 
 #include <stddef.h>
@@ -96,7 +96,7 @@ static void ehci_bios_handoff(struct ehci_controller *e) {
     uint32_t hccparams = ehci_cap_read(e, EHCI_HCSPARAMS + 4);
     uint8_t eecp = (hccparams >> 8) & 0xFF;
     if (eecp < 0x40) {
-        usb_log(USB_LOG_EHCI, USB_LOG_TRACE, "no legacy support capability, skip BIOS handoff");
+        LOG_DEBUG("no legacy support capability, skip BIOS handoff");
         return;
     }
 
@@ -107,7 +107,7 @@ static void ehci_bios_handoff(struct ehci_controller *e) {
         eecp = (legsup >> 8) & 0xFF;
     }
     if (!eecp) {
-        usb_log(USB_LOG_EHCI, USB_LOG_TRACE, "no USB Legacy Support cap found in ext cap list");
+        LOG_DEBUG("no USB Legacy Support cap found in ext cap list");
         return;
     }
 
@@ -116,12 +116,12 @@ static void ehci_bios_handoff(struct ehci_controller *e) {
     while (1) {
         legsup = ehci_cap_read(e, eecp);
         if (!(legsup & (1 << 16)) && (legsup & (1 << 24))) {
-            usb_log(USB_LOG_EHCI, USB_LOG_INFO, "BIOS handoff: OS now owns controller");
+            LOG_DEBUG("BIOS handoff: OS now owns controller");
             break;
         }
         if (t-- <= 0) {
 
-            usb_log(USB_LOG_EHCI, USB_LOG_WARN, "BIOS handoff timed out, forcing OS ownership");
+            LOG_WARNING("BIOS handoff timed out, forcing OS ownership");
             ehci_cap_write(e, eecp + 4, 0);
             return;
         }
@@ -130,7 +130,7 @@ static void ehci_bios_handoff(struct ehci_controller *e) {
 
     uint32_t legctlsts = ehci_cap_read(e, eecp + 4);
     ehci_cap_write(e, eecp + 4, legctlsts & 0xFFFF0000u);
-    usb_log(USB_LOG_EHCI, USB_LOG_INFO, "BIOS SMI sources disabled for this controller");
+    LOG_DEBUG("BIOS SMI sources disabled for this controller");
 }
 
 static int ehci_init_controller(struct ehci_controller *e, int ri) {
@@ -145,7 +145,7 @@ static int ehci_init_controller(struct ehci_controller *e, int ri) {
     int t = 500;
     while ((ehci_read(e, EHCI_USBCMD) & (1 << 1)) && t > 0) { delay_ms(1); t--; }
     if (!t) {
-        usb_log(USB_LOG_EHCI, USB_LOG_ERROR, "controller reset (HCRESET) timed out");
+        LOG_ERROR("controller %d reset (HCRESET) timed out", ri);
         return -1;
     }
 
@@ -191,6 +191,7 @@ static int ehci_init_controller(struct ehci_controller *e, int ri) {
 
     t = 1000;
     while ((ehci_read(e, EHCI_USBSTS) & (1 << 12)) && t > 0) { delay_ms(1); t--; }
+    if (!t) LOG_WARNING("controller %d still halted after run, USBSTS=0x%08x", ri, ehci_read(e, EHCI_USBSTS));
 
 #ifndef EHCI_CONFIGFLAG
 #define EHCI_CONFIGFLAG 0x40
@@ -211,10 +212,8 @@ static int ehci_init_controller(struct ehci_controller *e, int ri) {
     }
 
     e->initialized = 1;
-    usb_logrow_begin(USB_LOG_EHCI, USB_LOG_INFO);
-    usb_logrow_str("controller "); usb_logrow_dec(ri);
-    usb_logrow_str(" ready, ports="); usb_logrow_dec(e->num_ports);
-    usb_logrow_end();
+    LOG_INFO("controller %d ready, cap base 0x%x, %u ports%s", ri, e->cap_base,
+             (unsigned)e->num_ports, (hcs & (1u << 4)) ? ", port power control" : "");
     return 0;
 }
 
@@ -362,12 +361,8 @@ static int ehci_control_transfer_impl(struct ehci_controller *e, uint8_t dev_add
             free_qtd(ri, qtd_setup);
             if (qtd_data) free_qtd(ri, qtd_data);
             free_qtd(ri, qtd_status);
-            usb_logrow_begin(USB_LOG_EHCI, USB_LOG_ERROR);
-            usb_logrow_str("control xfer addr="); usb_logrow_dec(dev_addr);
-            usb_logrow_str(" ep="); usb_logrow_dec(endpoint);
-            usb_logrow_str(": setup qTD halted, token=");
-            usb_logrow_hex32(tok_s);
-            usb_logrow_end();
+            LOG_ERROR("control xfer addr=%u ep=%u: setup qTD halted, token=0x%08x",
+                      (unsigned)dev_addr, (unsigned)endpoint, tok_s);
             return -5;
         }
         volatile uint32_t token = qtd_status->token;
@@ -376,12 +371,8 @@ static int ehci_control_transfer_impl(struct ehci_controller *e, uint8_t dev_add
             free_qtd(ri, qtd_setup);
             if (qtd_data) free_qtd(ri, qtd_data);
             free_qtd(ri, qtd_status);
-            usb_logrow_begin(USB_LOG_EHCI, USB_LOG_ERROR);
-            usb_logrow_str("control xfer addr="); usb_logrow_dec(dev_addr);
-            usb_logrow_str(" ep="); usb_logrow_dec(endpoint);
-            usb_logrow_str(": status qTD halted, token=");
-            usb_logrow_hex32(token);
-            usb_logrow_end();
+            LOG_ERROR("control xfer addr=%u ep=%u: status qTD halted, token=0x%08x",
+                      (unsigned)dev_addr, (unsigned)endpoint, token);
             return -3;
         }
         if (!(token & 0x80)) {
@@ -403,11 +394,7 @@ static int ehci_control_transfer_impl(struct ehci_controller *e, uint8_t dev_add
     free_qtd(ri, qtd_status);
 
     if (timeout <= 0) {
-        usb_logrow_begin(USB_LOG_EHCI, USB_LOG_ERROR);
-        usb_logrow_str("control xfer addr="); usb_logrow_dec(dev_addr);
-        usb_logrow_str(" ep="); usb_logrow_dec(endpoint);
-        usb_logrow_str(": timed out");
-        usb_logrow_end();
+        LOG_ERROR("control xfer addr=%u ep=%u: timed out", (unsigned)dev_addr, (unsigned)endpoint);
     }
     return (timeout <= 0) ? -4 : 0;
 }
@@ -565,6 +552,9 @@ void ehci_irq(void) {
         uint32_t status = ehci_read(e, EHCI_USBSTS);
         if (!status) continue;
         ehci_write(e, EHCI_USBSTS, status & 0x3F);
+
+        if (status & (1u << 4))
+            LOG_ERROR("controller %d: host system error, USBSTS=0x%08x", i, status);
 
         if (!(status & 0x03)) continue;
 
@@ -1095,6 +1085,10 @@ struct ehci_driver *return_ehci_driver(void) {
     for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++) {
         if (u[i].type != USB_TYPE_EHCI || !u[i].pci) continue;
 
+        LOG_INFO("found EHCI controller at %02x:%02x.%x, base 0x%llx",
+                 (unsigned)u[i].pci->bus, (unsigned)u[i].pci->slot, (unsigned)u[i].pci->func,
+                 (unsigned long long)u[i].base_addr);
+
         struct ehci_controller *e = &ehci_resources[ehci_controller_count].ctrl;
         e->type = USB_TYPE_EHCI;
         e->cap_base = (uint32_t)u[i].base_addr;
@@ -1102,7 +1096,11 @@ struct ehci_driver *return_ehci_driver(void) {
 
         pci_enable_bus_mastering(u[i].pci);
 
-        if (ehci_init_controller(e, ehci_controller_count) != 0) continue;
+        if (ehci_init_controller(e, ehci_controller_count) != 0) {
+            LOG_ERROR("controller at %02x:%02x.%x failed to initialize",
+                      (unsigned)u[i].pci->bus, (unsigned)u[i].pci->slot, (unsigned)u[i].pci->func);
+            continue;
+        }
 
         struct pci_device *pdev = u[i].pci;
         uint8_t lapic = apic_get_lapic_id();
@@ -1110,10 +1108,13 @@ struct ehci_driver *return_ehci_driver(void) {
 
         if (msi_enable(pdev->bus, pdev->slot, pdev->func, vec, lapic, ehci_irq)) {
 
+            LOG_INFO("controller %d: MSI enabled, vector 0x%02x", ehci_controller_count, (unsigned)vec);
             ehci_write(e, EHCI_USBINTR, 0x07);
         } else {
 
             uint8_t irq_vec = (uint8_t)(0x20 + pdev->irq_line);
+            LOG_INFO("controller %d: legacy IRQ %u on vector 0x%02x", ehci_controller_count,
+                     (unsigned)pdev->irq_line, (unsigned)irq_vec);
             ioapic_map_pci_irq(pdev->irq_line, irq_vec, lapic);
             irq_register_handler(irq_vec, ehci_irq_legacy);
             ehci_write(e, EHCI_USBINTR, 0x07);
@@ -1122,6 +1123,7 @@ struct ehci_driver *return_ehci_driver(void) {
         ehci_controller_count++;
     }
 
+    LOG_INFO("%d EHCI controller(s) ready", ehci_controller_count);
     return &ehci_driver_loaded;
 }
 

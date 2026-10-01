@@ -14,6 +14,7 @@ A hobby x86-64 kernel built from scratch, booted via [Limine](https://limine-boo
 | Scripting | Embedded Lua and MicroPython — `.lua` and `.py` scripts can be run directly from disk or a USB drive |
 | Scheduler | Preemptive SMP scheduler: per-core run queues, 16-level multi-level feedback queue (dynamic priority, level-dependent quantum), aging against starvation, wake-up placement, work stealing and load balancing, per-task FPU/SSE state, stack overflow canary |
 | Services | Service manager with priorities, dependencies, health checks and restarts (root fs, keyboard updater, mouse updater, USB hotplug, shell) |
+| Logging | Kernel logger with a 256 KiB ring buffer, `[timestamp] [level] [caller] message` format, per-output levels for buffer/UART (COM1)/screen, interrupt-driven COM1 output through a 128 KiB TX queue (IRQ4, synchronous fallback), `dmesg` and `log-dump` to a `.txt` file, last messages shown on the panic screen |
 | Console | Interactive shell with its own console subsystem |
 | Extras | A few built-in terminal games (3D cube, Tetris-like, 2048-like) |
 
@@ -91,8 +92,8 @@ make clean
 
 ```
 src/
-├── components/   # ACPI, PCI, memory management, interrupts
-├── drivers/      # Storage, USB, Video, Input, Timer drivers
+├── components/   # ACPI, PCI, memory management, interrupts, logger, panic
+├── drivers/      # Storage, USB, Video, Input, Timer, Serial drivers
 ├── fs/           # FAT32, exFAT, ext4, ISO9660 implementations
 ├── kernel/       # core kernel, console, games
 │   ├── programs/ # service manager and system services
@@ -109,7 +110,6 @@ scripts/          # linker script and build helpers
 
 | Plan | Description |
 |---|---|
-| Logger component | Kernel logging subsystem |
 | Network stack | Basic networking support |
 | Audio stack | Sound output support |
 | OHCI hardware testing | Buy a real OHCI device and test the driver against real hardware, not just emulation |

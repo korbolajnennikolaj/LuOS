@@ -8,6 +8,9 @@
 #include "tables.h"
 #include "xsdt.h"
 
+#include "components/logger.h"
+
+
 #include <stddef.h>
 #include <stdio.h>
 
@@ -24,21 +27,35 @@ bool acpi_init(void) {
 
     s_rsdp = acpi_find_rsdp();
     if (!s_rsdp) {
+        LOG_ERROR("RSDP not found, ACPI unavailable");
         s_acpi_ready = false;
         return false;
     }
 
     if (!acpi_cache_tables()) {
+        LOG_ERROR("failed to load XSDT/RSDT, ACPI unavailable");
         s_acpi_ready = false;
         return false;
     }
 
     const ACPI_MADT *madt = acpi_get_madt();
     if (madt) madt_parse(madt);
+    else LOG_WARNING("MADT not present, assuming single CPU and default IRQ routing");
 
-    acpi_get_fadt();
-    acpi_get_mcfg();
-    acpi_get_hpet();
+    const ACPI_FADT *fadt = acpi_get_fadt();
+    const ACPI_MCFG *mcfg = acpi_get_mcfg();
+    const ACPI_HPET *hpet = acpi_get_hpet();
+
+    LOG_INFO("ACPI revision %u, OEM \"%.6s\", root %.4s, %d tables; MADT %s, FADT %s, MCFG %s, HPET %s",
+             (unsigned)s_rsdp->Revision, s_rsdp->OEMID,
+             acpi_get_root_table() ? acpi_get_root_table()->Signature : "????",
+             acpi_table_count(), madt ? "yes" : "no", fadt ? "yes" : "no",
+             mcfg ? "yes" : "no", hpet ? "yes" : "no");
+
+    for (int i = 0; i < acpi_table_count(); i++) {
+        ACPI_SDT_HEADER *t = acpi_get_table_by_index(i);
+        if (t) LOG_DEBUG("table %.4s rev %u, %u bytes", t->Signature, (unsigned)t->Revision, t->Length);
+    }
 
     s_acpi_ready = true;
     return true;

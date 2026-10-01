@@ -4,6 +4,7 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 #include "components/Memory/pmm.h"
 #include "components/Memory/vmm.h"
@@ -14,7 +15,6 @@
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
-#include "drivers/USB/usb_log.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/limine.h"
 #include "kernel/scheduler/scheduler.h"
@@ -195,57 +195,6 @@ static inline void wr32(uint64_t base, uint32_t off, uint32_t v) {
 static inline void wr64(uint64_t base, uint32_t off, uint64_t v) {
     wr32(base, off, (uint32_t)v);
     wr32(base, off + 4, (uint32_t)(v >> 32));
-}
-
-static void log(const char *m, uint32_t val, int show) {
-    if (show) usb_log_hex(USB_LOG_XHCI, USB_LOG_INFO, m, val);
-    else usb_log(USB_LOG_XHCI, USB_LOG_INFO, m);
-}
-
-static void err(const char *m, uint32_t c) {
-    usb_logrow_begin(USB_LOG_XHCI, USB_LOG_ERROR);
-    usb_logrow_str("ERR: ");
-    usb_logrow_str(m);
-    usb_logrow_str(" code=");
-    usb_logrow_hex32(c);
-    usb_logrow_end();
-}
-
-void xhci_debug_port(const char *msg, uint32_t port, uint32_t val) {
-    usb_logrow_begin(USB_LOG_XHCI, USB_LOG_INFO);
-    usb_logrow_str("port ");
-    usb_logrow_dec((int32_t)port);
-    usb_logrow_str(": ");
-    usb_logrow_str(msg);
-    usb_logrow_str(" = ");
-    usb_logrow_hex32(val);
-    usb_logrow_end();
-}
-
-static void trace(const char *s, const char *d) {
-    usb_logrow_begin(USB_LOG_XHCI, USB_LOG_TRACE);
-    usb_logrow_str(s);
-    if (d) { usb_logrow_str(": "); usb_logrow_str(d); }
-    usb_logrow_end();
-}
-
-static void dh(const char *l, uint32_t val) {
-    usb_log_hex(USB_LOG_XHCI, USB_LOG_TRACE, l, val);
-}
-
-static void dh64(const char *l, uint64_t val) {
-    usb_log_hex64(USB_LOG_XHCI, USB_LOG_TRACE, l, val);
-}
-
-static void dp(uint32_t p, uint32_t val) {
-    usb_logrow_begin(USB_LOG_XHCI, USB_LOG_TRACE);
-    usb_logrow_str("port "); usb_logrow_dec((int32_t)p);
-    usb_logrow_str(" = "); usb_logrow_hex32(val);
-    usb_logrow_end();
-}
-
-static void dusts(uint64_t op) {
-    (void)op;
 }
 
 static inline void *xhci_self(struct xhci_controller *x) {
@@ -657,19 +606,19 @@ static void xhci_wait_command(struct xhci_controller *x, int max_ms) {
 }
 
 static void xhci_handoff(struct xhci_controller *x) {
-    trace("Handoff", "Checking ExtCaps");
+    LOG_DEBUG("Handoff: Checking ExtCaps");
     uint32_t hcc = rd32(x->base_addr, 0x10);
     uint32_t xecp = (hcc >> 16) << 2;
-    if (!xecp) { log("No ExtCaps", 0, 0); return; }
+    if (!xecp) { LOG_DEBUG("No ExtCaps"); return; }
 
     uint32_t off = xecp;
     for (int guard = 0; guard < 32 && off != 0; guard++) {
         uint32_t v = rd32(x->base_addr, off);
-        dh("ExtCap", v);
+        LOG_DEBUG("ExtCap 0x%08x", v);
 
         if ((v & 0xFF) == 1) {
             if (v & (1u << 16)) {
-                log("BIOS owns HC, requesting handoff", 0, 0);
+                LOG_INFO("BIOS owns HC, requesting handoff");
                 wr32(x->base_addr, off, v | (1u << 24));
                 for (int i = 0; i < 500; i++) {
                     delay_ms(10);
@@ -679,21 +628,21 @@ static void xhci_handoff(struct xhci_controller *x) {
 
                         uint32_t ctrl = rd32(x->base_addr, off + 4);
                         wr32(x->base_addr, off + 4, ctrl & ~0x1FFF0000u);
-                        log("Handoff OK", 0, 0);
+                        LOG_INFO("BIOS handoff OK after %d ms", i * 10);
                         delay_ms(50);
                         return;
                     }
-                    if (i % 50 == 0) trace("Handoff", "waiting...");
+                    if (i % 50 == 0) LOG_DEBUG("Handoff: waiting...");
                 }
 
-                err("Handoff TIMEOUT - forcing OS ownership", 0);
+                LOG_WARNING("BIOS handoff timed out, forcing OS ownership");
                 uint32_t cur = rd32(x->base_addr, off);
                 wr32(x->base_addr, off, (cur & ~(1u << 16)) | (1u << 24));
                 uint32_t ctrl = rd32(x->base_addr, off + 4);
                 wr32(x->base_addr, off + 4, ctrl & ~0x1FFF0000u);
                 delay_ms(50);
             } else {
-                log("No BIOS ownership (OS already owns or no semaphore)", 0, 0);
+                LOG_DEBUG("No BIOS ownership (OS already owns or no semaphore)");
             }
             return;
         }
@@ -702,7 +651,7 @@ static void xhci_handoff(struct xhci_controller *x) {
         if (next == 0) break;
         off += next << 2;
     }
-    log("No USB Legacy Support ExtCap found", 0, 0);
+    LOG_DEBUG("No USB Legacy Support ExtCap found");
 }
 
 int xhci_reset_port(struct xhci_controller *x, uint8_t port)
@@ -716,14 +665,14 @@ int xhci_reset_port(struct xhci_controller *x, uint8_t port)
 
 static int xhci_reset_port_impl(struct xhci_controller *x, uint8_t port) {
     if (!x || port == 0) return -1;
-    log("=== RESET PORT ===", port, 1);
+    LOG_DEBUG("resetting port %u", (unsigned)port);
 
     uint32_t reg = XHCI_OP_PORTSC(port);
 
     uint32_t st = rd32(x->op_base, reg);
-    dp(port, st);
+    LOG_DEBUG("port %u PORTSC=0x%08x", (unsigned)port, st);
 
-    if (!(st & XHCI_PORTSC_CCS)) { err("No device on port", port); return -1; }
+    if (!(st & XHCI_PORTSC_CCS)) { LOG_WARNING("no device on port %u", (unsigned)port); return -1; }
 
     if (!(st & XHCI_PORTSC_PP)) {
         wr32(x->op_base, reg, xhci_portsc_neutral(st) | XHCI_PORTSC_PP);
@@ -741,7 +690,7 @@ static int xhci_reset_port_impl(struct xhci_controller *x, uint8_t port) {
     delay_ms(50);
 
     st = rd32(x->op_base, reg);
-    dp(port, st);
+    LOG_DEBUG("port %u PORTSC=0x%08x", (unsigned)port, st);
 
     if (st & XHCI_PORTSC_CHANGE_MASK) {
         wr32(x->op_base, reg,
@@ -772,9 +721,9 @@ static int xhci_reset_port_impl(struct xhci_controller *x, uint8_t port) {
         }
     }
 
-    if ((st & 1u) && (st & (1u << 1))) { log("Port reset OK", 0, 0); delay_ms(100); return 0; }
+    if ((st & 1u) && (st & (1u << 1))) { LOG_DEBUG("port %u reset OK", (unsigned)port); delay_ms(100); return 0; }
 
-    err("Port did not reach Enabled after reset", st);
+    LOG_WARNING("port %u did not reach Enabled after reset, PORTSC=0x%08x", (unsigned)port, st);
     return -1;
 }
 
@@ -788,7 +737,7 @@ int xhci_enable_slot(struct xhci_controller *x)
 }
 
 static int xhci_enable_slot_impl(struct xhci_controller *x) {
-    log("=== Enable Slot ===", 0, 0);
+    LOG_DEBUG("Enable Slot");
     struct xhci_trb cmd = {0};
     cmd.control = (TRB_TYPE_ENABLE_SLOT << 10);
     x->last_slot_id = 0;
@@ -796,20 +745,20 @@ static int xhci_enable_slot_impl(struct xhci_controller *x) {
     xhci_send_command(x, &cmd);
 
     for (int i = 0; i < 5000; i++) {
-        if (i % 100 == 0) { log("Poll", i, 1); dusts(x->op_base); }
+        if (i % 100 == 0) LOG_DEBUG("poll %d, USBSTS=0x%08x", i, rd32(x->op_base, XHCI_OP_USBSTS));
         xhci_poll_event_ring(x);
         if (x->last_completion_code != 0xFF) {
             if (x->last_completion_code == 1 && x->last_slot_id > 0) {
-                log("Slot enabled", x->last_slot_id, 1);
+                LOG_DEBUG("slot %u enabled", (unsigned)x->last_slot_id);
                 delay_ms(10);
                 return x->last_slot_id;
             }
-            err("Enable slot FAILED", x->last_completion_code);
+            LOG_ERROR("Enable Slot failed, completion code %u", (unsigned)x->last_completion_code);
             return -1;
         }
         delay_ms(2);
     }
-    err("Enable slot TIMEOUT", 0);
+    LOG_ERROR("Enable Slot timed out");
     return -1;
 }
 
@@ -825,13 +774,13 @@ int xhci_disable_slot(struct xhci_controller *x, uint8_t slot_id)
 static int xhci_disable_slot_impl(struct xhci_controller *x, uint8_t slot_id) {
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) return -1;
 
-    log("=== Disable Slot ===", slot_id, 1);
+    LOG_DEBUG("Disable Slot %u", (unsigned)slot_id);
 
     struct xhci_trb cmd = {0};
     cmd.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_DISABLE_SLOT << 10);
     x->last_completion_code = 0xFF;
 
-    if (xhci_send_command(x, &cmd) != 0) { err("DISABLE_SLOT send fail", slot_id); return -1; }
+    if (xhci_send_command(x, &cmd) != 0) { LOG_ERROR("DISABLE_SLOT send fail, code 0x%x", slot_id); return -1; }
 
     for (int i = 0; i < 5000; i++) {
         xhci_poll_event_ring(x);
@@ -840,7 +789,7 @@ static int xhci_disable_slot_impl(struct xhci_controller *x, uint8_t slot_id) {
     }
 
     if (x->last_completion_code != 1) {
-        err("DISABLE_SLOT FAILED", x->last_completion_code);
+        LOG_ERROR("DISABLE_SLOT FAILED, code 0x%x", x->last_completion_code);
 
     }
 
@@ -881,8 +830,8 @@ int xhci_address_device(struct xhci_controller *x, uint8_t slot_id, const struct
 }
 
 static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, const struct xhci_topology *topo) {
-    log("=== Address Device ===", slot_id, 1);
-    if (slot_id == 0 || slot_id > MAX_SLOTS) { err("Bad slot", slot_id); return -1; }
+    LOG_DEBUG("Address Device, slot %u", (unsigned)slot_id);
+    if (slot_id == 0 || slot_id > MAX_SLOTS) { LOG_ERROR("Bad slot, code 0x%x", slot_id); return -1; }
 
     static const struct xhci_topology root_topo_default = {0, 0, 0, 0, 0};
     if (!topo) topo = &root_topo_default;
@@ -911,28 +860,28 @@ static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, 
     if (topo->parent_hub_slot == 0) {
 
         uint32_t portsc = rd32(x->op_base, XHCI_OP_PORTSC(topo->root_port));
-        dp(topo->root_port, portsc);
+        LOG_DEBUG("port %u PORTSC=0x%08x", (unsigned)topo->root_port, portsc);
         uint32_t speed = (portsc >> 10) & 0xF;
         switch (speed) {
-            case 1: ss = 1; mps = 64; log("FS (64)", 0, 0); break;
-            case 2: ss = 2; mps = 8; log("LS (8)", 0, 0); break;
-            case 3: ss = 3; mps = 64; log("HS (64)", 0, 0); break;
-            case 4: ss = 4; mps = 512; log("SS (512)", 0, 0); break;
+            case 1: ss = 1; mps = 64; LOG_DEBUG("FS (64)"); break;
+            case 2: ss = 2; mps = 8; LOG_DEBUG("LS (8)"); break;
+            case 3: ss = 3; mps = 64; LOG_DEBUG("HS (64)"); break;
+            case 4: ss = 4; mps = 512; LOG_DEBUG("SS (512)"); break;
             default:
 
                 ss = speed;
                 mps = 512;
-                log("SS/SSP (raw PSIV)", speed, 1);
+                LOG_DEBUG("SS/SSP (raw PSIV) 0x%x", speed);
                 break;
         }
     } else {
 
         ss = topo->speed_id ? topo->speed_id : 1u;
         switch (ss) {
-            case 2: mps = 8; log("hub child: LS (8)", 0, 0); break;
-            case 3: mps = 64; log("hub child: HS (64)", 0, 0); break;
-            case 4: mps = 512; log("hub child: SS (512)", 0, 0); break;
-            default: ss = 1; mps = 64; log("hub child: FS (64)", 0, 0); break;
+            case 2: mps = 8; LOG_DEBUG("hub child: LS (8)"); break;
+            case 3: mps = 64; LOG_DEBUG("hub child: HS (64)"); break;
+            case 4: mps = 512; LOG_DEBUG("hub child: SS (512)"); break;
+            default: ss = 1; mps = 64; LOG_DEBUG("hub child: FS (64)"); break;
         }
     }
 
@@ -966,24 +915,23 @@ static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, 
     xhci_send_command(x, &cmd);
 
     for (int i = 0; i < 5000; i++) {
-        if (i % 100 == 0) { log("Poll", i, 1); dusts(x->op_base); }
-        if (rd32(x->op_base, XHCI_OP_USBSTS) & 1) { err("HALTED!", 0); return -1; }
+        if (i % 100 == 0) LOG_DEBUG("poll %d, USBSTS=0x%08x", i, rd32(x->op_base, XHCI_OP_USBSTS));
+        if (rd32(x->op_base, XHCI_OP_USBSTS) & 1) { LOG_ERROR("HALTED!"); return -1; }
         xhci_poll_event_ring(x);
         if (x->last_completion_code != 0xFF) {
             if (x->last_completion_code == 1) {
-                log("Addressed! slot", slot_id, 1);
-                log("Addressed! usbsts", rd32(x->op_base, XHCI_OP_USBSTS), 1);
+                LOG_DEBUG("slot %u addressed, USBSTS=0x%08x", (unsigned)slot_id, rd32(x->op_base, XHCI_OP_USBSTS));
                 for (size_t i2 = 0; i2 < XHCI_DEV_CTX_BYTES; i2 += 64) CACHE_FLUSH(dc + i2);
                 FULL_BARRIER();
                 delay_ms(100);
                 return 0;
             }
-            err("Address FAILED", x->last_completion_code);
+            LOG_ERROR("Address FAILED, code 0x%x", x->last_completion_code);
             return -1;
         }
         delay_ms(2);
     }
-    err("Address TIMEOUT", 0);
+    LOG_ERROR("Address TIMEOUT");
     return -1;
 }
 
@@ -1028,7 +976,7 @@ static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_i
     cmd.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_EVALUATE_CONTEXT << 10);
     x->last_completion_code = 0xFF;
 
-    if (xhci_send_command(x, &cmd) != 0) { err("EVAL_HUB_SLOT send fail", 0); return -1; }
+    if (xhci_send_command(x, &cmd) != 0) { LOG_ERROR("EVAL_HUB_SLOT send fail"); return -1; }
 
     for (int i = 0; i < 5000; i++) {
         xhci_poll_event_ring(x);
@@ -1037,27 +985,25 @@ static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_i
     }
 
     if (x->last_completion_code != 1) {
-        err("EVAL_HUB_SLOT FAILED", x->last_completion_code);
+        LOG_ERROR("EVAL_HUB_SLOT FAILED, code 0x%x", x->last_completion_code);
         return -1;
     }
 
     for (size_t i = 0; i < XHCI_DEV_CTX_BYTES; i += 64) CACHE_FLUSH(dc + i);
     FULL_BARRIER();
-    log("Hub slot marked (Hub=1)", slot_id, 1);
+    LOG_DEBUG("Hub slot marked (Hub=1) 0x%x", slot_id);
     return 0;
 }
 
 static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, uint8_t dci, uint8_t ep_type, uint16_t mps, uint8_t interval)
 {
-    log("=== Configure EP ===", 0, 0);
 
-    log("CFG_EP dci", dci, 1);
-    log("CFG_EP ep_type", ep_type, 1);
-    log("CFG_EP mps", mps, 1);
-    log("CFG_EP interval(raw)", interval, 1);
+
+    LOG_DEBUG("Configure EP slot %u dci %u type %u mps %u interval %u",
+              (unsigned)slot_id, (unsigned)dci, (unsigned)ep_type, (unsigned)mps, (unsigned)interval);
 
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) {
-        err("CFG_EP: bad params", slot_id);
+        LOG_ERROR("CFG_EP: bad params, code 0x%x", slot_id);
         return -1;
     }
 
@@ -1098,7 +1044,7 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     }
 
     uint64_t tr_phys = virt_to_phys(tr_ring);
-    dh64("intr ring phys", tr_phys);
+    LOG_DEBUG("intr ring phys 0x%016llx", (unsigned long long)tr_phys);
 
     memset(ictx, 0, XHCI_INPUT_CTX_BYTES);
     {
@@ -1151,7 +1097,7 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
             }
         }
     }
-    log("CFG_EP interval(xhci)", xhci_interval, 1);
+    LOG_DEBUG("CFG_EP interval(xhci) 0x%x", xhci_interval);
 
     uint32_t max_burst = 0u;
     uint32_t max_esit = ep_is_periodic ? ((uint32_t)mps * (max_burst + 1u)) : 0u;
@@ -1176,21 +1122,20 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     cmd.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_CONFIG_EP << 10);
     x->last_completion_code = 0xFF;
 
-    if (xhci_send_command(x, &cmd) != 0) { err("CFG_EP send fail", 0); return -1; }
+    if (xhci_send_command(x, &cmd) != 0) { LOG_ERROR("CFG_EP send fail"); return -1; }
 
     for (int i = 0; i < 5000; i++) {
-        if (i % 100 == 0) { log("CFG_EP poll", i, 1); dusts(x->op_base); }
+        if (i % 100 == 0) LOG_DEBUG("CFG_EP poll %d, USBSTS=0x%08x", i, rd32(x->op_base, XHCI_OP_USBSTS));
         xhci_poll_event_ring(x);
         if (x->last_completion_code != 0xFF) break;
         delay_ms(2);
     }
 
     if (x->last_completion_code != 1) {
-        err("CFG_EP FAILED", x->last_completion_code);
+        LOG_ERROR("CFG_EP FAILED, code 0x%x", x->last_completion_code);
         return -1;
     }
-    log("CFG_EP OK slot", slot_id, 1);
-    log("CFG_EP OK usbsts", rd32(x->op_base, XHCI_OP_USBSTS), 1);
+    LOG_DEBUG("Configure EP OK slot %u, USBSTS=0x%08x", (unsigned)slot_id, rd32(x->op_base, XHCI_OP_USBSTS));
     delay_ms(10);
 
     struct xhci_endpoint_context *dev_ep =
@@ -1215,7 +1160,7 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     }
 
     ep_configured[ci][slot_id - 1] = 1;
-    log("EP configured", 0, 0);
+    LOG_DEBUG("EP configured");
     return 0;
 }
 
@@ -1227,7 +1172,6 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
 {
     (void)endpoint; (void)setup_len;
     if (!x || slot_id == 0) return -1;
-    log("=== Control Transfer ===", 0, 0);
 
     int idx = x - ctrls;
     struct xhci_trb *tr = (struct xhci_trb *)xhci_mem[idx].transfer_rings[slot_id - 1];
@@ -1296,12 +1240,12 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
     xhci_waiter_init(&w);
 
     for (;;) {
-        if ((w.polls & 1023u) == 0) log("XFR poll", (int)w.polls, 1);
+        if ((w.polls & 1023u) == 0 && w.polls) LOG_DEBUG("control transfer slot %u still waiting, %u polls", (unsigned)slot_id, (unsigned)w.polls);
         {
             uint32_t _sts = rd32(x->op_base, XHCI_OP_USBSTS);
             if (_sts & ((1u << 0) | (1u << 2) | (1u << 14))) {
-                err("!!! USBSTS WENT FATAL DURING WAIT, slot", slot_id);
-                err("!!! ...for request type/req", ((uint32_t)((uint8_t *)setup)[0] << 8) | ((uint8_t *)setup)[1]);
+                LOG_ERROR("USBSTS went fatal (0x%08x) during control transfer on slot %u, request %02x/%02x",
+                          _sts, (unsigned)slot_id, (unsigned)((uint8_t *)setup)[0], (unsigned)((uint8_t *)setup)[1]);
                 g_last_xfer_error_code = x->last_completion_code;
                 g_last_usbsts = _sts;
                 x->pending_xfer_slot = 0;
@@ -1319,12 +1263,11 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
                         CACHE_FLUSH((void *)a);
                     FULL_BARRIER();
                 }
-                log("XFR OK slot", slot_id, 1);
-                log("XFR OK usbsts", rd32(x->op_base, XHCI_OP_USBSTS), 1);
                 delay_ms(2);
                 return 0;
             }
-            err("XFR FAILED", cc);
+            LOG_ERROR("control transfer on slot %u failed, completion code %u, request %02x/%02x",
+                      (unsigned)slot_id, (unsigned)cc, (unsigned)((uint8_t *)setup)[0], (unsigned)((uint8_t *)setup)[1]);
             g_last_xfer_error_code = cc;
             g_last_usbsts = rd32(x->op_base, XHCI_OP_USBSTS);
             xhci_control_ep0_recover(x, slot_id, idx, tr);
@@ -1334,8 +1277,8 @@ static int xhci_control_transfer_impl(struct xhci_controller *x, uint8_t slot_id
         xhci_waiter_backoff(&w);
     }
     x->pending_xfer_slot = 0;
-    err("XFR TIMEOUT", 0);
-    err("XFR TIMEOUT polls", w.polls);
+    LOG_ERROR("control transfer on slot %u timed out after %u polls, request %02x/%02x",
+              (unsigned)slot_id, (unsigned)w.polls, (unsigned)((uint8_t *)setup)[0], (unsigned)((uint8_t *)setup)[1]);
     g_last_xfer_error_code = 0xFF;
     g_last_usbsts = rd32(x->op_base, XHCI_OP_USBSTS);
     xhci_control_ep0_recover(x, slot_id, idx, tr);
@@ -1352,7 +1295,7 @@ int xhci_control_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t en
 }
 
 static int xhci_init(struct xhci_controller *x, int idx) {
-    log("INIT XHCI", idx, 1);
+    LOG_INFO("initializing controller %d at 0x%llx", idx, (unsigned long long)x->base_addr);
     x->type = 3;
 
     uint32_t cap_lo = rd32(x->base_addr, 0);
@@ -1366,42 +1309,42 @@ static int xhci_init(struct xhci_controller *x, int idx) {
 
     uint32_t cmd_val = rd32(x->op_base, XHCI_OP_USBCMD);
     if (cmd_val & 1) {
-        log("HC running, stopping...", 0, 0);
+        LOG_DEBUG("HC running, stopping...");
         wr32(x->op_base, XHCI_OP_USBCMD, cmd_val & ~1u);
 
         int th = 500;
         while (!(rd32(x->op_base, XHCI_OP_USBSTS) & 1) && --th) delay_ms(1);
         if (!th) {
-            err("HC stop timeout — continuing to SW reset", 0);
+            LOG_WARNING("HC stop timeout, continuing to software reset");
 
         } else {
-            log("HC stopped", 0, 0);
+            LOG_DEBUG("HC stopped");
         }
     } else {
-        log("HC already stopped", 0, 0);
+        LOG_DEBUG("HC already stopped");
     }
 
     wr32(x->op_base, XHCI_OP_USBCMD, (1 << 1));
     delay_ms(10);
     int tr = 5000;
     while ((rd32(x->op_base, XHCI_OP_USBCMD) & (1 << 1)) && --tr) delay_ms(1);
-    if (!tr) { err("Reset FAILED", 0); return -1; }
-    log("Reset OK", 0, 0);
+    if (!tr) { LOG_ERROR("Reset FAILED"); return -1; }
+    LOG_DEBUG("Reset OK");
 
     int tcnr = 2000;
     while ((rd32(x->op_base, XHCI_OP_USBSTS) & (1 << 11)) && --tcnr) delay_ms(1);
-    if (!tcnr) { err("CNR stuck", 0); return -1; }
-    log("CNR cleared", 0, 0);
+    if (!tcnr) { LOG_ERROR("CNR stuck"); return -1; }
+    LOG_DEBUG("CNR cleared");
     delay_ms(50);
 
     {
         uint32_t hccp1 = rd32(x->base_addr, 0x10);
         if (hccp1 & (1u << 2)) {
             x->csz = XHCI_CTX_SIZE_64;
-            log("CSZ=1, using 64-byte contexts", hccp1, 1);
+            LOG_DEBUG("CSZ=1, using 64-byte contexts 0x%x", hccp1);
         } else {
             x->csz = XHCI_CTX_SIZE_32;
-            log("CSZ=0, using 32-byte contexts", hccp1, 1);
+            LOG_DEBUG("CSZ=0, using 32-byte contexts 0x%x", hccp1);
         }
     }
 
@@ -1453,7 +1396,7 @@ static int xhci_init(struct xhci_controller *x, int idx) {
     uint64_t ering_phys = virt_to_phys(x->event_ring);
 
     if (!dcbaa_phys || !cring_phys || !ering_phys) {
-        err("virt_to_phys returned 0!", 0);
+        LOG_ERROR("virt_to_phys returned 0!");
         return -1;
     }
 
@@ -1463,21 +1406,21 @@ static int xhci_init(struct xhci_controller *x, int idx) {
     xhci_mem[idx].erst[0].size = TRB_RING_SIZE;
 
     if (max_scratch > 0) {
-        log("Scratchpad buffers required", max_scratch, 1);
+        LOG_DEBUG("Scratchpad buffers required 0x%x", max_scratch);
 
         uint32_t sp_arr_bytes = max_scratch * (uint32_t)sizeof(uint64_t);
         uint32_t sp_arr_pages = (sp_arr_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
         if (sp_arr_pages < 1) sp_arr_pages = 1;
 
         uint64_t sp_arr_phys = pmm_alloc_pages(sp_arr_pages);
-        if (!sp_arr_phys) { err("scratchpad array alloc FAILED", max_scratch); return -1; }
+        if (!sp_arr_phys) { LOG_ERROR("scratchpad array alloc FAILED, code 0x%x", max_scratch); return -1; }
 
         uint64_t *sp_arr = (uint64_t *)mm_phys_to_virt(sp_arr_phys);
         memset(sp_arr, 0, (size_t)sp_arr_pages * PAGE_SIZE);
 
         for (uint32_t s = 0; s < max_scratch; s++) {
             uint64_t buf_phys = pmm_alloc_pages(1);
-            if (!buf_phys) { err("scratchpad buffer alloc FAILED", s); return -1; }
+            if (!buf_phys) { LOG_ERROR("scratchpad buffer alloc FAILED, code 0x%x", s); return -1; }
             void *buf_virt = (void *)mm_phys_to_virt(buf_phys);
             memset(buf_virt, 0, PAGE_SIZE);
             sp_arr[s] = buf_phys;
@@ -1491,7 +1434,7 @@ static int xhci_init(struct xhci_controller *x, int idx) {
         CACHE_FLUSH(&xhci_mem[idx].dcbaa[0]);
         FULL_BARRIER();
     } else {
-        log("No scratchpad buffers required", 0, 0);
+        LOG_DEBUG("No scratchpad buffers required");
     }
 
     wr32(x->op_base, XHCI_OP_CONFIG, x->max_slots);
@@ -1519,7 +1462,7 @@ static int xhci_init(struct xhci_controller *x, int idx) {
     delay_ms(100);
 
     uint32_t sts = rd32(x->op_base, XHCI_OP_USBSTS);
-    if (sts & 1) { err("HC HALTED after run!", sts); return -1; }
+    if (sts & 1) { LOG_ERROR("HC HALTED after run!, code 0x%x", sts); return -1; }
 
     for (uint32_t p = 1; p <= maxp; p++) {
         uint32_t ps = rd32(x->op_base, XHCI_OP_PORTSC(p));
@@ -1533,12 +1476,12 @@ static int xhci_init(struct xhci_controller *x, int idx) {
     delay_ms(200);
 
     if (rd32(x->op_base, XHCI_OP_USBSTS) & 1) {
-        err("HC HALTED after port power!", 0);
+        LOG_ERROR("HC HALTED after port power!");
         return -1;
     }
 
     x->initialized = 1;
-    log("XHCI INIT OK", 0, 0);
+    LOG_DEBUG("controller %d init OK", idx);
     return 0;
 }
 
@@ -1700,7 +1643,7 @@ static void xhci_reset_bulk_toggle(struct xhci_controller *x, uint8_t slot_id, u
 static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t data_len, uint8_t direction)
 {
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) {
-        usb_log_hex(USB_LOG_XHCI, USB_LOG_ERROR, "INTR: bad ctrl/slot", slot_id);
+        LOG_ERROR("interrupt transfer: bad controller or slot %u", (unsigned)slot_id);
         return -1;
     }
 
@@ -1710,7 +1653,7 @@ static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_
     uint8_t ep_num = endpoint & 0x0F;
     uint8_t is_in = (endpoint & 0x80) ? 1 : 0;
     uint8_t dci = (ep_num * 2) + is_in;
-    if (dci == 0 || dci > 31) { usb_log_hex(USB_LOG_XHCI, USB_LOG_ERROR, "bad dci", dci); return -1; }
+    if (dci == 0 || dci > 31) { LOG_ERROR("bad dci %u", (unsigned)dci); return -1; }
     (void)direction;
 
     struct xhci_trb *tr_ring = xhci_mem[ci].intr_rings[ki];
@@ -1793,7 +1736,7 @@ static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_
         if (ep_interval < 1) ep_interval = 1;
         if (ep_interval > 16) ep_interval = 16;
         if (xhci_configure_endpoint(x, slot_id, dci, ep_type, ep_mps, ep_interval) != 0) {
-            usb_log(USB_LOG_XHCI, USB_LOG_ERROR, "CFG_EP FAILED");
+            LOG_ERROR("Configure EP failed");
             return -1;
         }
 
@@ -2395,14 +2338,15 @@ struct xhci_driver *return_xhci_driver(void) {
 
     delay_ms = tsc->sleep_tsc_ms;
     xhci_now_us_fn = tsc->get_tsc_uptime_us;
-    trace("XHCI", "Scanning PCI...");
+    LOG_DEBUG("scanning PCI for xHCI controllers");
 
     struct usb_controller *u = pci_get_usb_controllers();
     for (int i = 0; i < 8; i++) {
         if (u[i].type != USB_TYPE_XHCI || !u[i].pci) continue;
         if (ctrl_count >= MAX_XHCI_CONTROLLERS) break;
 
-        log("Found XHCI", i, 1);
+        LOG_INFO("found xHCI controller at %02x:%02x.%x (USB slot %d)",
+                 (unsigned)u[i].pci->bus, (unsigned)u[i].pci->slot, (unsigned)u[i].pci->func, i);
         pci_enable_bus_mastering(u[i].pci);
         delay_ms(10);
 
@@ -2416,7 +2360,7 @@ struct xhci_driver *return_xhci_driver(void) {
         else
             addr = b0 & 0xFFFFFFF0;
 
-        if (!addr) { err("BAR=0, skipping", i); continue; }
+        if (!addr) { LOG_ERROR("controller %d: BAR0 is zero, skipping", i); continue; }
 
         {
             uint64_t hhdm_off = hhdm_req.response ? hhdm_req.response->offset : 0;
@@ -2439,10 +2383,11 @@ struct xhci_driver *return_xhci_driver(void) {
 
         ctrls[ctrl_count].base_addr = addr;
         if (xhci_init(&ctrls[ctrl_count], ctrl_count) != 0) {
-            log("xhci_init FAILED", ctrl_count, 1);
+            LOG_ERROR("controller %d at 0x%llx failed to initialize", ctrl_count, (unsigned long long)addr);
             continue;
         }
-        log("xhci_init OK", ctrl_count, 1);
+        LOG_INFO("controller %d ready: %u slots, %u ports", ctrl_count,
+                 (unsigned)ctrls[ctrl_count].max_slots, (unsigned)ctrls[ctrl_count].max_ports);
 
         uint8_t msi_vec = (uint8_t)(MSI_VECTOR_XHCI_BASE + ctrl_count);
         uint8_t lapic = apic_get_lapic_id();
@@ -2450,7 +2395,7 @@ struct xhci_driver *return_xhci_driver(void) {
         bool msi_ok = msi_enable(pdev->bus, pdev->slot, pdev->func,
                                  msi_vec, lapic, xhci_irq);
         if (msi_ok) {
-            log("xHCI MSI enabled, vector", msi_vec, 1);
+            LOG_INFO("controller %d: MSI enabled, vector 0x%02x", ctrl_count, (unsigned)msi_vec);
 
             uint32_t iman = rd32(ctrls[ctrl_count].rt_base, 0x20);
             wr32(ctrls[ctrl_count].rt_base, 0x20, iman | 3u);
@@ -2463,10 +2408,10 @@ struct xhci_driver *return_xhci_driver(void) {
                 uint8_t irq_vec2 = (uint8_t)(0x20 + pdev->irq_line);
                 ioapic_map_pci_irq(pdev->irq_line, irq_vec2, lapic);
                 irq_register_handler(irq_vec2, xhci_irq_legacy_handler);
-                log("xHCI legacy IRQ fallback registered, vec", irq_vec2, 1);
+                LOG_DEBUG("controller %d: legacy IRQ %u fallback on vector 0x%02x", ctrl_count, (unsigned)pdev->irq_line, (unsigned)irq_vec2);
             }
         } else {
-            log("xHCI no MSI, trying legacy IRQ", pdev->irq_line, 1);
+            LOG_WARNING("controller %d: no MSI, using legacy IRQ %u", ctrl_count, (unsigned)pdev->irq_line);
             uint8_t irq_vec = (uint8_t)(0x20 + pdev->irq_line);
             uint8_t lapic2 = apic_get_lapic_id();
             ioapic_map_pci_irq(pdev->irq_line, irq_vec, lapic2);
@@ -2481,8 +2426,7 @@ struct xhci_driver *return_xhci_driver(void) {
         ctrl_count++;
     }
 
-    log("Total XHCI controllers", ctrl_count, 1);
-    log("XHCI DRIVER READY", 0, 0);
+    LOG_INFO("%d xHCI controller(s) ready", ctrl_count);
     return &xhci_driver_loaded;
 }
 

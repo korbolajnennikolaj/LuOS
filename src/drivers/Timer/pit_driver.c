@@ -1,6 +1,7 @@
 #include "pit_driver.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 
 #include <ports.h>
@@ -60,6 +61,8 @@ static void calibrate_with_rtc() {
 
     if (total_ticks > 1000) {
         ticks_per_ms = total_ticks / 1000;
+    } else {
+        LOG_WARNING("RTC calibration measured only %u ticks, keeping %u ticks/ms", total_ticks, ticks_per_ms);
     }
 }
 
@@ -94,6 +97,7 @@ struct pit_driver* return_pit_driver(void) {
         outb(0x40, 0xFF);
         outb(0x40, 0xFF);
         initialized = 1;
+        LOG_INFO("PIT calibrated against RTC: %u ticks/ms (nominal 1193)", ticks_per_ms);
     }
 
     return &driver_pit;

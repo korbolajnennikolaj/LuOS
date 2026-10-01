@@ -3,6 +3,7 @@
 #include "components/drivers.h"
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
+#include "components/logger.h"
 #include "kernel/scheduler/spinlock.h"
 #include "ps2_keyboard_driver.h"
 #include "mouse_driver.h"
@@ -118,11 +119,11 @@ static void mouse_init(void) {
     mouse_wait_write(); outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG);
     mouse_wait_write(); outb(PS2_DATA_PORT, config);
 
-    mouse_write(MOUSE_CMD_RESET);
-    mouse_wait_read(); inb(PS2_DATA_PORT);
-    mouse_wait_read(); inb(PS2_DATA_PORT);
+    uint8_t reset_ack = mouse_write(MOUSE_CMD_RESET);
+    mouse_wait_read(); uint8_t self_test = inb(PS2_DATA_PORT);
+    mouse_wait_read(); uint8_t device_id = inb(PS2_DATA_PORT);
 
-    mouse_write(MOUSE_CMD_SET_DEFAULTS);
+    uint8_t defaults_ack = mouse_write(MOUSE_CMD_SET_DEFAULTS);
 
     if (mouse_detect_wheel()) {
         packet_size = PACKET_SIZE_WHEEL;
@@ -132,10 +133,19 @@ static void mouse_init(void) {
         mouse_state.has_wheel = false;
     }
 
-    mouse_write(MOUSE_CMD_ENABLE_STREAM);
+    uint8_t stream_ack = mouse_write(MOUSE_CMD_ENABLE_STREAM);
     irq_register_handler(PS2_MOUSE_IRQ_VECTOR, ps2_mouse_irq_wrapper);
 
     ps2_bus_release(bus_flags);
+
+    LOG_DEBUG("reset ack=0x%02x self-test=0x%02x id=0x%02x, defaults ack=0x%02x, stream ack=0x%02x",
+              (unsigned)reset_ack, (unsigned)self_test, (unsigned)device_id,
+              (unsigned)defaults_ack, (unsigned)stream_ack);
+    if (self_test != 0xAA)
+        LOG_WARNING("PS/2 mouse self-test returned 0x%02x (expected 0xAA), mouse may be absent", (unsigned)self_test);
+    LOG_INFO("PS/2 mouse ready, %s, %u-byte packets, IRQ12 on vector 0x%x",
+             mouse_state.has_wheel ? "wheel detected" : "no wheel",
+             (unsigned)packet_size, PS2_MOUSE_IRQ_VECTOR);
 }
 
 static struct ps2_mouse_state *mouse_get_state(void) {

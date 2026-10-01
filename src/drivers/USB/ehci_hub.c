@@ -1,6 +1,7 @@
 #include "ehci_hub.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "kernel/limine.h"
@@ -51,6 +52,7 @@ static void ehci_ensure_configflag(struct ehci_controller *c) {
     }
 
     ehci_write_op(c, EHCI_CONFIGFLAG, 1);
+    LOG_DEBUG("CONFIGFLAG set, ports routed to EHCI");
 
     if (s_configflag_done_count < MAX_EHCI_CONTROLLERS)
         s_configflag_done[s_configflag_done_count++] = c;
@@ -106,7 +108,12 @@ uint32_t ehci_hub_exec(struct ehci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
             status = ehci_read_op(c, reg);
             ehci_write_op(c, reg, status | EHCI_PORTSC_RW1C);
 
-            return (ehci_read_op(c, reg) & (1 << 2)) ? 1 : 0;
+            uint32_t final = ehci_read_op(c, reg);
+            if (final & (1 << 2))
+                LOG_DEBUG("port %u reset: enabled (high speed), PORTSC=0x%08x", port, final);
+            else
+                LOG_DEBUG("port %u reset: not enabled, PORTSC=0x%08x (full/low speed device or no device)", port, final);
+            return (final & (1 << 2)) ? 1 : 0;
         }
 
         case HUB_CMD_PORT_POWER: {

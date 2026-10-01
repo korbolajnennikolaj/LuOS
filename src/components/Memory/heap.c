@@ -1,5 +1,6 @@
 #include "heap.h"
 
+#include "components/logger.h"
 #include "kernel/scheduler/spinlock.h"
 
 #include <stddef.h>
@@ -410,6 +411,9 @@ void heap_init(uintptr_t addr, size_t size)
 
     addr_insert(b);
     size_insert(b);
+
+    LOG_DEBUG("heap initialized at 0x%llx, %llu bytes usable",
+              (unsigned long long)addr, (unsigned long long)heap_total);
 }
 
 static void* kmalloc_impl(size_t size)
@@ -436,7 +440,11 @@ void* kmalloc(size_t size)
 {
     uint64_t flags = spin_lock_irqsave(&heap_lock);
     void *p = kmalloc_impl(size);
+    size_t used = heap_used;
     spin_unlock_irqrestore(&heap_lock, flags);
+    if (!p && size)
+        LOG_WARNING("kmalloc(%llu) failed, %llu of %llu bytes in use",
+                    (unsigned long long)size, (unsigned long long)used, (unsigned long long)heap_total);
     return p;
 }
 
@@ -445,7 +453,10 @@ static void kfree_impl(void* ptr)
     if (!ptr) return;
 
     block_t *b = DATA_BLOCK(ptr);
-    if (b->is_free) return;
+    if (b->is_free) {
+        LOG_WARNING("double free of %p ignored", ptr);
+        return;
+    }
 
     heap_used -= b->size;
     b->is_free = 1;
@@ -520,7 +531,11 @@ void* krealloc(void* ptr, size_t size)
     }
 
     void *new_ptr = kmalloc_impl(size);
-    if (!new_ptr) { spin_unlock_irqrestore(&heap_lock, flags); return NULL; }
+    if (!new_ptr) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        LOG_WARNING("krealloc(%p, %llu) failed", ptr, (unsigned long long)size);
+        return NULL;
+    }
 
     unsigned char *src = (unsigned char*)ptr;
     unsigned char *dst = (unsigned char*)new_ptr;

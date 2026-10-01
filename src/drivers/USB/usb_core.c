@@ -2,15 +2,16 @@
 
 #include "components/drivers.h"
 #include "components/Interruptions/msi.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/Timer/tsc_driver.h"
 #include "drivers/USB/ehci.h"
 #include "drivers/USB/ohci.h"
 #include "drivers/USB/uhci.h"
 #include "drivers/USB/usb_controller.h"
+#include "drivers/USB/usb_core_internal.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/USB/usb_hub.h"
-#include "drivers/USB/usb_log.h"
 #include "drivers/USB/xhci.h"
 #include "drivers/USB/xhci_hub.h"
 #include "drivers/Video/limine_video_driver.h"
@@ -139,9 +140,125 @@ void delay_ms(uint64_t ms) {
     for (volatile uint64_t i = 0; i < ms * 2000000ull; i++) asm volatile("pause");
 }
 
-static void usb_debug(const char *msg, uint32_t val, int show_val) {
-    if (show_val) usb_log_hex(USB_LOG_CORE, USB_LOG_INFO, msg, val);
-    else usb_log(USB_LOG_CORE, USB_LOG_INFO, msg);
+static const char *const usb_port_log_names[USB_PORT_LOG_SOURCE_COUNT] = {
+    [USB_PORT_LOG_HUB] = "hub_port",
+    [USB_PORT_LOG_XHCI] = "xhci_port",
+    [USB_PORT_LOG_EHCI] = "ehci_port",
+    [USB_PORT_LOG_OHCI] = "ohci_port",
+    [USB_PORT_LOG_UHCI] = "uhci_port",
+};
+
+static const char *usb_xhci_pls_name(uint32_t portsc) {
+    switch ((portsc >> 5) & 0xFu) {
+        case 0: return "U0";
+        case 1: return "U1";
+        case 2: return "U2";
+        case 3: return "U3";
+        case 4: return "Dis";
+        case 5: return "RxD";
+        case 7: return "Pol";
+        case 9: return "Comp";
+        case 15: return "Rsm";
+        default: return "---";
+    }
+}
+
+static const char *usb_xhci_speed_name(uint8_t speed_id) {
+    switch (speed_id) {
+        case 1: return "FS";
+        case 2: return "LS";
+        case 3: return "HS";
+        case 4: return "SS";
+        case 5: return "SS+";
+        default: return "--";
+    }
+}
+
+static void usb_port_change_append(char *buf, size_t cap, size_t *pos, const char *name) {
+    if (*pos && *pos + 1 < cap) buf[(*pos)++] = ' ';
+    while (*name && *pos + 1 < cap) buf[(*pos)++] = *name++;
+    buf[*pos] = '\0';
+}
+
+void usb_log_port_event(enum usb_port_log_source source, enum logger_level_t level,
+                        int ctrl_idx, uint8_t port, const char *event,
+                        uint32_t portsc, uint8_t speed_id) {
+    if ((unsigned)source >= USB_PORT_LOG_SOURCE_COUNT) source = USB_PORT_LOG_HUB;
+
+    uint8_t ccs = 0, ped = 0;
+    const char *pls = "---";
+    const char *spd = "--";
+    char changes[64];
+    size_t n = 0;
+    changes[0] = '\0';
+
+    switch (source) {
+        case USB_PORT_LOG_XHCI:
+            ccs = (portsc & (1u << 0)) ? 1 : 0;
+            ped = (portsc & (1u << 1)) ? 1 : 0;
+            pls = usb_xhci_pls_name(portsc);
+            spd = usb_xhci_speed_name(speed_id != 0xFF ? speed_id : (uint8_t)((portsc >> 10) & 0xFu));
+            if (portsc & (1u << 17)) usb_port_change_append(changes, sizeof(changes), &n, "CSC");
+            if (portsc & (1u << 18)) usb_port_change_append(changes, sizeof(changes), &n, "PEC");
+            if (portsc & (1u << 19)) usb_port_change_append(changes, sizeof(changes), &n, "WRC");
+            if (portsc & (1u << 20)) usb_port_change_append(changes, sizeof(changes), &n, "OCC");
+            if (portsc & (1u << 21)) usb_port_change_append(changes, sizeof(changes), &n, "PRC");
+            if (portsc & (1u << 22)) usb_port_change_append(changes, sizeof(changes), &n, "PLC");
+            if (portsc & (1u << 23)) usb_port_change_append(changes, sizeof(changes), &n, "CEC");
+            break;
+
+        case USB_PORT_LOG_EHCI:
+            ccs = (portsc & (1u << 0)) ? 1 : 0;
+            ped = (portsc & (1u << 2)) ? 1 : 0;
+            spd = ped ? "HS" : "FS/LS";
+            if (portsc & (1u << 1)) usb_port_change_append(changes, sizeof(changes), &n, "CSC");
+            if (portsc & (1u << 3)) usb_port_change_append(changes, sizeof(changes), &n, "PEC");
+            if (portsc & (1u << 5)) usb_port_change_append(changes, sizeof(changes), &n, "OCC");
+            if (portsc & (1u << 13)) usb_port_change_append(changes, sizeof(changes), &n, "OWNER=companion");
+            break;
+
+        case USB_PORT_LOG_OHCI:
+            ccs = (portsc & (1u << 0)) ? 1 : 0;
+            ped = (portsc & (1u << 1)) ? 1 : 0;
+            spd = (portsc & (1u << 9)) ? "LS" : "FS";
+            if (portsc & (1u << 16)) usb_port_change_append(changes, sizeof(changes), &n, "CSC");
+            if (portsc & (1u << 17)) usb_port_change_append(changes, sizeof(changes), &n, "PESC");
+            if (portsc & (1u << 18)) usb_port_change_append(changes, sizeof(changes), &n, "PSSC");
+            if (portsc & (1u << 19)) usb_port_change_append(changes, sizeof(changes), &n, "OCIC");
+            if (portsc & (1u << 20)) usb_port_change_append(changes, sizeof(changes), &n, "PRSC");
+            break;
+
+        case USB_PORT_LOG_UHCI:
+            ccs = (portsc & (1u << 0)) ? 1 : 0;
+            ped = (portsc & (1u << 2)) ? 1 : 0;
+            spd = (portsc & (1u << 8)) ? "LS" : "FS";
+            if (portsc & (1u << 1)) usb_port_change_append(changes, sizeof(changes), &n, "CSC");
+            if (portsc & (1u << 3)) usb_port_change_append(changes, sizeof(changes), &n, "PEC");
+            break;
+
+        case USB_PORT_LOG_HUB: {
+            uint16_t wstatus = (uint16_t)(portsc & 0xFFFFu);
+            uint16_t wchange = (uint16_t)(portsc >> 16);
+            ccs = (wstatus & 0x0001u) ? 1 : 0;
+            ped = (wstatus & 0x0002u) ? 1 : 0;
+            spd = (wstatus & 0x0400u) ? "HS" : (wstatus & 0x0200u) ? "LS" : "FS";
+            if (wchange & 0x0001u) usb_port_change_append(changes, sizeof(changes), &n, "CSC");
+            if (wchange & 0x0002u) usb_port_change_append(changes, sizeof(changes), &n, "PEC");
+            if (wchange & 0x0004u) usb_port_change_append(changes, sizeof(changes), &n, "SUSP");
+            if (wchange & 0x0008u) usb_port_change_append(changes, sizeof(changes), &n, "OCC");
+            if (wchange & 0x0010u) usb_port_change_append(changes, sizeof(changes), &n, "PRC");
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    logger_printf(level, usb_port_log_names[source],
+                  "c%d p%02u %s CCS=%u PED=%u PLS=%s SPD=%s CHANGE=%s PORTSC=0x%08x",
+                  ctrl_idx, (unsigned)port, event ? event : "?",
+                  (unsigned)ccs, (unsigned)ped, pls, spd,
+                  n ? changes : "-", portsc);
 }
 
 static void usb_core_enqueue_event(const usb_event_t *evt) {
@@ -416,7 +533,7 @@ static void usb_root_port_mark(usb_root_port_state_t *table, int ci, uint8_t por
     table[ci].slot[port] = val;
 }
 
-static void usb_root_ports_poll_one(usb_log_tag log_tag,
+static void usb_root_ports_poll_one(enum usb_port_log_source log_source,
                                      usb_root_port_state_t *table,
                                      int ctrl_count_, void *(*get_ctrl)(int),
                                      enum HUB_CONTROLLER_TYPE hub_type,
@@ -460,14 +577,10 @@ static void usb_root_ports_poll_one(usb_log_tag log_tag,
                     continue;
                 if (connected_now) st->mismatch_tries[port]++;
 
-                usb_logrow_begin(log_tag, USB_LOG_WARN);
-                usb_logrow_str("root poll: c");
-                usb_logrow_dec(ci);
-                usb_logrow_str(" p");
-                usb_logrow_dec(port);
-                usb_logrow_str(connected_now ? " connect" : " disconnect");
-                usb_logrow_str(" seen via CCS only (change bit lost)");
-                usb_logrow_end();
+                logger_printf(LOGGER_LEVEL_WARNING, __func__,
+                              "%s c%d p%u %s seen via CCS only (change bit lost)",
+                              usb_port_log_names[log_source], ci, (unsigned)port,
+                              connected_now ? "connect" : "disconnect");
             }
 
             bool connected = connected_now;
@@ -475,18 +588,14 @@ static void usb_root_ports_poll_one(usb_log_tag log_tag,
 
             if (cur_slot == USB_ROOT_PORT_BUSY) {
 
-                usb_logrow_begin(log_tag, USB_LOG_WARN);
-                usb_logrow_str("root poll: skipped re-entrant hit on c");
-                usb_logrow_dec(ci);
-                usb_logrow_str(" p");
-                usb_logrow_dec(port);
-                usb_logrow_str(" (enumeration already in progress)");
-                usb_logrow_end();
+                logger_printf(LOGGER_LEVEL_WARNING, __func__,
+                              "%s c%d p%u skipped re-entrant hit (enumeration already in progress)",
+                              usb_port_log_names[log_source], ci, (unsigned)port);
                 continue;
             }
 
             if (is_xhci && connected && cur_slot >= 0 && !(pst & 0x2u)) {
-                usb_log_port_event(log_tag, ci, port, "port-disabled, re-enumerating", pst, 0xFF);
+                usb_log_port_event(log_source, LOGGER_LEVEL_INFO, ci, port, "port-disabled, re-enumerating", pst, 0xFF);
                 usb_hub_detach(cur_slot);
                 st->slot[port] = -1;
                 cur_slot = -1;
@@ -521,7 +630,7 @@ static void usb_root_ports_poll_one(usb_log_tag log_tag,
                 int existing = usb_root_find_device_slot((struct usb_controller *)ctrl, port);
                 if (existing >= 0) {
                     st->slot[port] = (int16_t)existing;
-                    usb_log_port_event(log_tag, ci, port, "adopt-existing", pst, 0xFF);
+                    usb_log_port_event(log_source, LOGGER_LEVEL_INFO, ci, port, "adopt-existing", pst, 0xFF);
                 } else if (root_hub_port_reset(hub, port)) {
 
                     st->slot[port] = USB_ROOT_PORT_BUSY;
@@ -532,26 +641,26 @@ static void usb_root_ports_poll_one(usb_log_tag log_tag,
                     if (found >= 0) {
                         st->slot[port] = (int16_t)found;
                         st->mismatch_tries[port] = 0;
-                        usb_log_port_event(log_tag, ci, port, "connect", post, 0xFF);
+                        usb_log_port_event(log_source, LOGGER_LEVEL_INFO, ci, port, "connect", post, 0xFF);
                     } else {
                         st->slot[port] = -1;
-                        usb_log_port_event(log_tag, ci, port, "enum-failed", post, 0xFF);
+                        usb_log_port_event(log_source, LOGGER_LEVEL_WARNING, ci, port, "enum-failed", post, 0xFF);
                     }
                 } else if (is_ehci) {
 
                     root_hub_exec(hub, HUB_CMD_PORT_OWNER_SET, port, 0);
                     uint32_t post = root_hub_port_status(hub, port);
-                    usb_log_port_event(log_tag, ci, port, "owner->companion", post, 0xFF);
+                    usb_log_port_event(log_source, LOGGER_LEVEL_INFO, ci, port, "owner->companion", post, 0xFF);
                 } else {
                     uint32_t post = root_hub_port_status(hub, port);
-                    usb_log_port_event(log_tag, ci, port, "reset-failed", post, 0xFF);
+                    usb_log_port_event(log_source, LOGGER_LEVEL_WARNING, ci, port, "reset-failed", post, 0xFF);
                 }
             } else if (!connected && cur_slot >= 0) {
 
                 usb_hub_detach(cur_slot);
                 st->slot[port] = -1;
                 st->mismatch_tries[port] = 0;
-                usb_log_port_event(log_tag, ci, port, "disconnect", pst, 0xFF);
+                usb_log_port_event(log_source, LOGGER_LEVEL_INFO, ci, port, "disconnect", pst, 0xFF);
             }
 
             root_hub_clear_port_change(hub, port, change);
@@ -581,7 +690,7 @@ static void usb_root_ports_poll(void) {
     if (xhci && xhci->get_controller_count) {
         int cnt = xhci->get_controller_count();
 
-        usb_root_ports_poll_one(USB_LOG_XHCI, s_root_xhci, cnt, adapt_get_xhci,
+        usb_root_ports_poll_one(USB_PORT_LOG_XHCI, s_root_xhci, cnt, adapt_get_xhci,
                                  HUB_TYPE_XHCI, true, false,
                                  (1u << 17) | (1u << 18) | (1u << 19));
     }
@@ -590,7 +699,7 @@ static void usb_root_ports_poll(void) {
     if (ehci && ehci->get_controller_count) {
         int cnt = ehci->get_controller_count();
 
-        usb_root_ports_poll_one(USB_LOG_EHCI, s_root_ehci, cnt, adapt_get_ehci,
+        usb_root_ports_poll_one(USB_PORT_LOG_EHCI, s_root_ehci, cnt, adapt_get_ehci,
                                  HUB_TYPE_EHCI, false, true,
                                  (1u << 1));
     }
@@ -599,7 +708,7 @@ static void usb_root_ports_poll(void) {
     if (ohci && ohci->get_controller_count) {
         int cnt = ohci->get_controller_count();
 
-        usb_root_ports_poll_one(USB_LOG_OHCI, s_root_ohci, cnt, adapt_get_ohci,
+        usb_root_ports_poll_one(USB_PORT_LOG_OHCI, s_root_ohci, cnt, adapt_get_ohci,
                                  HUB_TYPE_OHCI, false, false,
                                  (1u << 16));
     }
@@ -608,7 +717,7 @@ static void usb_root_ports_poll(void) {
     if (uhci && uhci->get_controller_count) {
         int cnt = uhci->get_controller_count();
 
-        usb_root_ports_poll_one(USB_LOG_UHCI, s_root_uhci, cnt, adapt_get_uhci,
+        usb_root_ports_poll_one(USB_PORT_LOG_UHCI, s_root_uhci, cnt, adapt_get_uhci,
                                  HUB_TYPE_UHCI, false, false,
                                  (1u << 1));
     }
@@ -821,10 +930,9 @@ static void usb_parse_config(struct usb_device *dev, const uint8_t *cfg, uint16_
                 dev->device_protocol = i_protocol;
             }
 
-            usb_debug("USB: iface cls=", i_class, 1);
-            usb_debug("USB: iface sub=", i_subclass, 1);
-            usb_debug("USB: iface prt=", i_protocol, 1);
-            usb_debug("USB: in_hid=", in_hid, 1);
+            LOG_DEBUG("interface %u: class=0x%02x sub=0x%02x proto=0x%02x hid_boot=%d",
+                      (unsigned)cur_interface, (unsigned)i_class, (unsigned)i_subclass,
+                      (unsigned)i_protocol, (int)in_hid);
             if (in_hid) {
 
                 if (dev->device_class == 0x03 && dev->device_protocol == 0x01) {
@@ -910,12 +1018,17 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     dev->ctrl = (struct usb_controller *)ctrl_ptr;
     dev->root_port = root_port;
     dev->hub_depth = hub_depth;
-    usb_debug("USB: init port ", port, 1);
+    LOG_DEBUG("enumerating %s port %u (root %u, depth %u, route 0x%05x, parent slot %u)",
+              is_xhci ? "xHCI" : "legacy", (unsigned)port, (unsigned)root_port,
+              (unsigned)hub_depth, route_string, (unsigned)parent_hub_slot);
 
     if (is_xhci) {
         struct xhci_driver *x_drv = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
         int slot_id = x_drv->enable_slot((struct xhci_controller *)ctrl_ptr);
-        if (slot_id <= 0) goto fail;
+        if (slot_id <= 0) {
+            LOG_ERROR("port %u: xHCI Enable Slot failed (%d)", (unsigned)port, slot_id);
+            goto fail;
+        }
 
         uint32_t my_route = route_string;
         if (hub_depth > 0 && hub_depth <= 5)
@@ -932,6 +1045,7 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
 
         if (x_drv->address_device((struct xhci_controller *)ctrl_ptr,
             slot_id, &topo) != 0) {
+            LOG_ERROR("port %u: xHCI Address Device failed for slot %d", (unsigned)port, slot_id);
 
             if (x_drv->disable_slot)
                 x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
@@ -944,6 +1058,7 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         struct usb_setup_packet setup = {0x80, 0x06, 0x0100, 0, 18};
         if (x_drv->control_transfer((struct xhci_controller *)dev->ctrl,
             dev->address, 0, &setup, 8, desc_tmp, 18, 1) != 0) {
+            LOG_ERROR("slot %d: GET_DESCRIPTOR(device) failed", slot_id);
             if (x_drv->disable_slot)
                 x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
             goto fail;
@@ -951,12 +1066,16 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         for (int i = 0; i < 18; i++) ((uint8_t *)&dev->desc)[i] = desc_tmp[i];
 
         if (usb_validate_device_descriptor(&dev->desc) != 0) {
+            LOG_ERROR("slot %d: invalid device descriptor (bLength=%u mps0=%u)",
+                      slot_id, (unsigned)dev->desc.bLength, (unsigned)dev->desc.bMaxPacketSize0);
             if (x_drv->disable_slot)
                 x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
             goto fail;
         }
 
-        usb_debug("USB: VID:PID=", ((uint32_t)dev->desc.idVendor << 16) | dev->desc.idProduct, 1);
+        LOG_DEBUG("slot %d: VID:PID=%04x:%04x bcdUSB=%04x mps0=%u",
+                  slot_id, (unsigned)dev->desc.idVendor, (unsigned)dev->desc.idProduct,
+                  (unsigned)dev->desc.bcdUSB, (unsigned)dev->desc.bMaxPacketSize0);
     } else {
         dev->address = 0;
 
@@ -968,11 +1087,9 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         for (int retry = 0; retry < 5; retry++) {
             for (int i = 0; i < 8; i++) b8[i] = 0;
             last_xfer_ret = usb_control_transfer(dev, 0x80, 0x06, 0x0100, 0, 8, b8);
-            usb_debug("USB: GET_DESC8 ret=", (uint32_t)(last_xfer_ret & 0xFFFFFFFF), 1);
+            LOG_DEBUG("port %u: GET_DESCRIPTOR(8) try %d ret=%d len=%u type=%u mps0=%u",
+                      (unsigned)port, retry, last_xfer_ret, (unsigned)b8[0], (unsigned)b8[1], (unsigned)b8[7]);
             if (last_xfer_ret == 0) {
-                usb_debug("USB: b8[0]=", b8[0], 1);
-                usb_debug("USB: b8[1]=", b8[1], 1);
-                usb_debug("USB: b8[7]=", b8[7], 1);
                 uint32_t sum = 0;
                 for (int i = 0; i < 8; i++) sum |= b8[i];
                 if (sum != 0 && b8[1] == 0x01 && b8[0] == 18) {
@@ -986,22 +1103,21 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         }
 
         if (!got_desc) {
-            usb_debug("USB: FAIL got_desc=0 last_ret=", (uint32_t)(last_xfer_ret & 0xFFFFFFFF), 1);
-            usb_debug("USB: b8[0]=", b8[0], 1);
-            usb_debug("USB: b8[1]=", b8[1], 1);
+            LOG_ERROR("port %u: no valid device descriptor after 5 tries (ret=%d len=%u type=%u)",
+                      (unsigned)port, last_xfer_ret, (unsigned)b8[0], (unsigned)b8[1]);
             goto fail;
         }
 
         delay_ms(20);
         if (usb_next_address > 127) {
-            usb_debug("USB: FAIL out of USB addresses", 0, 1);
+            LOG_ERROR("port %u: out of USB addresses", (unsigned)port);
             goto fail;
         }
         uint8_t new_addr = usb_next_address++;
-        usb_debug("USB: SET_ADDR ", new_addr, 1);
+        LOG_DEBUG("port %u: SET_ADDRESS %u", (unsigned)port, (unsigned)new_addr);
         int sa_ret = usb_control_transfer(dev, 0x00, 0x05, new_addr, 0, 0, NULL);
         if (sa_ret != 0) {
-            usb_debug("USB: FAIL SET_ADDR ret=", (uint32_t)(sa_ret & 0xFFFFFFFF), 1);
+            LOG_ERROR("port %u: SET_ADDRESS %u failed (%d)", (unsigned)port, (unsigned)new_addr, sa_ret);
             goto fail;
         }
         dev->address = new_addr;
@@ -1013,9 +1129,8 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                 dev->is_low_speed = uhci_dev_is_ls[ki][0];
                 uhci_dev_is_ls[ki][new_addr & 0x7F] = uhci_dev_is_ls[ki][0];
                 uhci_dev_mps0[ki][new_addr & 0x7F] = (uint8_t)dev->max_packet_size;
-                usb_debug("LS save ki=", (uint32_t)ki, 1);
-                usb_debug("LS save addr=", (uint32_t)new_addr, 1);
-                usb_debug("LS save ls[0]=", (uint32_t)uhci_dev_is_ls[ki][0], 1);
+                LOG_DEBUG("uhci%d addr %u: low_speed=%u mps0=%u",
+                          ki, (unsigned)new_addr, (unsigned)uhci_dev_is_ls[ki][0], (unsigned)dev->max_packet_size);
             }
         }
 
@@ -1025,9 +1140,8 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                 dev->is_low_speed = ohci_dev_is_ls[ki][0];
                 ohci_dev_is_ls[ki][new_addr & 0x7F] = ohci_dev_is_ls[ki][0];
                 ohci_dev_mps0[ki][new_addr & 0x7F] = (uint8_t)dev->max_packet_size;
-                usb_debug("LS save ohci ki=", (uint32_t)ki, 1);
-                usb_debug("LS save ohci addr=", (uint32_t)new_addr, 1);
-                usb_debug("LS save ohci ls[0]=", (uint32_t)ohci_dev_is_ls[ki][0], 1);
+                LOG_DEBUG("ohci%d addr %u: low_speed=%u mps0=%u",
+                          ki, (unsigned)new_addr, (unsigned)ohci_dev_is_ls[ki][0], (unsigned)dev->max_packet_size);
             }
         }
 
@@ -1035,21 +1149,19 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         for (int i = 0; i < 18; i++) desc_full[i] = 0;
         int gd_ret = usb_control_transfer(dev, 0x80, 0x06, 0x0100, 0, 18, desc_full);
         if (gd_ret != 0) {
-            usb_debug("USB: FAIL GET_DESC18 ret=", (uint32_t)(gd_ret & 0xFFFFFFFF), 1);
+            LOG_ERROR("addr %u: GET_DESCRIPTOR(18) failed (%d)", (unsigned)dev->address, gd_ret);
             goto fail;
         }
         for (int i = 0; i < 18; i++) ((uint8_t *)&dev->desc)[i] = desc_full[i];
-        usb_debug("USB: desc bcdUSB=", dev->desc.bcdUSB, 1);
-        usb_debug("USB: desc mps0=", dev->desc.bMaxPacketSize0, 1);
-        usb_debug("USB: desc VID=", dev->desc.idVendor, 1);
-        usb_debug("USB: desc PID=", dev->desc.idProduct, 1);
         if (usb_validate_device_descriptor(&dev->desc) != 0) {
-            usb_debug("USB: FAIL validate bLen=", dev->desc.bLength, 1);
-            usb_debug("USB: FAIL validate mps=", dev->desc.bMaxPacketSize0, 1);
+            LOG_ERROR("addr %u: invalid device descriptor (bLength=%u mps0=%u)",
+                      (unsigned)dev->address, (unsigned)dev->desc.bLength, (unsigned)dev->desc.bMaxPacketSize0);
             goto fail;
         }
 
-        usb_debug("USB: VID:PID=", ((uint32_t)dev->desc.idVendor << 16) | dev->desc.idProduct, 1);
+        LOG_DEBUG("addr %u: VID:PID=%04x:%04x bcdUSB=%04x mps0=%u",
+                  (unsigned)dev->address, (unsigned)dev->desc.idVendor, (unsigned)dev->desc.idProduct,
+                  (unsigned)dev->desc.bcdUSB, (unsigned)dev->desc.bMaxPacketSize0);
     }
 
     dev->device_class = dev->desc.bDeviceClass;
@@ -1091,22 +1203,25 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         for (int i = 0; i < 9; i++) cfg_desc[i] = 0;
         cfg9_ret = usb_control_transfer(dev, 0x80, 0x06, (0x02 << 8), 0, 9, cfg_desc);
     }
-    usb_debug("USB: GET_CFG9 ret=", (uint32_t)(cfg9_ret & 0xFFFFFFFF), 1);
+    if (cfg9_ret != 0)
+        LOG_WARNING("addr %u: GET_DESCRIPTOR(config, 9) failed (%d)", (unsigned)dev->address, cfg9_ret);
     if (cfg9_ret == 0) {
         uint16_t total_len = cfg_desc[2] | ((uint16_t)cfg_desc[3] << 8);
-        usb_debug("USB: cfg total_len=", total_len, 1);
+        LOG_DEBUG("addr %u: configuration total length %u", (unsigned)dev->address, (unsigned)total_len);
         if (total_len > 256) total_len = 256;
 
         delay_ms(5);
         int cfgN_ret = usb_control_transfer(dev, 0x80, 0x06,
                                             (0x02 << 8), 0, total_len, cfg_desc);
-        usb_debug("USB: GET_CFGN ret=", (uint32_t)(cfgN_ret & 0xFFFFFFFF), 1);
         if (cfgN_ret == 0) {
             usb_parse_config(dev, cfg_desc, total_len);
-            usb_debug("USB: after parse cls=", (uint32_t)dev->device_class, 1);
-            usb_debug("USB: after parse sub=", (uint32_t)dev->device_subclass, 1);
-            usb_debug("USB: after parse prt=", (uint32_t)dev->device_protocol, 1);
-            usb_debug("USB: after parse ep=", (uint32_t)dev->endpoint_address, 1);
+            LOG_DEBUG("addr %u: class=0x%02x sub=0x%02x proto=0x%02x int_ep=0x%02x bulk_eps=%u iso_eps=%u",
+                      (unsigned)dev->address, (unsigned)dev->device_class, (unsigned)dev->device_subclass,
+                      (unsigned)dev->device_protocol, (unsigned)dev->endpoint_address,
+                      (unsigned)dev->bulk_ep_count, (unsigned)dev->iso_ep_count);
+        } else {
+            LOG_WARNING("addr %u: GET_DESCRIPTOR(config, %u) failed (%d)",
+                        (unsigned)dev->address, (unsigned)total_len, cfgN_ret);
         }
     }
 
@@ -1122,8 +1237,8 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
             sc_ret = usb_control_transfer(dev, 0x00, 0x09, config_value, 0, 0, NULL);
         }
         if (sc_ret != 0) {
-            usb_debug("USB: WARN SET_CONFIGURATION failed after retries, ret=",
-                      (uint32_t)(sc_ret & 0xFFFFFFFF), 1);
+            LOG_WARNING("addr %u: SET_CONFIGURATION %u failed after retries (%d)",
+                        (unsigned)dev->address, (unsigned)config_value, sc_ret);
         }
 
         if (sc_ret == 0) delay_ms(15);
@@ -1150,16 +1265,22 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     };
     usb_core_enqueue_event(&conn_evt);
 
+    LOG_INFO("device %04x:%04x at port %u addr %u: class 0x%02x/0x%02x/0x%02x \"%s\" \"%s\"",
+             (unsigned)dev->desc.idVendor, (unsigned)dev->desc.idProduct, (unsigned)port,
+             (unsigned)dev->address, (unsigned)dev->device_class, (unsigned)dev->device_subclass,
+             (unsigned)dev->device_protocol, dev->vendor_str, dev->product_str);
+
     if (dev->device_class == 0x09) {
-        usb_debug("USB: HUB detected, enumerating downstream ports", 0, 0);
+        LOG_INFO("hub detected at addr %u, enumerating downstream ports", (unsigned)dev->address);
 
         usb_hub_attach(dev, slot);
 
-        usb_debug("USB: HUB downstream enumeration done", 0, 0);
+        LOG_DEBUG("hub at addr %u: downstream enumeration done", (unsigned)dev->address);
     }
     return;
 
 fail:
+    LOG_WARNING("enumeration of port %u failed", (unsigned)port);
     { uint64_t flags = spin_lock_irqsave(&usb_core_lock);
     dev->valid = 0;
     spin_unlock_irqrestore(&usb_core_lock, flags); }
@@ -1178,8 +1299,7 @@ static void usb_scan_all_locked(void) {
     usb_root_ports_reset_state();
 
     delay_ms(500);
-    usb_debug("USB: scan EHCI/UHCI/XHCI", 0, 0);
-    usb_log_port_table_header();
+    LOG_INFO("scanning root ports (xHCI, EHCI, OHCI, UHCI)");
 
     struct xhci_driver *xhci = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
     if (xhci && xhci->get_controller_count) {
@@ -1203,10 +1323,7 @@ static void usb_scan_all_locked(void) {
                     uint32_t pst = root_hub_port_status(&hub, port);
                     if (pst & 0x01) {
 
-                        usb_logrow_begin(USB_LOG_XHCI, USB_LOG_TRACE);
-                        usb_logrow_str("pre-reset  USBSTS=");
-                        usb_logrow_hex32(xhci_read_current_usbsts());
-                        usb_logrow_end();
+                        LOG_DEBUG("xhci%d p%u pre-reset USBSTS=0x%08x", i, (unsigned)port, xhci_read_current_usbsts());
 
                         if (root_hub_port_reset(&hub, port)) {
 
@@ -1216,19 +1333,17 @@ static void usb_scan_all_locked(void) {
                             int found = usb_root_find_device_slot((struct usb_controller *)ctrl, port);
                             uint32_t post = root_hub_port_status(&hub, port);
                             usb_root_port_mark(s_root_xhci, i, port, (int16_t)found);
-                            usb_log_port_event(USB_LOG_XHCI, i, port,
+                            usb_log_port_event(USB_PORT_LOG_XHCI,
+                                (found >= 0) ? LOGGER_LEVEL_INFO : LOGGER_LEVEL_WARNING, i, port,
                                 (found >= 0) ? "connect" : "enum-failed",
                                 post, (uint8_t)((post >> 10) & 0xFu));
                         } else {
                             uint32_t post = root_hub_port_status(&hub, port);
-                            usb_log_port_event(USB_LOG_XHCI, i, port, "reset-failed",
+                            usb_log_port_event(USB_PORT_LOG_XHCI, LOGGER_LEVEL_WARNING, i, port, "reset-failed",
                                 post, (uint8_t)((post >> 10) & 0xFu));
                         }
 
-                        usb_logrow_begin(USB_LOG_XHCI, USB_LOG_TRACE);
-                        usb_logrow_str("post-reset USBSTS=");
-                        usb_logrow_hex32(xhci_read_current_usbsts());
-                        usb_logrow_end();
+                        LOG_DEBUG("xhci%d p%u post-reset USBSTS=0x%08x", i, (unsigned)port, xhci_read_current_usbsts());
                     }
             }
         }
@@ -1268,13 +1383,13 @@ static void usb_scan_all_locked(void) {
                 delay_ms(100);
                 pst = root_hub_port_status(&hub, port);
                 if (!(pst & 0x01)) {
-                    usb_log_port_event(USB_LOG_EHCI, i, port, "lost-after-reset", pst, 0xFF);
+                    usb_log_port_event(USB_PORT_LOG_EHCI, LOGGER_LEVEL_WARNING, i, port, "lost-after-reset", pst, 0xFF);
                     continue;
                 }
                 if (!(pst & (1u << 2))) {
 
                     root_hub_exec(&hub, HUB_CMD_PORT_OWNER_SET, port, 0);
-                    usb_log_port_event(USB_LOG_EHCI, i, port, "owner->companion", pst, 0xFF);
+                    usb_log_port_event(USB_PORT_LOG_EHCI, LOGGER_LEVEL_INFO, i, port, "owner->companion", pst, 0xFF);
                     continue;
                 }
                 usb_root_port_mark(s_root_ehci, i, port, USB_ROOT_PORT_BUSY);
@@ -1282,7 +1397,7 @@ static void usb_scan_all_locked(void) {
                 int after_slot = usb_root_find_device_slot((struct usb_controller *)ctrl, port);
                 usb_root_port_mark(s_root_ehci, i, port, (int16_t)after_slot);
                 pst = root_hub_port_status(&hub, port);
-                usb_log_port_event(USB_LOG_EHCI, i, port, "connect", pst, 0xFF);
+                usb_log_port_event(USB_PORT_LOG_EHCI, LOGGER_LEVEL_INFO, i, port, "connect", pst, 0xFF);
             }
         }
     }
@@ -1303,7 +1418,7 @@ static void usb_scan_all_locked(void) {
                 delay_ms(50);
                 pst = root_hub_port_status(&hub, port);
                 if (!(pst & 0x01)) {
-                    usb_log_port_event(USB_LOG_OHCI, i, port, "lost-after-reset", pst, 0xFF);
+                    usb_log_port_event(USB_PORT_LOG_OHCI, LOGGER_LEVEL_WARNING, i, port, "lost-after-reset", pst, 0xFF);
                     continue;
                 }
                 usb_root_port_mark(s_root_ohci, i, port, USB_ROOT_PORT_BUSY);
@@ -1311,7 +1426,7 @@ static void usb_scan_all_locked(void) {
                 int after_slot = usb_root_find_device_slot((struct usb_controller *)ctrl, port);
                 usb_root_port_mark(s_root_ohci, i, port, (int16_t)after_slot);
                 pst = root_hub_port_status(&hub, port);
-                usb_log_port_event(USB_LOG_OHCI, i, port, "connect", pst, 0xFF);
+                usb_log_port_event(USB_PORT_LOG_OHCI, LOGGER_LEVEL_INFO, i, port, "connect", pst, 0xFF);
             }
         }
     }
@@ -1337,7 +1452,7 @@ static void usb_scan_all_locked(void) {
 
                 pst = root_hub_port_status(&hub, port);
                 if (!(pst & 0x01)) {
-                    usb_log_port_event(USB_LOG_UHCI, i, port, "lost-after-reset", pst, 0xFF);
+                    usb_log_port_event(USB_PORT_LOG_UHCI, LOGGER_LEVEL_WARNING, i, port, "lost-after-reset", pst, 0xFF);
                     continue;
                 }
 
@@ -1346,7 +1461,7 @@ static void usb_scan_all_locked(void) {
                 int after_slot = usb_root_find_device_slot((struct usb_controller *)ctrl, port);
                 usb_root_port_mark(s_root_uhci, i, port, (int16_t)after_slot);
                 pst = root_hub_port_status(&hub, port);
-                usb_log_port_event(USB_LOG_UHCI, i, port, "connect", pst, 0xFF);
+                usb_log_port_event(USB_PORT_LOG_UHCI, LOGGER_LEVEL_INFO, i, port, "connect", pst, 0xFF);
             }
         }
     }
@@ -1363,7 +1478,7 @@ void usb_scan_all(void) {
         delay_ms(10);
     }
 
-    usb_debug("USB: scan skipped, controller busy", 0, 1);
+    LOG_WARNING("scan skipped, controller busy");
 }
 
 static struct usb_core_driver core = {

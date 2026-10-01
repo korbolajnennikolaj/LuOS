@@ -1,5 +1,6 @@
 #include "uhci_hub.h"
 
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/USB/uhci.h"
 
@@ -54,9 +55,12 @@ uint32_t uhci_hub_exec(struct uhci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
                     if (ci >= 0)
                         uhci_dev_is_ls[ci][0] = (r & PORTSC_LSDA) ? 1 : 0;
                     uhci_delay_ms(20);
+                    LOG_DEBUG("port %u reset OK after %d tries, %s speed device", port, tries + 1,
+                              (r & PORTSC_LSDA) ? "low" : "full");
                     return 1;
                 }
             }
+            LOG_WARNING("port %u: not enabled after reset, PORTSC=0x%04x", port, (unsigned)inw(addr));
             return 0;
         }
 

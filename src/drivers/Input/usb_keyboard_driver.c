@@ -1,6 +1,7 @@
 #include "usb_keyboard_driver.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
 #include "drivers/USB/xhci.h"
@@ -443,7 +444,10 @@ static bool usb_kbd_try_attach(struct usb_core_driver *core, struct usb_device *
         if (keyboards[k].active && keyboards[k].dev == dev) return false;
 
     int slot = find_free_kbd_slot();
-    if (slot < 0) return false;
+    if (slot < 0) {
+        LOG_WARNING("no free keyboard slot for addr %u (max %d)", (unsigned)dev->address, MAX_USB_KEYBOARDS);
+        return false;
+    }
 
     struct usb_keyboard_instance *kbd = &keyboards[slot];
     kbd->dev = dev;
@@ -460,17 +464,22 @@ static bool usb_kbd_try_attach(struct usb_core_driver *core, struct usb_device *
 
     delay_ms(5);
     ret = usb_kbd_class_request(core, dev, 0x21, HID_SET_PROTOCOL, 0x0000,
-                                 dev->hid_interface, 0, NULL); (void)ret;
+                                 dev->hid_interface, 0, NULL);
+    if (ret != 0) LOG_WARNING("addr %u: SET_PROTOCOL(boot) failed (%d)", (unsigned)dev->address, ret);
     ret = usb_kbd_class_request(core, dev, 0x21, HID_SET_IDLE, 0x0000,
-                                 dev->hid_interface, 0, NULL); (void)ret;
+                                 dev->hid_interface, 0, NULL);
+    if (ret != 0) LOG_DEBUG("addr %u: SET_IDLE failed (%d)", (unsigned)dev->address, ret);
     uint8_t led = 0;
     ret = usb_kbd_class_request(core, dev, 0x21, HID_SET_REPORT, 0x0200,
-                                dev->hid_interface, 1, &led); (void)ret;
+                                dev->hid_interface, 1, &led);
+    if (ret != 0) LOG_DEBUG("addr %u: SET_REPORT(LED) failed (%d)", (unsigned)dev->address, ret);
     uint8_t init_rep[8] = {0};
     ret = usb_kbd_class_request(core, dev, 0xA1, HID_GET_REPORT, 0x0100,
                                 dev->hid_interface, 8, init_rep);
     if (ret == 0)
         for (int j = 0; j < 8; j++) kbd->last_report[j] = init_rep[j];
+    else
+        LOG_DEBUG("addr %u: GET_REPORT failed (%d)", (unsigned)dev->address, ret);
 
     usb_event_register_handler_for_device(
         usb_kbd_on_event,
@@ -481,6 +490,9 @@ static bool usb_kbd_try_attach(struct usb_core_driver *core, struct usb_device *
     );
 
     if (slot == keyboard_count) keyboard_count++;
+    LOG_INFO("USB keyboard %d attached: addr %u, interface %u, ep 0x%02x, mps %u, interval %u",
+             slot, (unsigned)dev->address, (unsigned)dev->hid_interface,
+             (unsigned)kbd->endpoint_address, (unsigned)kbd->max_packet_size, (unsigned)dev->hid_interval);
     return true;
 }
 
@@ -499,6 +511,7 @@ static void usb_kbd_on_usb_event(const usb_event_t *evt, void *ctx) {
     if (evt->type == USB_EVENT_DEVICE_DISC) {
         for (int k = 0; k < keyboard_count; k++) {
             if (keyboards[k].active && keyboards[k].dev == evt->device) {
+                LOG_INFO("USB keyboard %d detached", k);
                 keyboards[k].active = false;
                 keyboards[k].pending = false;
                 keyboards[k].dev = NULL;
@@ -570,7 +583,10 @@ struct usb_keyboard_driver *return_usb_keyboard_driver(void) {
     ext_tail = 0;
 
     struct usb_core_driver *core = get_self_driver(USB_DRIVER, USB_CORE_SLOT);
-    if (!core || !core->control_transfer) return &drv;
+    if (!core || !core->control_transfer) {
+        LOG_ERROR("USB core unavailable, USB keyboards disabled");
+        return &drv;
+    }
 
     for (int i = 0; i < MAX_USB_DEVICES; i++) {
         struct usb_device *dev = (struct usb_device *)device_table[USB_DEVICE][i];
@@ -581,6 +597,7 @@ struct usb_keyboard_driver *return_usb_keyboard_driver(void) {
     usb_event_register_handler(usb_kbd_on_usb_event, NULL);
 
     if (keyboard_count > 0) usb_kbd_set_leds(false, false, false);
+    LOG_INFO("%d USB keyboard(s) at boot, hotplug handler registered", keyboard_count);
     return &drv;
 }
 

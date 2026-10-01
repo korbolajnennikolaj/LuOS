@@ -1,5 +1,6 @@
 #include "ohci_hub.h"
 
+#include "components/logger.h"
 #include "drivers/USB/ohci.h"
 #include "kernel/limine.h"
 
@@ -53,10 +54,14 @@ uint32_t ohci_hub_exec(struct ohci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
             int timeout = 200;
             while (timeout-- > 0) {
                 s = ohci_mmio_read(c, reg);
-                if (s == 0xFFFFFFFFu) return 0;
+                if (s == 0xFFFFFFFFu) {
+                    LOG_WARNING("port %u: controller stopped responding during reset", port);
+                    return 0;
+                }
                 if (s & PORT_PRSC) break;
                 ohci_delay_ms(1);
             }
+            if (timeout <= 0) LOG_WARNING("port %u: reset did not complete, status 0x%08x", port, s);
 
             ohci_mmio_write(c, reg, PORT_PRSC);
             ohci_delay_ms(20);
@@ -69,13 +74,17 @@ uint32_t ohci_hub_exec(struct ohci_hub* hub, enum USB_HUB_CMD cmd, uint32_t port
                 ohci_delay_ms(10);
                 s = ohci_mmio_read(c, reg);
             }
-            if (!(s & PORT_PES)) return 0;
+            if (!(s & PORT_PES)) {
+                LOG_WARNING("port %u: not enabled after reset, status 0x%08x", port, s);
+                return 0;
+            }
 
             int ci = ohci_controller_index(c);
             uint8_t is_ls = (uint8_t)((s & PORT_LSDA) ? 1 : 0);
             c->is_low_speed = is_ls;
             if (ci >= 0) ohci_dev_is_ls[ci][0] = is_ls;
 
+            LOG_DEBUG("port %u reset OK, %s speed device", port, is_ls ? "low" : "full");
             return 1;
         }
 

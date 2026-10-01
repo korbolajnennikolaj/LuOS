@@ -3,6 +3,7 @@
 #include "service_usb_hotplug.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "kernel/scheduler/scheduler.h"
 
@@ -25,6 +26,7 @@ static void keyboard_updater_entry(void *arg) {
     if (kbd && kbd->claim_pump) kbd->claim_pump();
 
     bool claimed = (kbd != NULL);
+    if (!kbd) LOG_WARNING("virtual keyboard not available yet");
 
     while (!service_stop_requested(svc->id)) {
         if (!kbd) {
@@ -39,7 +41,12 @@ static void keyboard_updater_entry(void *arg) {
 
         if (kbd) {
             if (kbd->keyboard_handler) kbd->keyboard_handler();
-            if (kbd->get_active_type) keyboard_updater_type = kbd->get_active_type();
+            if (kbd->get_active_type) {
+                int type = kbd->get_active_type();
+                if (type != keyboard_updater_type)
+                    LOG_INFO("active keyboard: %s", type == USB_KEYBOARD ? "USB" : type == PS2_KEYBOARD ? "PS/2" : "none");
+                keyboard_updater_type = type;
+            }
         }
 
         keyboard_updater_heartbeat++;
@@ -54,7 +61,11 @@ static bool keyboard_updater_update(void *arg) {
     (void)arg;
     if (keyboard_updater_last_beat_ms == 0) return true;
     if (usb_hotplug_busy()) return true;
-    return (service_uptime_ms() - keyboard_updater_last_beat_ms) < KEYBOARD_UPDATER_WATCHDOG_MS;
+    uint64_t silent = service_uptime_ms() - keyboard_updater_last_beat_ms;
+    if (silent < KEYBOARD_UPDATER_WATCHDOG_MS) return true;
+    LOG_WARNING("keyboard pump silent for %llu ms (watchdog %u ms)",
+                (unsigned long long)silent, KEYBOARD_UPDATER_WATCHDOG_MS);
+    return false;
 }
 
 int keyboard_updater_active_type(void) {

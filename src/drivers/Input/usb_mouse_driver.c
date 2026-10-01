@@ -1,6 +1,7 @@
 #include "usb_mouse_driver.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
@@ -197,7 +198,10 @@ static bool usb_mouse_try_attach(struct usb_core_driver *core, struct usb_device
         if (mice[i].active && mice[i].dev == dev) return false;
 
     int slot = find_free_mouse_slot();
-    if (slot < 0) return false;
+    if (slot < 0) {
+        LOG_WARNING("no free mouse slot for addr %u (max %d)", (unsigned)dev->address, MAX_USB_MICE);
+        return false;
+    }
 
     struct usb_mouse_instance *m = &mice[slot];
     m->dev = dev;
@@ -208,10 +212,12 @@ static bool usb_mouse_try_attach(struct usb_core_driver *core, struct usb_device
     for (int j = 0; j < 8; j++) m->dma_report[j] = 0;
 
     delay_ms(5);
-    usb_mouse_class_request(core, dev, 0x21, HID_SET_PROTOCOL,
+    int proto_ret = usb_mouse_class_request(core, dev, 0x21, HID_SET_PROTOCOL,
                              0x0000, dev->hid_interface, 0, NULL);
-    usb_mouse_class_request(core, dev, 0x21, HID_SET_IDLE,
+    if (proto_ret != 0) LOG_WARNING("addr %u: SET_PROTOCOL(boot) failed (%d)", (unsigned)dev->address, proto_ret);
+    int idle_ret = usb_mouse_class_request(core, dev, 0x21, HID_SET_IDLE,
                              0x0000, dev->hid_interface, 0, NULL);
+    if (idle_ret != 0) LOG_DEBUG("addr %u: SET_IDLE failed (%d)", (unsigned)dev->address, idle_ret);
 
     usb_event_register_handler_for_device(
         usb_mouse_event_handler,
@@ -224,8 +230,12 @@ static bool usb_mouse_try_attach(struct usb_core_driver *core, struct usb_device
     int ret = core->interrupt_transfer(m->dev, m->endpoint_address,
                                        m->dma_report, 8, 1);
     if (ret == -2) m->pending = true;
+    else if (ret != 0) LOG_WARNING("addr %u: first interrupt transfer failed (%d)", (unsigned)dev->address, ret);
 
     if (slot == mouse_count) mouse_count++;
+    LOG_INFO("USB mouse %d attached: addr %u, interface %u, ep 0x%02x, mps %u, protocol %u",
+             slot, (unsigned)dev->address, (unsigned)dev->hid_interface,
+             (unsigned)m->endpoint_address, (unsigned)m->max_packet_size, (unsigned)dev->device_protocol);
     return true;
 }
 
@@ -242,6 +252,7 @@ static void usb_mouse_on_usb_event(const usb_event_t *evt, void *ctx) {
     if (evt->type == USB_EVENT_DEVICE_DISC) {
         for (int i = 0; i < mouse_count; i++) {
             if (mice[i].active && mice[i].dev == evt->device) {
+                LOG_INFO("USB mouse %d detached", i);
                 mice[i].active = false;
                 mice[i].pending = false;
                 mice[i].dev = NULL;
@@ -253,7 +264,10 @@ static void usb_mouse_on_usb_event(const usb_event_t *evt, void *ctx) {
 static void mouse_init(void) {
     mouse_count = 0;
     struct usb_core_driver *core = get_self_driver(USB_DRIVER, USB_CORE_SLOT);
-    if (!core) return;
+    if (!core) {
+        LOG_ERROR("USB core unavailable, USB mice disabled");
+        return;
+    }
 
     for (int i = 0; i < MAX_USB_DEVICES; i++) {
         struct usb_device *dev = (struct usb_device *)device_table[USB_DEVICE][i];
@@ -262,6 +276,7 @@ static void mouse_init(void) {
     }
 
     usb_event_register_handler(usb_mouse_on_usb_event, NULL);
+    LOG_INFO("%d USB mouse/mice at boot, hotplug handler registered", mouse_count);
 }
 
 static struct usb_mouse_driver drv_usb_mouse = {

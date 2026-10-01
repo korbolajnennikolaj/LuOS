@@ -2,6 +2,9 @@
 #define PANIC_H
 
 #include <stdint.h>
+#include "components/logger.h"
+
+#define PANIC_MAX_LOG_PRINT_SIZE 5
 
 enum panic_code{
     PANIC_CODE_GENERAL = 0,

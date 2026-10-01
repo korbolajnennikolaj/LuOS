@@ -1,6 +1,7 @@
 #include "usb_msc_driver.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Storage/block_device.h"
 #include "drivers/Storage/partition.h"
 #include "drivers/Timer/timer.h"
@@ -8,7 +9,6 @@
 #include "drivers/USB/usb_controller.h"
 #include "drivers/USB/usb_core.h"
 #include "drivers/USB/usb_event.h"
-#include "drivers/Video/limine_video_driver.h"
 #include "kernel/scheduler/scheduler.h"
 #include "kernel/scheduler/spinlock.h"
 
@@ -103,112 +103,38 @@ static uint8_t g_scsi_buf[96] __attribute__((aligned(64)));
 #define MSC_XFER_CHUNK_XHCI 32768u
 static uint8_t g_dma_buf[MSC_DMA_CHUNK] __attribute__((aligned(65536)));
 
-#define MSC_COL_INFO 0x00AAFFAA
-#define MSC_COL_ERR 0x00FF4444
-#define MSC_COL_DATA 0x00FFFF00
-#define MSC_COL_OK 0x0044FF44
-#define MSC_COL_DBG 0x00AAAAFF
-#define MSC_COL_TRACE 0x00888888
-#define MSC_COL_WARN 0x00FFAA00
-#define MSC_COL_SEP 0x00666666
-
-#define MSC_COL_NOTE 0x0088DDFF
-
 static int g_msc_verbose = 0;
-static int g_msc_line_muted = 0;
-static int g_msc_at_line_start = 1;
+
+#define MSC_TRACE(...) do { if (g_msc_verbose) LOG_DEBUG(__VA_ARGS__); } while (0)
+#define MSC_HEXDUMP(prefix, buf, len) do { if (g_msc_verbose) msc_hexdump(__func__, (prefix), (buf), (len)); } while (0)
 
 int usb_msc_set_verbose(int on)
 {
     int prev = g_msc_verbose;
     g_msc_verbose = on ? 1 : 0;
-    g_msc_line_muted = 0;
-    g_msc_at_line_start = 1;
+    LOG_INFO("per-command tracing %s", g_msc_verbose ? "enabled" : "disabled");
     return prev;
 }
 
-static int msc_color_is_quiet_worthy(uint32_t color)
+int usb_msc_get_verbose(void)
 {
-    return color == MSC_COL_ERR || color == MSC_COL_WARN ||
-           color == MSC_COL_NOTE;
+    return g_msc_verbose;
 }
 
-static void msc_puts(const char *s, uint32_t color)
+static void msc_hexdump(const char *caller, const char *prefix, const uint8_t *buf, uint16_t len)
 {
-    if (!s) return;
+    static const char h[] = "0123456789abcdef";
+    char line[3 * 64 + 1];
+    size_t pos = 0;
 
-    if (!g_msc_verbose) {
-        if (g_msc_at_line_start)
-            g_msc_line_muted = !msc_color_is_quiet_worthy(color);
-
-        int ends_line = 0;
-        for (const char *p = s; *p; p++) ends_line = (*p == '\n');
-        int muted = g_msc_line_muted;
-        g_msc_at_line_start = ends_line;
-
-        if (muted) return;
+    for (uint16_t i = 0; i < len && pos + 3 < sizeof(line); i++) {
+        if (i > 0) line[pos++] = ' ';
+        line[pos++] = h[(buf[i] >> 4) & 0xF];
+        line[pos++] = h[buf[i] & 0xF];
     }
+    line[pos] = '\0';
 
-    struct limine_video_driver *v =
-    (struct limine_video_driver *)get_self_driver(LIMINE_VIDEO_DRIVER, 0);
-    if (v && v->printf) v->printf(s, color);
-}
-
-static void msc_hex8(uint8_t v, uint32_t col)
-{
-    static const char h[] = "0123456789ABCDEF";
-    char buf[5] = "0x00";
-    buf[2] = h[(v >> 4) & 0xF];
-    buf[3] = h[v & 0xF];
-    buf[4] = '\0';
-    msc_puts(buf, col);
-}
-
-static void msc_hex16(uint16_t v, uint32_t col)
-{
-    static const char h[] = "0123456789ABCDEF";
-    char buf[7] = "0x0000";
-    buf[2] = h[(v >> 12) & 0xF];
-    buf[3] = h[(v >> 8) & 0xF];
-    buf[4] = h[(v >> 4) & 0xF];
-    buf[5] = h[v & 0xF];
-    buf[6] = '\0';
-    msc_puts(buf, col);
-}
-
-static void msc_hex32(uint32_t v, uint32_t col)
-{
-    static const char h[] = "0123456789ABCDEF";
-    char buf[11] = "0x00000000";
-    for (int i = 9; i >= 2; i--) { buf[i] = h[v & 0xF]; v >>= 4; }
-    buf[10] = '\0';
-    msc_puts(buf, col);
-}
-
-static void msc_dec(uint64_t v, uint32_t col)
-{
-    char buf[21]; int i = 20; buf[20] = '\0';
-    if (v == 0) { msc_puts("0", col); return; }
-    while (v > 0 && i > 0) { buf[--i] = (char)('0' + v % 10); v /= 10; }
-    msc_puts(buf + i, col);
-}
-
-static void msc_hexdump(const char *prefix, const uint8_t *buf, uint16_t len, uint32_t col)
-{
-    msc_puts(prefix, col);
-    msc_puts("[", MSC_COL_TRACE);
-    for (uint16_t i = 0; i < len; i++) {
-        if (i > 0) msc_puts(" ", MSC_COL_TRACE);
-        msc_hex8(buf[i], col);
-    }
-    msc_puts("]\n", MSC_COL_TRACE);
-}
-
-static void msc_sep(const char *label)
-{
-    msc_puts("--- ", MSC_COL_SEP);
-    msc_puts(label, MSC_COL_SEP);
-    msc_puts(" ---\n", MSC_COL_SEP);
+    logger_printf(LOGGER_LEVEL_DEBUG, caller, "%s[%s]", prefix, line);
 }
 
 static inline uint32_t be32(uint32_t v)
@@ -226,11 +152,11 @@ static void msc_check_fatal_usbsts(void)
 {
     uint32_t sts = xhci_get_last_usbsts();
     if (sts & ((1u << 0) | (1u << 2) | (1u << 14))) {
-        msc_puts("[MSC]  !!! CONTROLLER HALTED (", MSC_COL_ERR);
-        if (sts & (1u << 2)) msc_puts("HSE ", MSC_COL_ERR);
-        if (sts & (1u << 14)) msc_puts("HCE ", MSC_COL_ERR);
-        if (sts & (1u << 0)) msc_puts("HCH ", MSC_COL_ERR);
-        msc_puts(") - fatal, needs full xHC reset, not endpoint recovery !!!\n", MSC_COL_ERR);
+        LOG_ERROR("controller halted (%s%s%s), USBSTS=0x%08x - fatal, needs full xHC reset, not endpoint recovery",
+                  (sts & (1u << 2)) ? "HSE " : "",
+                  (sts & (1u << 14)) ? "HCE " : "",
+                  (sts & (1u << 0)) ? "HCH" : "",
+                  sts);
     }
 }
 
@@ -245,7 +171,7 @@ static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t l
 {
     struct usb_core_driver *core = get_usb_core();
     if (!core->bulk_transfer) {
-        msc_puts("[MSC] msc_bulk: ERR bulk_transfer==NULL\n", MSC_COL_ERR);
+        LOG_ERROR("usb core has no bulk_transfer");
         return MSC_XFER_ERROR;
     }
 
@@ -272,11 +198,7 @@ static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t l
     if (ret == 0) return MSC_XFER_OK;
 
     if (ret == -2) {
-        msc_puts("[MSC]  bulk TIMEOUT after ", MSC_COL_ERR);
-        msc_dec(attempts, MSC_COL_DATA);
-        msc_puts(" polls, ep=", MSC_COL_ERR);
-        msc_hex8(endpoint, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        LOG_ERROR("bulk timeout after %d polls, ep=0x%02x, len=%u", attempts, (unsigned)endpoint, (unsigned)len);
 
         if (core->reset_endpoint_toggle)
             core->reset_endpoint_toggle(d->usb_dev, endpoint);
@@ -284,22 +206,13 @@ static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t l
     }
 
     if (ret == -1) {
-        msc_puts("[MSC]  bulk STALL after ", MSC_COL_WARN);
-        msc_dec(attempts, MSC_COL_DATA);
-        msc_puts(" polls, ep=", MSC_COL_WARN);
-        msc_hex8(endpoint, MSC_COL_DATA);
-        msc_puts(" cc=", MSC_COL_WARN);
-        msc_dec((uint64_t)(int32_t)xhci_get_last_error_code(), MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_WARN);
+        LOG_WARNING("bulk stall after %d polls, ep=0x%02x, cc=%d",
+                    attempts, (unsigned)endpoint, xhci_get_last_error_code());
         msc_check_fatal_usbsts();
         return MSC_XFER_STALL;
     }
 
-    msc_puts("[MSC]  bulk ERR ret=", MSC_COL_ERR);
-    msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-    msc_puts(" ep=", MSC_COL_ERR);
-    msc_hex8(endpoint, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_ERR);
+    LOG_ERROR("bulk error ret=%d ep=0x%02x", ret, (unsigned)endpoint);
     return MSC_XFER_ERROR;
 }
 
@@ -307,95 +220,62 @@ static int msc_control(usb_msc_device_t *d, uint8_t type, uint8_t req, uint16_t 
 {
     struct usb_core_driver *core = get_usb_core();
     if (!core->control_transfer) {
-        msc_puts("[MSC]  control_transfer==NULL\n", MSC_COL_ERR);
+        LOG_ERROR("usb core has no control_transfer");
         return MSC_ERR_IO;
     }
 
-    msc_puts("[MSC]  ctrl type=", MSC_COL_TRACE);
-    msc_hex8(type, MSC_COL_DATA);
-    msc_puts(" req=", MSC_COL_TRACE);
-    msc_hex8(req, MSC_COL_DATA);
-    msc_puts(" val=", MSC_COL_TRACE);
-    msc_hex16(val, MSC_COL_DATA);
-    msc_puts(" idx=", MSC_COL_TRACE);
-    msc_hex16(idx, MSC_COL_DATA);
-    msc_puts(" len=", MSC_COL_TRACE);
-    msc_dec(len, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_TRACE);
+    MSC_TRACE("ctrl type=0x%02x req=0x%02x val=0x%04x idx=0x%04x len=%u",
+              (unsigned)type, (unsigned)req, (unsigned)val, (unsigned)idx, (unsigned)len);
 
     int ret = core->control_transfer(d->usb_dev, type, req, val, idx, len, data);
 
     if (ret != 0) {
-        msc_puts("[MSC]  ctrl ERR ret=", MSC_COL_WARN);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts(" xhci_cc=", MSC_COL_WARN);
-        msc_dec((uint64_t)(int32_t)xhci_get_last_error_code(), MSC_COL_DATA);
-        msc_puts(" USBSTS=", MSC_COL_WARN);
-        msc_hex32(xhci_get_last_usbsts(), MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_WARN);
+        LOG_WARNING("ctrl type=0x%02x req=0x%02x failed ret=%d xhci_cc=%d USBSTS=0x%08x",
+                    (unsigned)type, (unsigned)req, ret, xhci_get_last_error_code(), xhci_get_last_usbsts());
         msc_check_fatal_usbsts();
     } else {
-        msc_puts("[MSC]  ctrl OK\n", MSC_COL_TRACE);
+        MSC_TRACE("ctrl OK");
     }
     return ret;
 }
 
 static void msc_bot_reset(usb_msc_device_t *d)
 {
-    msc_sep("BOT RESET");
-    msc_puts("[MSC] BOT Reset: step 1/4 — Mass Storage Reset (class req)\n",
-             MSC_COL_INFO);
-    int r1 = msc_control(d, 0x21, USB_MSC_REQ_RESET, 0, 0, 0, NULL);
-    msc_puts("[MSC] BOT Reset: step1 result=", MSC_COL_DBG);
-    msc_dec((uint64_t)(int32_t)r1, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+    LOG_WARNING("BOT reset on addr %u (ep_in=0x%02x ep_out=0x%02x)",
+                (unsigned)(d->usb_dev ? d->usb_dev->address : 0),
+                (unsigned)d->ep_bulk_in, (unsigned)d->ep_bulk_out);
 
-    msc_puts("[MSC] BOT Reset: step 2/4 — Clear STALL Bulk-IN ep=",
-             MSC_COL_INFO);
-    msc_hex8(d->ep_bulk_in, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+    int r1 = msc_control(d, 0x21, USB_MSC_REQ_RESET, 0, 0, 0, NULL);
+    LOG_DEBUG("step 1/4 Mass Storage Reset result=%d", r1);
+
     int r2 = msc_control(d, 0x02, 0x01 , 0x0000,
                          d->ep_bulk_in, 0, NULL);
-    msc_puts("[MSC] BOT Reset: step2 result=", MSC_COL_DBG);
-    msc_dec((uint64_t)(int32_t)r2, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+    LOG_DEBUG("step 2/4 Clear STALL Bulk-IN ep=0x%02x result=%d", (unsigned)d->ep_bulk_in, r2);
 
     if (delay_ms) delay_ms(10);
 
-    msc_puts("[MSC] BOT Reset: step 3/4 — Clear STALL Bulk-OUT ep=",
-             MSC_COL_INFO);
-    msc_hex8(d->ep_bulk_out, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
     int r3 = msc_control(d, 0x02, 0x01 , 0x0000,
                          d->ep_bulk_out, 0, NULL);
-    msc_puts("[MSC] BOT Reset: step3 result=", MSC_COL_DBG);
-    msc_dec((uint64_t)(int32_t)r3, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+    LOG_DEBUG("step 3/4 Clear STALL Bulk-OUT ep=0x%02x result=%d", (unsigned)d->ep_bulk_out, r3);
 
-    msc_puts("[MSC] BOT Reset: step 4/4 — reset toggle DATA0\n", MSC_COL_INFO);
     {
         struct usb_core_driver *_core = get_usb_core();
         if (_core->reset_endpoint_toggle) {
             _core->reset_endpoint_toggle(d->usb_dev, d->ep_bulk_out);
-            msc_puts("[MSC] BOT Reset:   toggle OUT reset OK\n", MSC_COL_DBG);
             _core->reset_endpoint_toggle(d->usb_dev, d->ep_bulk_in);
-            msc_puts("[MSC] BOT Reset:   toggle IN  reset OK\n", MSC_COL_DBG);
+            LOG_DEBUG("step 4/4 data toggles reset to DATA0");
         } else {
-            msc_puts("[MSC] BOT Reset: WARN reset_endpoint_toggle not available\n",
-                     MSC_COL_WARN);
+            LOG_WARNING("step 4/4 reset_endpoint_toggle not available");
         }
     }
 
-    msc_puts("[MSC] BOT Reset: sleeping 50ms...\n", MSC_COL_DBG);
     if (delay_ms) delay_ms(50);
-    msc_puts("[MSC] BOT Reset: done\n", MSC_COL_OK);
+    LOG_DEBUG("BOT reset done");
 }
 
 static void msc_clear_halt(usb_msc_device_t *d, uint8_t ep)
 {
-    msc_puts("[MSC]  clear halt ep=", MSC_COL_WARN);
-    msc_hex8(ep, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_WARN);
+    LOG_WARNING("clear halt ep=0x%02x", (unsigned)ep);
 
     msc_control(d, 0x02, 0x01, 0x0000, ep, 0, NULL);
 
@@ -412,15 +292,8 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
 
     msc_bot_enter();
 
-    msc_puts("[MSC]  execute: CDB len=", MSC_COL_DBG);
-    msc_dec(cmd_len, MSC_COL_DATA);
-    msc_puts(" cmd=", MSC_COL_DBG);
-    msc_hex8(cmd[0], MSC_COL_DATA);
-    msc_puts(" dir=", MSC_COL_DBG);
-    msc_puts((direction == CBW_FLAGS_IN) ? "IN" : "OUT", MSC_COL_DATA);
-    msc_puts(" data_len=", MSC_COL_DBG);
-    msc_dec(data_len, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+    MSC_TRACE("CDB len=%u cmd=0x%02x dir=%s data_len=%u",
+              (unsigned)cmd_len, (unsigned)cmd[0], (direction == CBW_FLAGS_IN) ? "IN" : "OUT", data_len);
 
     uint32_t tag = ++d->cbw_tag;
 
@@ -433,15 +306,14 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
     for (int i = 0; i < 16; i++)
         g_cbw.CBWCB[i] = (i < cmd_len) ? cmd[i] : 0;
 
-    msc_hexdump("[MSC]  CBW bytes: ", (const uint8_t *)&g_cbw,
-                sizeof(g_cbw), MSC_COL_TRACE);
+    MSC_HEXDUMP("CBW bytes: ", (const uint8_t *)&g_cbw, sizeof(g_cbw));
 
     int xr = msc_bulk(d, d->ep_bulk_out, &g_cbw, sizeof(g_cbw), 0);
     if (xr != MSC_XFER_OK) {
 
         if (xr == MSC_XFER_STALL) msc_clear_halt(d, d->ep_bulk_out);
 
-        msc_puts("[MSC]  CBW not accepted, BOT reset\n", MSC_COL_ERR);
+        LOG_ERROR("CBW for cmd 0x%02x not accepted, BOT reset", (unsigned)cmd[0]);
         msc_bot_reset(d);
         msc_bot_leave();
         return MSC_ERR_IO;
@@ -458,7 +330,7 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
             msc_clear_halt(d, ep);
         } else if (xr != MSC_XFER_OK) {
 
-            msc_puts("[MSC]  data phase unrecoverable, BOT reset\n", MSC_COL_ERR);
+            LOG_ERROR("data phase of cmd 0x%02x unrecoverable, BOT reset", (unsigned)cmd[0]);
             msc_bot_reset(d);
             msc_bot_leave();
             return MSC_ERR_IO;
@@ -481,49 +353,38 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
     }
 
     if (cr != MSC_XFER_OK) {
-        msc_puts("[MSC]  CSW recv FAILED\n", MSC_COL_ERR);
+        LOG_ERROR("CSW receive for cmd 0x%02x failed", (unsigned)cmd[0]);
         msc_bot_reset(d);
         msc_bot_leave();
         return MSC_ERR_IO;
     }
 
-    msc_hexdump("[MSC]  CSW bytes: ", (const uint8_t *)&g_csw,
-                sizeof(g_csw), MSC_COL_TRACE);
+    MSC_HEXDUMP("CSW bytes: ", (const uint8_t *)&g_csw, sizeof(g_csw));
 
     if (g_csw.dCSWSignature != CSW_SIGNATURE || g_csw.dCSWTag != tag) {
-        msc_puts("[MSC]  CSW invalid: sig=", MSC_COL_ERR);
-        msc_hex32(g_csw.dCSWSignature, MSC_COL_DATA);
-        msc_puts(" tag=", MSC_COL_ERR);
-        msc_hex32(g_csw.dCSWTag, MSC_COL_DATA);
-        msc_puts(" want=", MSC_COL_ERR);
-        msc_hex32(tag, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        LOG_ERROR("CSW invalid: sig=0x%08x tag=0x%08x want=0x%08x",
+                  g_csw.dCSWSignature, g_csw.dCSWTag, tag);
         msc_bot_reset(d);
         msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     if (g_csw.bCSWStatus == CSW_STATUS_PHASE_ERROR) {
-        msc_puts("[MSC]  CSW phase error, BOT reset\n", MSC_COL_ERR);
+        LOG_ERROR("CSW phase error on cmd 0x%02x, BOT reset", (unsigned)cmd[0]);
         msc_bot_reset(d);
         msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     if (g_csw.bCSWStatus != CSW_STATUS_GOOD) {
-        msc_puts("[MSC]  CSW status=", MSC_COL_WARN);
-        msc_hex8(g_csw.bCSWStatus, MSC_COL_DATA);
-        msc_puts(" residue=", MSC_COL_WARN);
-        msc_hex32(g_csw.dCSWDataResidue, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_WARN);
+        LOG_WARNING("cmd 0x%02x CSW status=0x%02x residue=%u",
+                    (unsigned)cmd[0], (unsigned)g_csw.bCSWStatus, g_csw.dCSWDataResidue);
         msc_bot_leave();
         return MSC_ERR_IO;
     }
 
     if (g_csw.dCSWDataResidue != 0) {
-        msc_puts("[MSC]  short transfer, residue=", MSC_COL_DBG);
-        msc_hex32(g_csw.dCSWDataResidue, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_DBG);
+        MSC_TRACE("short transfer, residue=%u", g_csw.dCSWDataResidue);
     }
 
     msc_bot_leave();
@@ -533,41 +394,28 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
 static int msc_scsi_inquiry(usb_msc_device_t *d)
 {
     msc_bot_enter();
-    msc_sep("SCSI INQUIRY");
     uint8_t cdb[6] = { SCSI_INQUIRY, 0, 0, 0, 36, 0 };
-    msc_puts("[MSC] INQUIRY: CDB alloc_len=36\n", MSC_COL_DBG);
+    LOG_DEBUG("INQUIRY alloc_len=36");
     for (int i = 0; i < 36; i++) g_scsi_buf[i] = 0;
 
     int ret = msc_execute(d, cdb, 6, g_scsi_buf, 36, CBW_FLAGS_IN);
     if (ret != 0) {
-        msc_puts("[MSC] INQUIRY FAILED ret=", MSC_COL_ERR);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        LOG_ERROR("INQUIRY failed ret=%d", ret);
         msc_bot_leave();
         return ret;
     }
 
-    msc_hexdump("[MSC] INQUIRY raw: ", g_scsi_buf, 36, MSC_COL_TRACE);
+    MSC_HEXDUMP("INQUIRY raw: ", g_scsi_buf, 36);
 
     scsi_inquiry_data_t *inq = (scsi_inquiry_data_t *)g_scsi_buf;
-
-    msc_puts("[MSC] INQUIRY peripheral_type=", MSC_COL_DBG);
-
-    msc_puts(" removable=", MSC_COL_DBG);
-    msc_puts((inq->removable & 0x80) ? "YES" : "NO", MSC_COL_DATA);
-    msc_puts(" version=", MSC_COL_DBG);
-    msc_hex8(inq->version, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
 
     char vendor[9] = {0}, product[17] = {0}, revision[5] = {0};
     for (int i = 0; i < 8; i++) vendor[i] = inq->vendor_id[i];
     for (int i = 0; i < 16; i++) product[i] = inq->product_id[i];
     for (int i = 0; i < 4; i++) revision[i] = inq->product_rev[i];
 
-    msc_puts("[MSC] INQUIRY vendor=", MSC_COL_NOTE); msc_puts(vendor, MSC_COL_DATA);
-    msc_puts(" product=", MSC_COL_INFO); msc_puts(product, MSC_COL_DATA);
-    msc_puts(" revision=", MSC_COL_INFO); msc_puts(revision, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+    LOG_INFO("INQUIRY vendor=\"%s\" product=\"%s\" revision=\"%s\" removable=%s version=0x%02x",
+             vendor, product, revision, (inq->removable & 0x80) ? "yes" : "no", (unsigned)inq->version);
 
     msc_bot_leave();
 
@@ -576,36 +424,29 @@ static int msc_scsi_inquiry(usb_msc_device_t *d)
 
 static int msc_scsi_test_unit_ready(usb_msc_device_t *d)
 {
-    msc_puts("[MSC] TEST UNIT READY\n", MSC_COL_DBG);
     uint8_t cdb[6] = { SCSI_TEST_UNIT_READY, 0, 0, 0, 0, 0 };
     int ret = msc_execute(d, cdb, 6, NULL, 0, CBW_FLAGS_OUT);
     if (ret == 0)
-        msc_puts("[MSC] TEST UNIT READY: device is ready\n", MSC_COL_OK);
-    else {
-        msc_puts("[MSC] TEST UNIT READY: device NOT ready ret=", MSC_COL_DBG);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_WARN);
-    }
+        LOG_DEBUG("TEST UNIT READY: device is ready");
+    else
+        LOG_DEBUG("TEST UNIT READY: device not ready ret=%d", ret);
     return ret;
 }
 
 static int msc_scsi_request_sense(usb_msc_device_t *d)
 {
     msc_bot_enter();
-    msc_puts("[MSC] REQUEST SENSE\n", MSC_COL_DBG);
     uint8_t cdb[6] = { SCSI_REQUEST_SENSE, 0, 0, 0, 18, 0 };
     for (int i = 0; i < 18; i++) g_scsi_buf[i] = 0;
 
     int ret = msc_execute(d, cdb, 6, g_scsi_buf, 18, CBW_FLAGS_IN);
     if (ret != 0) {
-        msc_puts("[MSC] REQUEST SENSE failed ret=", MSC_COL_ERR);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        LOG_ERROR("REQUEST SENSE failed ret=%d", ret);
         msc_bot_leave();
         return ret;
     }
 
-    msc_hexdump("[MSC] SENSE raw: ", g_scsi_buf, 18, MSC_COL_TRACE);
+    MSC_HEXDUMP("SENSE raw: ", g_scsi_buf, 18);
 
     scsi_sense_data_t *s = (scsi_sense_data_t *)g_scsi_buf;
 
@@ -619,30 +460,23 @@ static int msc_scsi_request_sense(usb_msc_device_t *d)
         "ABORTED_COMMAND","?","VOLUME_OVERFLOW","MISCOMPARE","?"
     };
 
-    msc_puts("[MSC] SENSE response_code=", MSC_COL_INFO);
-    msc_hex8(resp_code, MSC_COL_DATA);
-    msc_puts(" sense_key=", MSC_COL_INFO);
-    msc_hex8(sense_key, MSC_COL_DATA);
-    msc_puts(" (", MSC_COL_INFO);
-    msc_puts(sk_names[sense_key], MSC_COL_DATA);
-    msc_puts(") asc=", MSC_COL_INFO);
-    msc_hex8(s->asc, MSC_COL_DATA);
-    msc_puts(" ascq=", MSC_COL_INFO);
-    msc_hex8(s->ascq, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+    logger_printf((sense_key == 0x00 || sense_key == 0x06) ? LOGGER_LEVEL_DEBUG : LOGGER_LEVEL_WARNING, __func__,
+                  "SENSE response_code=0x%02x sense_key=0x%02x (%s) asc=0x%02x ascq=0x%02x",
+                  (unsigned)resp_code, (unsigned)sense_key, sk_names[sense_key],
+                  (unsigned)s->asc, (unsigned)s->ascq);
 
     if (s->asc == 0x04 && s->ascq == 0x01)
-        msc_puts("[MSC] SENSE: becoming ready (normal spinup)\n", MSC_COL_DBG);
+        LOG_DEBUG("SENSE: becoming ready (normal spinup)");
     else if (s->asc == 0x28 && s->ascq == 0x00)
-        msc_puts("[MSC] SENSE: medium changed (unit attention, expected)\n", MSC_COL_DBG);
+        LOG_DEBUG("SENSE: medium changed (unit attention, expected)");
     else if (s->asc == 0x3A)
-        msc_puts("[MSC] SENSE: medium not present!\n", MSC_COL_ERR);
+        LOG_ERROR("SENSE: medium not present");
     else if (s->asc == 0x20 && s->ascq == 0x00)
-        msc_puts("[MSC] SENSE: invalid command opcode\n", MSC_COL_ERR);
+        LOG_ERROR("SENSE: invalid command opcode");
     else if (s->asc == 0x24 && s->ascq == 0x00)
-        msc_puts("[MSC] SENSE: invalid field in CDB\n", MSC_COL_ERR);
+        LOG_ERROR("SENSE: invalid field in CDB");
     else if (sense_key == 0x00)
-        msc_puts("[MSC] SENSE: no sense (all good)\n", MSC_COL_OK);
+        LOG_DEBUG("SENSE: no sense (all good)");
 
     msc_bot_leave();
 
@@ -652,20 +486,17 @@ static int msc_scsi_request_sense(usb_msc_device_t *d)
 static int msc_scsi_read_capacity(usb_msc_device_t *d)
 {
     msc_bot_enter();
-    msc_sep("SCSI READ CAPACITY(10)");
     uint8_t cdb[10] = { SCSI_READ_CAPACITY_10, 0,0,0,0,0,0,0,0,0 };
     for (int i = 0; i < 8; i++) g_scsi_buf[i] = 0;
 
     int ret = msc_execute(d, cdb, 10, g_scsi_buf, 8, CBW_FLAGS_IN);
     if (ret != 0) {
-        msc_puts("[MSC] READ CAPACITY FAILED ret=", MSC_COL_ERR);
-        msc_dec((uint64_t)(int32_t)ret, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        LOG_ERROR("READ CAPACITY failed ret=%d", ret);
         msc_bot_leave();
         return ret;
     }
 
-    msc_hexdump("[MSC] READ CAPACITY raw: ", g_scsi_buf, 8, MSC_COL_TRACE);
+    MSC_HEXDUMP("READ CAPACITY raw: ", g_scsi_buf, 8);
 
     scsi_read_capacity_t *cap = (scsi_read_capacity_t *)g_scsi_buf;
 
@@ -674,27 +505,15 @@ static int msc_scsi_read_capacity(usb_msc_device_t *d)
     uint32_t last_lba = be32(last_lba_be);
     uint32_t blk_size = be32(blk_size_be);
 
-    msc_puts("[MSC] READ CAPACITY: raw_last_lba_be=", MSC_COL_DBG);
-    msc_hex32(last_lba_be, MSC_COL_DATA);
-    msc_puts(" raw_blk_size_be=", MSC_COL_DBG);
-    msc_hex32(blk_size_be, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
-
-    msc_puts("[MSC] READ CAPACITY: last_lba=", MSC_COL_DBG);
-    msc_hex32(last_lba, MSC_COL_DATA);
-    msc_puts(" blk_size=", MSC_COL_DBG);
-    msc_dec(blk_size, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
+    LOG_DEBUG("READ CAPACITY: last_lba=0x%08x blk_size=%u (raw 0x%08x 0x%08x)",
+              last_lba, blk_size, last_lba_be, blk_size_be);
 
     if (blk_size == 0) {
-        msc_puts("[MSC] WARN block_size=0 from device, defaulting to 512\n",
-                 MSC_COL_WARN);
+        LOG_WARNING("block_size=0 from device, defaulting to 512");
         blk_size = 512;
     }
     if (blk_size != 512 && blk_size != 4096) {
-        msc_puts("[MSC] WARN unusual block_size=", MSC_COL_WARN);
-        msc_dec(blk_size, MSC_COL_DATA);
-        msc_puts(" (expected 512 or 4096)\n", MSC_COL_WARN);
+        LOG_WARNING("unusual block_size=%u (expected 512 or 4096)", blk_size);
     }
 
     d->sector_count = (uint64_t)last_lba + 1;
@@ -703,19 +522,9 @@ static int msc_scsi_read_capacity(usb_msc_device_t *d)
     uint64_t size_mb = (d->sector_count * d->sector_size) >> 20;
     uint64_t size_gb = size_mb >> 10;
 
-    msc_puts("[MSC] capacity: sectors=", MSC_COL_INFO);
-    msc_dec(d->sector_count, MSC_COL_DATA);
-    msc_puts(" sector_size=", MSC_COL_INFO);
-    msc_dec(d->sector_size, MSC_COL_DATA);
-    msc_puts(" (~", MSC_COL_INFO);
-    if (size_gb > 0) {
-        msc_dec(size_gb, MSC_COL_DATA);
-        msc_puts(" GB", MSC_COL_INFO);
-    } else {
-        msc_dec(size_mb, MSC_COL_DATA);
-        msc_puts(" MB", MSC_COL_INFO);
-    }
-    msc_puts(")\n", MSC_COL_INFO);
+    LOG_DEBUG("capacity: sectors=%llu sector_size=%u (~%llu %s)",
+              (unsigned long long)d->sector_count, d->sector_size,
+              (unsigned long long)(size_gb > 0 ? size_gb : size_mb), size_gb > 0 ? "GB" : "MB");
 
     msc_bot_leave();
 
@@ -763,6 +572,8 @@ static int msc_blk_read(struct block_device *self, uint64_t lba, uint32_t count,
 
         int ret = msc_execute(d, cdb, 10, g_dma_buf, byte_len, CBW_FLAGS_IN);
         if (ret != 0) {
+            LOG_ERROR("%s: READ(10) lba=%llu count=%u failed ret=%d",
+                      self->name, (unsigned long long)cur_lba, n, ret);
             msc_scsi_request_sense(d);
             msc_bot_leave();
             return ret;
@@ -818,6 +629,8 @@ static int msc_blk_write(struct block_device *self, uint64_t lba, uint32_t count
 
         int ret = msc_execute(d, cdb, 10, g_dma_buf, byte_len, CBW_FLAGS_OUT);
         if (ret != 0) {
+            LOG_ERROR("%s: WRITE(10) lba=%llu count=%u failed ret=%d",
+                      self->name, (unsigned long long)cur_lba, n, ret);
             msc_scsi_request_sense(d);
             msc_bot_leave();
             return ret;
@@ -883,23 +696,18 @@ static void msc_init_device(struct usb_device *dev)
 
 static void msc_init_device_locked(struct usb_device *dev)
 {
-    msc_sep("MSC DEVICE INIT");
-
     int slot = find_free_msc_slot();
     if (slot < 0) {
-        msc_puts("[MSC] ERR: too many MSC devices (max=", MSC_COL_ERR);
-        msc_dec(USB_MSC_MAX_DEVICES, MSC_COL_DATA);
-        msc_puts(")\n", MSC_COL_ERR);
+        LOG_ERROR("too many MSC devices (max=%d)", USB_MSC_MAX_DEVICES);
         return;
     }
 
-    msc_puts("[MSC] found USB Mass Storage device addr=", MSC_COL_INFO);
-    msc_dec(dev->address, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
-
-    msc_puts("[MSC] USBSTS at MSC handoff (before any MSC request)=", MSC_COL_INFO);
-    msc_hex32(xhci_read_current_usbsts(), MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+    bool on_xhci = dev->ctrl && dev->ctrl->type == USB_TYPE_XHCI;
+    if (on_xhci)
+        LOG_INFO("initializing USB mass storage device addr=%u, USBSTS=0x%08x",
+                 (unsigned)dev->address, xhci_read_current_usbsts());
+    else
+        LOG_INFO("initializing USB mass storage device addr=%u", (unsigned)dev->address);
 
     usb_msc_device_t *d = &msc_devs[slot];
     for (int i = 0; i < (int)sizeof(usb_msc_device_t); i++)
@@ -910,72 +718,45 @@ static void msc_init_device_locked(struct usb_device *dev)
     d->cbw_tag = 0;
 
     d->max_xfer = MSC_XFER_CHUNK_DEFAULT;
-    if (dev->ctrl && dev->ctrl->type == USB_TYPE_XHCI)
+    if (on_xhci)
         d->max_xfer = MSC_XFER_CHUNK_XHCI;
 
-    msc_puts("[MSC] scanning bulk endpoints:\n", MSC_COL_DBG);
     for (int i = 0; i < dev->bulk_ep_count; i++) {
         struct usb_endpoint_info *ep = &dev->bulk_ep[i];
-        msc_puts("[MSC]   ep[", MSC_COL_TRACE);
-        msc_dec(i, MSC_COL_DATA);
-        msc_puts("] addr=", MSC_COL_TRACE);
-        msc_hex8(ep->address, MSC_COL_DATA);
-        msc_puts(" mps=", MSC_COL_TRACE);
-        msc_dec(ep->max_packet_size, MSC_COL_DATA);
-        msc_puts(" dir=", MSC_COL_TRACE);
-        msc_puts((ep->address & 0x80) ? "IN" : "OUT", MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_TRACE);
+        LOG_DEBUG("bulk ep[%d] addr=0x%02x mps=%u dir=%s", i, (unsigned)ep->address,
+                  (unsigned)ep->max_packet_size, (ep->address & 0x80) ? "IN" : "OUT");
 
         if ((ep->address & 0x80) && !d->ep_bulk_in) {
             d->ep_bulk_in = ep->address;
             d->ep_in_mps = ep->max_packet_size ? ep->max_packet_size : 512;
-            msc_puts("[MSC]   -> selected as Bulk-IN\n", MSC_COL_OK);
         } else if (!(ep->address & 0x80) && !d->ep_bulk_out) {
             d->ep_bulk_out = ep->address;
             d->ep_out_mps = ep->max_packet_size ? ep->max_packet_size : 512;
-            msc_puts("[MSC]   -> selected as Bulk-OUT\n", MSC_COL_OK);
         }
     }
 
     if (!d->ep_bulk_in || !d->ep_bulk_out) {
-        msc_puts("[MSC] ERR: bulk endpoints not found\n", MSC_COL_ERR);
-        msc_puts("[MSC]   Bulk-IN  found=", MSC_COL_ERR);
-        msc_puts(d->ep_bulk_in ? "YES" : "NO", MSC_COL_DATA);
-        msc_puts(" addr=", MSC_COL_ERR); msc_hex8(d->ep_bulk_in, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
-        msc_puts("[MSC]   Bulk-OUT found=", MSC_COL_ERR);
-        msc_puts(d->ep_bulk_out ? "YES" : "NO", MSC_COL_DATA);
-        msc_puts(" addr=", MSC_COL_ERR); msc_hex8(d->ep_bulk_out, MSC_COL_DATA);
-        msc_puts("\n", MSC_COL_ERR);
+        LOG_ERROR("bulk endpoints not found: IN=%s (0x%02x) OUT=%s (0x%02x)",
+                  d->ep_bulk_in ? "yes" : "no", (unsigned)d->ep_bulk_in,
+                  d->ep_bulk_out ? "yes" : "no", (unsigned)d->ep_bulk_out);
         return;
     }
 
-    msc_puts("[MSC] ep_in=", MSC_COL_INFO); msc_hex8(d->ep_bulk_in, MSC_COL_DATA);
-    msc_puts(" mps_in=", MSC_COL_INFO); msc_dec(d->ep_in_mps, MSC_COL_DATA);
-    msc_puts(" ep_out=", MSC_COL_INFO); msc_hex8(d->ep_bulk_out, MSC_COL_DATA);
-    msc_puts(" mps_out=", MSC_COL_INFO); msc_dec(d->ep_out_mps, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+    LOG_DEBUG("ep_in=0x%02x mps_in=%u ep_out=0x%02x mps_out=%u max_xfer=%u",
+              (unsigned)d->ep_bulk_in, (unsigned)d->ep_in_mps,
+              (unsigned)d->ep_bulk_out, (unsigned)d->ep_out_mps, d->max_xfer);
 
-    msc_sep("GET MAX LUN");
-    msc_puts("[MSC] USBSTS just before GET MAX LUN=", MSC_COL_INFO);
-    msc_hex32(xhci_read_current_usbsts(), MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
     {
         static uint8_t lun_buf[1] __attribute__((aligned(64)));
         lun_buf[0] = 0xFF;
-        msc_puts("[MSC] GET MAX LUN (bmReqType=0xA1, bReq=0xFE)\n", MSC_COL_DBG);
+        if (on_xhci) LOG_DEBUG("GET MAX LUN, USBSTS=0x%08x", xhci_read_current_usbsts());
+        else LOG_DEBUG("GET MAX LUN");
         int r = msc_control(d, 0xA1, USB_MSC_REQ_GET_MAX_LUN,
                             0, 0, 1, lun_buf);
-        if (r == 0) {
-            msc_puts("[MSC] max_lun=", MSC_COL_INFO);
-            msc_dec(lun_buf[0], MSC_COL_DATA);
-            msc_puts(" (using LUN 0)\n", MSC_COL_INFO);
-        } else {
-            msc_puts("[MSC] GET MAX LUN returned err=", MSC_COL_DBG);
-            msc_dec((uint64_t)(int32_t)r, MSC_COL_DATA);
-            msc_puts(" — device may not support it (normal for single-LUN)\n",
-                     MSC_COL_WARN);
-        }
+        if (r == 0)
+            LOG_DEBUG("max_lun=%u (using LUN 0)", (unsigned)lun_buf[0]);
+        else
+            LOG_DEBUG("GET MAX LUN returned %d, device may not support it (normal for single-LUN)", r);
     }
 
     if (delay_ms) delay_ms(50);
@@ -986,86 +767,64 @@ static void msc_init_device_locked(struct usb_device *dev)
         for (int inq_try = 0; inq_try < 5; inq_try++) {
             if (inq_try > 0) {
 
-                msc_puts("[MSC] INQUIRY retry ", MSC_COL_WARN);
-                msc_dec(inq_try + 1, MSC_COL_DATA);
-                msc_puts("/5\n", MSC_COL_WARN);
+                LOG_WARNING("INQUIRY retry %d/5", inq_try + 1);
                 if (delay_ms) delay_ms(100);
             }
             if (msc_scsi_inquiry(d) == 0) {
                 inq_ok = 1;
                 break;
             }
-            msc_puts("[MSC] INQUIRY attempt ", MSC_COL_WARN);
-            msc_dec(inq_try + 1, MSC_COL_DATA);
-            msc_puts(" failed\n", MSC_COL_WARN);
+            LOG_WARNING("INQUIRY attempt %d failed", inq_try + 1);
             if (delay_ms) delay_ms(50);
         }
         if (!inq_ok) {
 
-            msc_puts("[MSC] WARN: INQUIRY failed after 5 attempts — continuing without INQUIRY data\n", MSC_COL_WARN);
-            msc_puts("[MSC]   BOT Reset to recover\n", MSC_COL_WARN);
+            LOG_WARNING("INQUIRY failed after 5 attempts, continuing without INQUIRY data, BOT reset to recover");
             msc_bot_reset(d);
             if (delay_ms) delay_ms(200);
         }
     }
 
-    msc_sep("TEST UNIT READY loop");
     {
         int ready = 0;
         for (int attempt = 0; attempt < 10; attempt++) {
-            msc_puts("[MSC] TUR attempt ", MSC_COL_DBG);
-            msc_dec(attempt + 1, MSC_COL_DATA);
-            msc_puts("/10\n", MSC_COL_DBG);
+            LOG_DEBUG("TEST UNIT READY attempt %d/10", attempt + 1);
 
             if (msc_scsi_test_unit_ready(d) == 0) {
                 ready = 1;
-                msc_puts("[MSC] device ready on attempt ", MSC_COL_OK);
-                msc_dec(attempt + 1, MSC_COL_DATA);
-                msc_puts("\n", MSC_COL_OK);
+                LOG_DEBUG("device ready on attempt %d", attempt + 1);
                 break;
             }
-            msc_puts("[MSC] not ready, reading sense...\n", MSC_COL_DBG);
             msc_scsi_request_sense(d);
-            msc_puts("[MSC] waiting 100ms before retry\n", MSC_COL_DBG);
             if (delay_ms) delay_ms(100);
         }
         if (!ready) {
-            msc_puts("[MSC] ERR: device not ready after 10 attempts\n", MSC_COL_ERR);
-            msc_puts("[MSC]   device subclass=", MSC_COL_WARN);
-            msc_hex8(dev->device_subclass, MSC_COL_DATA);
-            msc_puts(" protocol=", MSC_COL_WARN);
-            msc_hex8(dev->device_protocol, MSC_COL_DATA);
-            msc_puts("\n", MSC_COL_WARN);
+            LOG_ERROR("device not ready after 10 attempts (subclass=0x%02x protocol=0x%02x)",
+                      (unsigned)dev->device_subclass, (unsigned)dev->device_protocol);
             return;
         }
     }
 
     if (msc_scsi_read_capacity(d) != 0) {
-        msc_puts("[MSC] ERR: READ CAPACITY failed\n", MSC_COL_ERR);
-        msc_puts("[MSC]   Trying REQUEST SENSE for diagnostics...\n", MSC_COL_WARN);
+        LOG_ERROR("READ CAPACITY failed, trying REQUEST SENSE for diagnostics");
         msc_scsi_request_sense(d);
         return;
     }
 
     if (d->sector_count == 0) {
-        msc_puts("[MSC] ERR: sector_count=0 (device reported empty medium?)\n",
-                 MSC_COL_ERR);
+        LOG_ERROR("sector_count=0 (device reported empty medium?)");
         return;
     }
 
-    msc_sep("SANITY CHECKS");
-    msc_puts("[MSC] sector_count=", MSC_COL_DBG); msc_dec(d->sector_count, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-    msc_puts("[MSC] sector_size=", MSC_COL_DBG); msc_dec(d->sector_size, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-    msc_puts("[MSC] ep_in_mps=", MSC_COL_DBG); msc_dec(d->ep_in_mps, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-    msc_puts("[MSC] ep_out_mps=", MSC_COL_DBG); msc_dec(d->ep_out_mps, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-    msc_puts("[MSC] cbw_tag=", MSC_COL_DBG); msc_hex32(d->cbw_tag, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
+    LOG_DEBUG("sanity: sector_count=%llu sector_size=%u ep_in_mps=%u ep_out_mps=%u cbw_tag=0x%08x",
+              (unsigned long long)d->sector_count, d->sector_size,
+              (unsigned)d->ep_in_mps, (unsigned)d->ep_out_mps, d->cbw_tag);
 
     if (d->sector_size % 512 != 0) {
-        msc_puts("[MSC] WARN sector_size not a multiple of 512!\n", MSC_COL_WARN);
+        LOG_WARNING("sector_size %u is not a multiple of 512", d->sector_size);
     }
 
     dev->driver_managed = 1;
-    msc_puts("[MSC] dev->driver_managed set to 1\n", MSC_COL_DBG);
 
     d->present = true;
 
@@ -1080,27 +839,16 @@ static void msc_init_device_locked(struct usb_device *dev)
     bd->write_sectors = msc_blk_write;
     bd->flush = msc_blk_flush;
 
-    msc_puts("[MSC] registering block_device name=", MSC_COL_DBG);
-    msc_puts(bd->name, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
-
     block_device_register(bd);
 
     partition_register_all(bd);
 
-    msc_puts("[MSC] registered -> ", MSC_COL_NOTE);
-    msc_puts(bd->name, MSC_COL_OK);
-    msc_puts(" sectors=", MSC_COL_INFO);
-    msc_dec(bd->sector_count, MSC_COL_DATA);
-    msc_puts(" sector_size=", MSC_COL_INFO);
-    msc_dec(bd->sector_size, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_OK);
-
     if (slot == msc_dev_count) msc_dev_count++;
     drv_usb_msc.disk_count = msc_dev_count;
-    msc_puts("[MSC] total USB MSC devices now: ", MSC_COL_INFO);
-    msc_dec(msc_dev_count, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+
+    LOG_INFO("registered %s: %llu sectors x %u bytes (%llu MB), %d USB disk(s) total",
+             bd->name, (unsigned long long)bd->sector_count, bd->sector_size,
+             (unsigned long long)((bd->sector_count * bd->sector_size) >> 20), msc_dev_count);
 }
 
 static void usb_msc_on_usb_event(const usb_event_t *evt, void *ctx)
@@ -1128,9 +876,7 @@ static void usb_msc_on_usb_event(const usb_event_t *evt, void *ctx)
                 partition_unregister_all(&msc_devs[j].blkdev);
                 block_device_unregister(&msc_devs[j].blkdev);
 
-                msc_puts("[MSC] device removed, unregistered ", MSC_COL_NOTE);
-                msc_puts(msc_devs[j].blkdev.name, MSC_COL_DATA);
-                msc_puts("\n", MSC_COL_WARN);
+                LOG_INFO("device removed, unregistered %s", msc_devs[j].blkdev.name);
             }
         }
     }
@@ -1138,34 +884,20 @@ static void usb_msc_on_usb_event(const usb_event_t *evt, void *ctx)
 
 static void msc_scan_devices(void)
 {
-    msc_sep("USB DEVICE SCAN");
-    msc_puts("[MSC] scanning USB devices for Mass Storage...\n", MSC_COL_INFO);
-
     extern int usb_get_device_count(void);
     extern struct usb_device *usb_get_device(int idx);
 
     int n = usb_get_device_count();
-    msc_puts("[MSC] usb_get_device_count()=", MSC_COL_DBG);
-    msc_dec((uint64_t)n, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_DBG);
-
-    if (n <= 0) {
-        msc_puts("[MSC] WARN: no USB devices found\n", MSC_COL_WARN);
-    }
+    LOG_DEBUG("scanning %d USB device(s) for mass storage", n);
 
     int msc_found = 0;
     for (int i = 0; i < n; i++) {
         struct usb_device *dev = usb_get_device(i);
-        if (!dev) {
-            msc_puts("[MSC]   slot ", MSC_COL_TRACE);
-            msc_dec(i, MSC_COL_DATA);
-            msc_puts(": NULL, skipping\n", MSC_COL_TRACE);
-            continue;
-        }
+        if (!dev) continue;
 
         bool is_msc = (dev->device_class == USB_CLASS_MSC);
-        msc_puts(is_msc ? " [MSC!]" : " [skip]", is_msc ? MSC_COL_OK : MSC_COL_TRACE);
-        msc_puts("\n", MSC_COL_TRACE);
+        LOG_DEBUG("slot %d: addr %u class 0x%02x %s", i, (unsigned)dev->address,
+                  (unsigned)dev->device_class, is_msc ? "mass storage" : "skip");
 
         if (!is_msc) continue;
         msc_found++;
@@ -1175,78 +907,50 @@ static void msc_scan_devices(void)
             if (msc_devs[j].usb_dev == dev) { already = true; break; }
         }
         if (already) {
-            msc_puts("[MSC]   already initialized, skipping\n", MSC_COL_TRACE);
+            LOG_DEBUG("slot %d already initialized, skipping", i);
             continue;
         }
 
         msc_init_device(dev);
     }
 
-    msc_puts("[MSC] scan done: found ", MSC_COL_INFO);
-    msc_dec(msc_found, MSC_COL_DATA);
-    msc_puts(" MSC device(s)\n", MSC_COL_INFO);
+    LOG_DEBUG("scan done: found %d mass storage device(s)", msc_found);
 }
 
 static void *msc_driver_init(void)
 {
-    msc_sep("USB MSC DRIVER INIT START");
-    msc_puts("[MSC] USB Mass Storage driver init\n", MSC_COL_INFO);
-    msc_puts("[MSC] compiled: " __DATE__ " " __TIME__ "\n", MSC_COL_TRACE);
-
-    msc_puts("[MSC] resolving delay_ms via TIMER_DRIVER/TSC_TIMER...\n", MSC_COL_DBG);
     {
         struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
         if (tsc) {
             delay_ms = tsc->sleep_tsc_ms;
             delay_us = tsc->sleep_tsc_us;
             uptime_ms = tsc->get_tsc_uptime_ms;
-            msc_puts("[MSC] delay_ms resolved OK (tsc=", MSC_COL_OK);
-            msc_hex32((uint32_t)(uintptr_t)tsc, MSC_COL_DATA);
-            msc_puts(")\n", MSC_COL_OK);
         } else {
-            msc_puts("[MSC] WARN: TSC driver not found, delay_ms=NULL — "
-            "polling may be unreliable\n", MSC_COL_WARN);
+            LOG_WARNING("TSC driver not found, delays unavailable, polling may be unreliable");
         }
     }
 
-    msc_puts("[MSC] resolving usb_core (USB_DRIVER/USB_CORE_SLOT)...\n", MSC_COL_DBG);
     {
         struct usb_core_driver *core = get_usb_core();
-        msc_puts("[MSC]   bulk_transfer=", MSC_COL_DBG);
-        msc_puts(core->bulk_transfer ? "OK" : "NULL!", core->bulk_transfer ? MSC_COL_OK : MSC_COL_ERR);
-        msc_puts("\n", MSC_COL_DBG);
-        msc_puts("[MSC]   control_transfer=", MSC_COL_DBG);
-        msc_puts(core->control_transfer ? "OK" : "NULL!", core->control_transfer ? MSC_COL_OK : MSC_COL_ERR);
-        msc_puts("\n", MSC_COL_DBG);
-        msc_puts("[MSC]   reset_endpoint_toggle=",MSC_COL_DBG);
-        msc_puts(core->reset_endpoint_toggle? "OK" : "NULL (toggle reset unavailable)",
-                 core->reset_endpoint_toggle? MSC_COL_OK : MSC_COL_WARN);
-        msc_puts("\n", MSC_COL_DBG);
+        if (!core->bulk_transfer) LOG_ERROR("usb core bulk_transfer is NULL");
+        if (!core->control_transfer) LOG_ERROR("usb core control_transfer is NULL");
+        if (!core->reset_endpoint_toggle) LOG_WARNING("usb core reset_endpoint_toggle is NULL, toggle reset unavailable");
     }
 
-    msc_puts("[MSC] zeroing device pool (max=", MSC_COL_DBG);
-    msc_dec(USB_MSC_MAX_DEVICES, MSC_COL_DATA);
-    msc_puts(")\n", MSC_COL_DBG);
     for (int i = 0; i < USB_MSC_MAX_DEVICES; i++)
         for (int j = 0; j < (int)sizeof(usb_msc_device_t); j++)
             ((uint8_t *)&msc_devs[i])[j] = 0;
     msc_dev_count = 0;
 
-    msc_puts("[MSC] DMA buffers:\n", MSC_COL_DBG);
-    msc_puts("[MSC]   g_cbw=", MSC_COL_DBG); msc_hex32((uint32_t)(uintptr_t)&g_cbw, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-    msc_puts("[MSC]   g_csw=", MSC_COL_DBG); msc_hex32((uint32_t)(uintptr_t)&g_csw, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-    msc_puts("[MSC]   g_scsi_buf=", MSC_COL_DBG); msc_hex32((uint32_t)(uintptr_t)&g_scsi_buf, MSC_COL_DATA); msc_puts("\n", MSC_COL_DBG);
-
     bool cbw_aligned = ((uintptr_t)&g_cbw & 63) == 0;
     bool csw_aligned = ((uintptr_t)&g_csw & 63) == 0;
     bool scsi_aligned = ((uintptr_t)&g_scsi_buf & 63) == 0;
-    msc_puts("[MSC]   alignment (64-byte): cbw=", MSC_COL_DBG);
-    msc_puts(cbw_aligned ? "OK" : "MISALIGNED!", cbw_aligned ? MSC_COL_OK : MSC_COL_ERR);
-    msc_puts(" csw=", MSC_COL_DBG);
-    msc_puts(csw_aligned ? "OK" : "MISALIGNED!", csw_aligned ? MSC_COL_OK : MSC_COL_ERR);
-    msc_puts(" scsi=", MSC_COL_DBG);
-    msc_puts(scsi_aligned ? "OK" : "MISALIGNED!", scsi_aligned ? MSC_COL_OK : MSC_COL_ERR);
-    msc_puts("\n", MSC_COL_DBG);
+    LOG_DEBUG("DMA buffers: cbw=0x%llx csw=0x%llx scsi=0x%llx",
+              (unsigned long long)(uintptr_t)&g_cbw, (unsigned long long)(uintptr_t)&g_csw,
+              (unsigned long long)(uintptr_t)&g_scsi_buf);
+    if (!cbw_aligned || !csw_aligned || !scsi_aligned)
+        LOG_ERROR("DMA buffers misaligned: cbw=%s csw=%s scsi=%s",
+                  cbw_aligned ? "OK" : "BAD", csw_aligned ? "OK" : "BAD", scsi_aligned ? "OK" : "BAD");
 
     msc_scan_devices();
 
@@ -1254,10 +958,7 @@ static void *msc_driver_init(void)
 
     usb_event_register_handler(usb_msc_on_usb_event, NULL);
 
-    msc_sep("USB MSC DRIVER INIT DONE");
-    msc_puts("[MSC] init done, usb disks found=", MSC_COL_INFO);
-    msc_dec((uint64_t)msc_dev_count, MSC_COL_DATA);
-    msc_puts("\n", MSC_COL_INFO);
+    LOG_INFO("USB mass storage driver ready, %d USB disk(s)", msc_dev_count);
 
     return (void *)1;
 }

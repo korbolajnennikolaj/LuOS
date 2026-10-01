@@ -1,6 +1,7 @@
 #include "components/pci.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/USB/usb_controller.h"
 
 #include <ports.h>
@@ -53,7 +54,11 @@ void pci_scan_devices(void) {
         for (int slot = 0; slot < 32; slot++) {
             for (int func = 0; func < 8; func++) {
 
-                if (pci_device_count >= MAX_PCI_DEVICES) return;
+                if (pci_device_count >= MAX_PCI_DEVICES) {
+                    LOG_WARNING("PCI device table full (%d), stopping scan at %02x:%02x.%x",
+                                MAX_PCI_DEVICES, bus, slot, func);
+                    return;
+                }
 
                 uint32_t vendor_device = pci_read_config(bus, slot, func, 0);
 
@@ -87,6 +92,11 @@ void pci_scan_devices(void) {
 
                 pci_enable_interrupts(dev);
 
+                LOG_DEBUG("%02x:%02x.%x %04x:%04x class %02x/%02x/%02x irq %u pin %u bar0 0x%08x",
+                          bus, slot, func, (unsigned)dev->vendor_id, (unsigned)dev->device_id,
+                          (unsigned)dev->class_code, (unsigned)dev->subclass, (unsigned)dev->prog_if,
+                          (unsigned)dev->irq_line, (unsigned)dev->irq_pin, dev->bar0);
+
                 if (dev->class_code == 0x0C && dev->subclass == 0x03) {
                     if (usb_controller_count < 8) {
                         struct usb_controller* usb = &usb_controllers[usb_controller_count++];
@@ -110,6 +120,11 @@ void pci_scan_devices(void) {
                             }
                         }
                         pci_enable_bus_mastering(dev);
+                        LOG_DEBUG("USB controller prog-if 0x%02x at %02x:%02x.%x, base 0x%llx (%s)",
+                                  (unsigned)dev->prog_if, bus, slot, func,
+                                  (unsigned long long)usb->base_addr, usb->is_io_space ? "io" : "mmio");
+                    } else {
+                        LOG_WARNING("more than 8 USB controllers, %02x:%02x.%x ignored", bus, slot, func);
                     }
                 }
 
@@ -158,5 +173,6 @@ void pci_init(void) {
     if (!initialized) {
         pci_scan_devices();
         initialized = true;
+        LOG_INFO("PCI scan found %d device(s), %d USB controller(s)", pci_device_count, usb_controller_count);
     }
 }

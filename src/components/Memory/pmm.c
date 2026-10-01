@@ -1,5 +1,6 @@
 #include "pmm.h"
 
+#include "components/logger.h"
 #include "kernel/limine.h"
 #include "kernel/scheduler/spinlock.h"
 
@@ -76,7 +77,10 @@ static void _pmm_reserve_region(uint64_t base, uint64_t length) {
 void pmm_init(void) {
     pmm_hhdm_offset = hhdm_req.response ? hhdm_req.response->offset : 0xffff800000000000ULL;
     struct limine_memmap_response *mm = memmap_req.response;
-    if (!mm) return;
+    if (!mm) {
+        LOG_ERROR("bootloader provided no memory map");
+        return;
+    }
 
     uint64_t highest_addr = 0;
     pmm_usable_total = 0;
@@ -85,6 +89,10 @@ void pmm_init(void) {
         struct limine_memmap_entry *e = mm->entries[i];
         uint64_t end = e->base + e->length;
         if (end > highest_addr) highest_addr = end;
+
+        LOG_DEBUG("memmap 0x%016llx-0x%016llx type %llu (%llu KiB)",
+                  (unsigned long long)e->base, (unsigned long long)(end - 1),
+                  (unsigned long long)e->type, (unsigned long long)(e->length / 1024));
 
         if (e->type == LIMINE_MEMMAP_USABLE ||
             e->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE ||
@@ -106,7 +114,11 @@ void pmm_init(void) {
         }
     }
 
-    if (!pmm_bitmap) return;
+    if (!pmm_bitmap) {
+        LOG_ERROR("no usable region large enough for the %llu byte frame bitmap",
+                  (unsigned long long)pmm_bitmap_size);
+        return;
+    }
 
     pmm_free = 0;
     _bitmap_fill();
@@ -133,6 +145,12 @@ void pmm_init(void) {
     }
 
     pmm_last_idx = 0;
+
+    LOG_INFO("PMM: %llu memmap entries, highest address 0x%llx, %llu MiB usable, %llu MiB free, bitmap %llu bytes",
+             (unsigned long long)mm->entry_count, (unsigned long long)highest_addr,
+             (unsigned long long)(pmm_usable_total * PAGE_SIZE / (1024 * 1024)),
+             (unsigned long long)(pmm_free * PAGE_SIZE / (1024 * 1024)),
+             (unsigned long long)pmm_bitmap_size);
 }
 
 static uint64_t pmm_alloc_page_impl(void) {
@@ -170,11 +188,15 @@ uint64_t pmm_alloc_page(void) {
     uint64_t flags = spin_lock_irqsave(&pmm_lock);
     uint64_t p = pmm_alloc_page_impl();
     spin_unlock_irqrestore(&pmm_lock, flags);
+    if (p == PMM_ALLOC_FAIL) LOG_WARNING("out of physical pages");
     return p;
 }
 
 uint64_t pmm_alloc_pages(uint64_t count) {
-    if (!pmm_bitmap || count == 0 || pmm_free < count) return PMM_ALLOC_FAIL;
+    if (!pmm_bitmap || count == 0 || pmm_free < count) {
+        LOG_WARNING("cannot allocate %llu page(s), %llu free", (unsigned long long)count, (unsigned long long)pmm_free);
+        return PMM_ALLOC_FAIL;
+    }
 
     uint64_t flags = spin_lock_irqsave(&pmm_lock);
 
@@ -206,6 +228,8 @@ uint64_t pmm_alloc_pages(uint64_t count) {
     }
 
     spin_unlock_irqrestore(&pmm_lock, flags);
+    LOG_WARNING("no %llu contiguous free pages (%llu free in total)",
+                (unsigned long long)count, (unsigned long long)pmm_free);
     return PMM_ALLOC_FAIL;
 }
 

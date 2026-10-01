@@ -2,6 +2,9 @@
 
 #include "tables.h"
 
+#include "components/logger.h"
+
+
 #include <stddef.h>
 
 static const ACPI_MADT *s_madt = NULL;
@@ -58,25 +61,49 @@ void madt_parse(const ACPI_MADT *madt) {
             case MADT_ENTRY_LOCAL_APIC:
                 if (s_cpu_count < MADT_MAX_CPUS) {
                     s_cpus[s_cpu_count++] = *(const ACPI_MADT_LOCAL_APIC *)e;
+                    LOG_DEBUG("LAPIC processor %u apic %u flags 0x%x",
+                              (unsigned)s_cpus[s_cpu_count - 1].ProcessorID,
+                              (unsigned)s_cpus[s_cpu_count - 1].APICID,
+                              s_cpus[s_cpu_count - 1].Flags);
+                } else {
+                    LOG_WARNING("more than %d CPUs in MADT, extra ignored", MADT_MAX_CPUS);
                 }
                 break;
 
             case MADT_ENTRY_IO_APIC:
                 if (s_ioapic_count < MADT_MAX_IOAPICS) {
                     s_ioapics[s_ioapic_count++] = *(const ACPI_MADT_IO_APIC *)e;
+                    LOG_DEBUG("IOAPIC id %u at 0x%x, GSI base %u",
+                              (unsigned)s_ioapics[s_ioapic_count - 1].IOAPICID,
+                              s_ioapics[s_ioapic_count - 1].IOAPICAddress,
+                              s_ioapics[s_ioapic_count - 1].GlobalSystemInterruptBase);
+                } else {
+                    LOG_WARNING("more than %d IOAPICs in MADT, extra ignored", MADT_MAX_IOAPICS);
                 }
                 break;
 
             case MADT_ENTRY_INTERRUPT_SOURCE_OVERRIDE:
                 if (s_iso_count < MADT_MAX_ISOS) {
                     s_isos[s_iso_count++] = *(const ACPI_MADT_INTERRUPT_SOURCE_OVERRIDE *)e;
+                    LOG_DEBUG("override bus %u IRQ %u -> GSI %u flags 0x%04x",
+                              (unsigned)s_isos[s_iso_count - 1].Bus,
+                              (unsigned)s_isos[s_iso_count - 1].Source,
+                              s_isos[s_iso_count - 1].GlobalSystemInterrupt,
+                              (unsigned)s_isos[s_iso_count - 1].Flags);
+                } else {
+                    LOG_WARNING("more than %d interrupt overrides in MADT, extra ignored", MADT_MAX_ISOS);
                 }
                 break;
 
             default:
+                LOG_DEBUG("entry type %u (%u bytes) not used", (unsigned)e->Type, (unsigned)e->Length);
                 break;
         }
     }
+
+    LOG_INFO("MADT: %d CPU(s), %d IOAPIC(s), %d override(s), LAPIC at 0x%x, legacy PIC %s",
+             s_cpu_count, s_ioapic_count, s_iso_count, madt->LocalAPICAddress,
+             madt_has_legacy_pic(madt) ? "present" : "absent");
 }
 
 int madt_get_cpu_count(void) { return s_cpu_count; }

@@ -1,5 +1,6 @@
 #include "rtc_driver.h"
 
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 #include "kernel/scheduler/spinlock.h"
 #include <kernel/limine.h>
@@ -112,6 +113,9 @@ static void init_rtc_once(void) {
 
     rtc_initialized = 1;
     spin_unlock(&rtc_lock);
+
+    LOG_WARNING("CMOS RTC returned invalid time 5 times, using %s fallback",
+                boot_time_req.response ? "Limine boot time" : "zero");
 }
 
 struct system_time* get_rtc_time(void) {
@@ -135,6 +139,10 @@ struct rtc_driver rtc_driver_loaded = {
 };
 
 struct rtc_driver* return_rtc_driver(void) {
+    struct system_time *t = get_rtc_time();
+    LOG_INFO("RTC time %04u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)t->year, (unsigned)t->month, (unsigned)t->day,
+             (unsigned)t->hours, (unsigned)t->minutes, (unsigned)t->seconds);
     return &rtc_driver_loaded;
 }
 

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "components/panic.h"
 #include "components/GDT/gdt.h"
 #include "drivers/Timer/timer.h"
@@ -16,6 +17,7 @@
 #include "drivers/Timer/hpet_driver.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Input/mouse_driver.h"
+#include "drivers/Serial/uart_driver.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "components/pci.h"
 #include "kernel/games.h"
@@ -24,7 +26,6 @@
 #include "drivers/Storage/ahci.h"
 #include "drivers/Storage/partition.h"
 #include "drivers/Storage/usb_msc_driver.h"
-#include "drivers/USB/usb_log.h"
 #include "fs/fs.h"
 #include "kernel/rootfs.h"
 #include "kernel/math_test.h"
@@ -2168,12 +2169,11 @@ static void cmd_usb_debug(limine_video_driver* video, const char* arg) {
     }
 
     if (want >= 0) {
-        usb_log_set_level(want ? USB_LOG_TRACE : USB_LOG_EVENT);
         usb_msc_set_verbose(want);
     }
 
     video->printf(" USB verbose logging: ", LIMINE_COLOR_LIGHT_GRAY);
-    if (usb_log_get_level() == USB_LOG_TRACE)
+    if (usb_msc_get_verbose())
         video->printf("on\n", LIMINE_COLOR_LIGHT_GREEN);
     else
         video->printf("off\n", LIMINE_COLOR_AMBER);
@@ -2536,6 +2536,204 @@ static void cmd_fs_stat(limine_video_driver *video, const char *arg) {
     printf_color(0xFFDDDDDD, "  Size: %llu bytes\n", (unsigned long long)st.size);
 }
 
+#define LOG_DUMP_STAGE_SIZE 4096
+
+static fs_file_t g_log_dump_file;
+static char g_log_dump_stage[LOG_DUMP_STAGE_SIZE];
+static size_t g_log_dump_staged = 0;
+static uint64_t g_log_dump_written = 0;
+static int g_log_dump_error = FS_OK;
+
+static void log_dump_flush(void) {
+    if (g_log_dump_staged == 0) return;
+    if (g_log_dump_error == FS_OK) {
+        int64_t n = fs_write(&g_log_dump_file, g_log_dump_stage, g_log_dump_staged);
+        if (n < 0) g_log_dump_error = (int)n;
+        else if ((size_t)n != g_log_dump_staged) g_log_dump_error = FS_ERR_NOSPACE;
+        else g_log_dump_written += (uint64_t)n;
+    }
+    g_log_dump_staged = 0;
+}
+
+static void log_dump_write(const char *message, size_t length) {
+    while (length > 0 && g_log_dump_error == FS_OK) {
+        size_t room = LOG_DUMP_STAGE_SIZE - g_log_dump_staged;
+        size_t n = (length < room) ? length : room;
+        memcpy(g_log_dump_stage + g_log_dump_staged, message, n);
+        g_log_dump_staged += n;
+        message += n;
+        length -= n;
+        if (g_log_dump_staged == LOG_DUMP_STAGE_SIZE) log_dump_flush();
+    }
+}
+
+static int str_ends_with_txt(const char *s) {
+    size_t len = strlen(s);
+    if (len < 4) return 0;
+    const char *ext = s + len - 4;
+    return ext[0] == '.' &&
+           (ext[1] == 't' || ext[1] == 'T') &&
+           (ext[2] == 'x' || ext[2] == 'X') &&
+           (ext[3] == 't' || ext[3] == 'T');
+}
+
+static void cmd_log_dump(limine_video_driver *video, const char *arg) {
+    (void)video;
+    char name[FS_MAX_PATH];
+
+    while (arg && *arg == ' ') arg++;
+    if (!arg || arg[0] == '\0') {
+        struct rtc_driver *rtc_drv = (struct rtc_driver *)get_self_driver(TIMER_DRIVER, RTC_TIMER);
+        struct system_time *t = rtc_drv ? rtc_drv->get_rtc_time() : NULL;
+        if (t)
+            snprintf(name, sizeof(name), "luos_log_%04u%02u%02u_%02u%02u%02u.txt",
+                     (unsigned)t->year, (unsigned)t->month, (unsigned)t->day,
+                     (unsigned)t->hours, (unsigned)t->minutes, (unsigned)t->seconds);
+        else
+            snprintf(name, sizeof(name), "luos_log.txt");
+    } else if (str_ends_with_txt(arg)) {
+        snprintf(name, sizeof(name), "%s", arg);
+    } else {
+        snprintf(name, sizeof(name), "%s.txt", arg);
+    }
+
+    char path[FS_MAX_PATH], rel[FS_MAX_PATH];
+    fs_t *fs = shell_path(name, NULL, path, sizeof(path), rel, sizeof(rel));
+    if (!fs) return;
+
+    int r = fs_open(fs, rel, true, true, &g_log_dump_file);
+    if (r != FS_OK) {
+        printf_color(0xFFFF5555, "log-dump: failed to create '%s' (code %d)\n", path, r);
+        LOG_ERROR("cannot create log dump file %s (%d)", path, r);
+        return;
+    }
+
+    LOG_DEBUG("dumping log buffer to %s", path);
+
+    g_log_dump_staged = 0;
+    g_log_dump_written = 0;
+    g_log_dump_error = FS_OK;
+
+    logger_dump_buffer_to_text(log_dump_write);
+    log_dump_flush();
+
+    int close_r = fs_close(&g_log_dump_file);
+    if (g_log_dump_error != FS_OK || close_r != FS_OK) {
+        int code = (g_log_dump_error != FS_OK) ? g_log_dump_error : close_r;
+        printf_color(0xFFFF5555, "log-dump: write to '%s' failed after %llu bytes (code %d)\n",
+                     path, (unsigned long long)g_log_dump_written, code);
+        LOG_ERROR("log dump to %s failed after %llu bytes (%d)", path, (unsigned long long)g_log_dump_written, code);
+        return;
+    }
+
+    printf_color(0xFF55FF55, "Log saved: %s (%llu bytes)\n", path, (unsigned long long)g_log_dump_written);
+    LOG_DEBUG("log dump saved to %s, %llu bytes", path, (unsigned long long)g_log_dump_written);
+}
+
+static void dmesg_write(const char *message, size_t length) {
+    struct limine_video_driver *v = (struct limine_video_driver *)get_self_driver(LIMINE_VIDEO_DRIVER, 0);
+    if (!v || !v->printf) return;
+
+    char chunk[LOGGER_DUMP_CHUNK_SIZE + 1];
+    while (length > 0) {
+        size_t n = (length < LOGGER_DUMP_CHUNK_SIZE) ? length : LOGGER_DUMP_CHUNK_SIZE;
+        memcpy(chunk, message, n);
+        chunk[n] = '\0';
+        v->printf(chunk, LIMINE_COLOR_LIGHT_GRAY);
+        message += n;
+        length -= n;
+    }
+}
+
+static void cmd_dmesg(limine_video_driver *video, const char *arg) {
+    (void)video;
+    while (arg && *arg == ' ') arg++;
+    if (arg && arg[0] != '\0') {
+        unsigned int count = parse_number(arg);
+        if (count == 0) {
+            printf_color(0xFFFF5555, "Usage: dmesg [last_lines]\n");
+            return;
+        }
+        logger_dump_last_to_text(count, dmesg_write);
+    } else {
+        logger_dump_buffer_to_text(dmesg_write);
+    }
+}
+
+static void cmd_log_status(limine_video_driver *video) {
+    (void)video;
+    struct uart_driver *uart = (struct uart_driver *)get_self_driver(SERIAL_DRIVER, UART_COM1);
+
+    printf_color(LIMINE_COLOR_CYAN, "=== Kernel Logger ===\n");
+    printf_color(0xFFDDDDDD, "  Format   : [timestamp] [level] [caller] message\n");
+    printf_color(0xFFDDDDDD, "  Buffer   : %llu / %u KiB used, %llu message(s), %llu byte(s) overwritten\n",
+                 (unsigned long long)(logger_buffer_used() / 1024), (unsigned)(LOGGER_BUFFER_SIZE / 1024),
+                 (unsigned long long)logger_message_count(), (unsigned long long)logger_dropped_bytes());
+    printf_color(0xFFDDDDDD, "  Levels   : buffer=%s uart=%s video=%s\n",
+                 logger_level_name(logger_get_level(LOGGER_OUTPUT_BUFFER)),
+                 logger_level_name(logger_get_level(LOGGER_OUTPUT_UART)),
+                 logger_level_name(logger_get_level(LOGGER_OUTPUT_VIDEO)));
+    if (uart && uart->is_present()) {
+        struct uart_stats stats;
+        uart->get_stats(&stats);
+        printf_color(0xFFDDDDDD, "  UART     : COM1 io 0x%x, %u baud, %s mode, %u byte FIFO\n",
+                     (unsigned)uart->get_io_base(), uart->get_baud_rate(),
+                     uart->get_mode_name(stats.mode), (unsigned)stats.fifo_size);
+        printf_color(0xFFDDDDDD, "  UART TX  : %llu / %u KiB pending (peak %llu KiB), %llu of %llu byte(s) sent, %llu IRQ(s), %llu stall(s)\n",
+                     (unsigned long long)(stats.pending / 1024), (unsigned)(stats.queue_size / 1024),
+                     (unsigned long long)(stats.peak_pending / 1024),
+                     (unsigned long long)stats.sent_bytes, (unsigned long long)stats.queued_bytes,
+                     (unsigned long long)stats.irq_count, (unsigned long long)stats.stalls);
+    } else
+        printf_color(0xFFDDDDDD, "  UART     : not present\n");
+    printf_color(0xFFDDDDDD, "  Panic    : last %d message(s) shown on the panic screen\n", PANIC_MAX_LOG_PRINT_SIZE);
+}
+
+static void cmd_log_level(limine_video_driver *video, const char *arg) {
+    char first[16], second[16];
+    size_t n = 0;
+
+    while (arg && *arg == ' ') arg++;
+    while (arg && arg[n] && arg[n] != ' ' && n < sizeof(first) - 1) { first[n] = arg[n]; n++; }
+    first[n] = '\0';
+
+    const char *p = arg ? arg + n : "";
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    n = 0;
+    while (p[n] && p[n] != ' ' && n < sizeof(second) - 1) { second[n] = p[n]; n++; }
+    second[n] = '\0';
+
+    if (first[0] == '\0') {
+        cmd_log_status(video);
+        return;
+    }
+
+    enum logger_output_t output = LOGGER_OUTPUT_VIDEO;
+    const char *level_name = first;
+    if (second[0] != '\0') {
+        if (str_cmp(first, "buffer") == 0) output = LOGGER_OUTPUT_BUFFER;
+        else if (str_cmp(first, "uart") == 0 || str_cmp(first, "serial") == 0) output = LOGGER_OUTPUT_UART;
+        else if (str_cmp(first, "video") == 0 || str_cmp(first, "screen") == 0) output = LOGGER_OUTPUT_VIDEO;
+        else {
+            printf_color(0xFFFF5555, "Usage: log-level [buffer|uart|video] <debug|info|warning|error>\n");
+            return;
+        }
+        level_name = second;
+    }
+
+    enum logger_level_t level;
+    if (!logger_level_from_name(level_name, &level)) {
+        printf_color(0xFFFF5555, "Unknown level '%s'. Use debug, info, warning or error.\n", level_name);
+        return;
+    }
+
+    static const char *const output_names[LOGGER_OUTPUT_COUNT] = { "buffer", "uart", "video" };
+    logger_set_level(output, level);
+    printf_color(0xFF55FF55, "Log level for %s set to %s\n", output_names[output], logger_level_name(level));
+    LOG_DEBUG("%s level set to %s", output_names[output], logger_level_name(level));
+}
+
 static void cmd_mouse_status(limine_video_driver *video) {
     (void)video;
 
@@ -2800,7 +2998,7 @@ static void shell_entry(void *arg) {
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "ram           - memory/heap info", "time          - current time");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "cpu           - CPU information", "pci           - PCI devices");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "usb-list      - USB devices", "disks         - block devices");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "partitions    - partition tables", "usb-debug on|off - USB trace log");
+            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "partitions    - partition tables", "usb-debug on|off - USB MSC command trace");
 
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Filesystem --\n");
             printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "mount NAME [POINT] - mount disk to POINT (default /)", "umount [POINT] - unmount POINT");
@@ -2856,6 +3054,9 @@ static void shell_entry(void *arg) {
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Power / Debug --\n");
 
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "poweroff      - shutdown system", "debug         - debug menu");
+            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log           - logger status and levels", "dmesg [N]     - kernel log (last N lines)");
+            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log-dump [FILE] - save kernel log to FILE.txt", "log-clear     - clear the log buffer");
+            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log-level [buffer|uart|video] LEVEL", "panic [MSG]   - trigger a kernel panic");
 
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Services --\n");
             printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "services      - service table", "service-start NAME - start service");
@@ -2887,6 +3088,18 @@ static void shell_entry(void *arg) {
         else if (str_cmp(cmd_buffer, "usb-list") == 0) { cmd_usb_list(video); }
         else if (str_cmp(cmd_buffer, "usb-debug") == 0) { cmd_usb_debug(video, ""); }
         else if (str_starts_with(cmd_buffer, "usb-debug ")) { cmd_usb_debug(video, cmd_buffer + 10); }
+        else if (str_cmp(cmd_buffer, "log") == 0) { cmd_log_status(video); }
+        else if (str_cmp(cmd_buffer, "log-level") == 0) { cmd_log_level(video, ""); }
+        else if (str_starts_with(cmd_buffer, "log-level ")) { cmd_log_level(video, cmd_buffer + 10); }
+        else if (str_cmp(cmd_buffer, "log-dump") == 0) { cmd_log_dump(video, ""); }
+        else if (str_starts_with(cmd_buffer, "log-dump ")) { cmd_log_dump(video, cmd_buffer + 9); }
+        else if (str_cmp(cmd_buffer, "log-clear") == 0) {
+            logger_clear_buffer();
+            video->printf("Log buffer cleared.\n", LIMINE_COLOR_AMBER);
+            LOG_DEBUG("log buffer cleared from shell");
+        }
+        else if (str_cmp(cmd_buffer, "dmesg") == 0) { cmd_dmesg(video, ""); }
+        else if (str_starts_with(cmd_buffer, "dmesg ")) { cmd_dmesg(video, cmd_buffer + 6); }
         else if (str_cmp(cmd_buffer, "disks") == 0) { get_list_disks(video); }
         else if (str_cmp(cmd_buffer, "partitions") == 0) { cmd_partitions(video); }
         else if (str_starts_with(cmd_buffer, "mount ")) { cmd_fs_mount(video, cmd_buffer + 6); }

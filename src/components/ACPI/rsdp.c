@@ -1,6 +1,7 @@
 #include "rsdp.h"
 
 #include "checksum.h"
+#include "components/logger.h"
 #include "components/Memory/mm.h"
 
 #include <stdbool.h>
@@ -58,10 +59,15 @@ static ACPI_RSDP *acpi_legacy_find_rsdp(void) {
 
     if (ebda_phys != 0) {
         ACPI_RSDP *found = acpi_scan_for_rsdp(ebda_phys, ebda_phys + 1024);
-        if (found) return found;
+        if (found) {
+            LOG_DEBUG("RSDP found in EBDA at 0x%llx", (unsigned long long)ebda_phys);
+            return found;
+        }
     }
 
-    return acpi_scan_for_rsdp(0xE0000, 0x100000);
+    ACPI_RSDP *found = acpi_scan_for_rsdp(0xE0000, 0x100000);
+    if (found) LOG_DEBUG("RSDP found in BIOS area 0xE0000-0xFFFFF");
+    return found;
 }
 
 ACPI_RSDP *acpi_find_rsdp(void) {
@@ -69,8 +75,12 @@ ACPI_RSDP *acpi_find_rsdp(void) {
     if (rsdp_request.response && rsdp_request.response->address) {
         ACPI_RSDP *rsdp = (ACPI_RSDP *)acpi_resolve_boot_ptr((uint64_t)rsdp_request.response->address);
         if (rsdp_looks_valid(rsdp)) {
+            LOG_DEBUG("RSDP from bootloader at 0x%llx, revision %u",
+                      (unsigned long long)(uint64_t)rsdp_request.response->address, (unsigned)rsdp->Revision);
             return rsdp;
         }
+        LOG_WARNING("bootloader RSDP at 0x%llx is invalid, scanning legacy areas",
+                    (unsigned long long)(uint64_t)rsdp_request.response->address);
     }
 
     return acpi_legacy_find_rsdp();

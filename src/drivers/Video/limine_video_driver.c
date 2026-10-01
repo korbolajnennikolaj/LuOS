@@ -2,6 +2,7 @@
 
 #include <components/drivers.h>
 #include "gop_font.h"
+#include "components/logger.h"
 #include "kernel/limine.h"
 #include "kernel/scheduler/spinlock.h"
 
@@ -310,8 +311,12 @@ static void limine_video_get_display_resolution(uint64_t* w, uint64_t* h) {
 }
 
 static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
-    if (!width || width > phys_width) return false;
-    if (!height || height > phys_height) return false;
+    if (!width || width > phys_width || !height || height > phys_height) {
+        LOG_WARNING("rejected resolution %llux%llu, framebuffer is %llux%llu",
+                    (unsigned long long)width, (unsigned long long)height,
+                    (unsigned long long)phys_width, (unsigned long long)phys_height);
+        return false;
+    }
 
     uint64_t flags = spin_lock_irqsave(&video_lock);
 
@@ -324,6 +329,10 @@ static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
     scroll_cache_init();
 
     spin_unlock_irqrestore(&video_lock, flags);
+
+    LOG_INFO("text area set to %llux%llu (%ux%u cells)%s",
+             (unsigned long long)width, (unsigned long long)height,
+             max_chars_x, max_chars_y, scroll_cache ? "" : ", no scroll cache");
     return true;
 }
 
@@ -339,8 +348,10 @@ struct limine_video_driver limine_loaded_driver = {
 
 struct limine_video_driver* return_limine_video_driver(void) {
     struct limine_framebuffer_request* req = get_framebuffer_request();
-    if (!req || !req->response || req->response->framebuffer_count < 1)
+    if (!req || !req->response || req->response->framebuffer_count < 1) {
+        LOG_ERROR("bootloader provided no framebuffer");
         return NULL;
+    }
 
     struct limine_framebuffer* fb = req->response->framebuffers[0];
 
@@ -356,6 +367,14 @@ struct limine_video_driver* return_limine_video_driver(void) {
     max_chars_y = (uint32_t)(screen_height / FONT_HEIGHT);
 
     scroll_cache_init();
+
+    LOG_INFO("framebuffer %llux%llu, %u bpp, pitch %llu at 0x%llx, %ux%u text cells, %llu framebuffer(s)",
+             (unsigned long long)phys_width, (unsigned long long)phys_height, (unsigned)fb->bpp,
+             (unsigned long long)phys_pitch, (unsigned long long)(uintptr_t)framebuffer_base,
+             max_chars_x, max_chars_y, (unsigned long long)req->response->framebuffer_count);
+    if (!scroll_cache)
+        LOG_WARNING("framebuffer larger than %ux%u, scroll cache disabled (slower scrolling)",
+                    SCROLL_CACHE_MAX_WIDTH, SCROLL_CACHE_MAX_HEIGHT);
     return &limine_loaded_driver;
 }
 

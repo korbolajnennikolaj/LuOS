@@ -1,5 +1,6 @@
 #include "drivers/USB/usb_event.h"
 
+#include "components/logger.h"
 #include "drivers/USB/usb_core.h"
 
 #include <stddef.h>
@@ -97,8 +98,11 @@ bool usb_event_enqueue(usb_event_ring_t *ring, const usb_event_t *evt) {
     uint64_t irq_flags = spin_lock_irqsave(&ring->lock);
     uint32_t next = (ring->head + 1) & ring->mask;
     if (next == ring->tail) {
-        ring->drop_count++;
+        uint32_t drops = ++ring->drop_count;
         spin_unlock_irqrestore(&ring->lock, irq_flags);
+        if (drops == 1 || (drops % 4096) == 0)
+            LOG_DEBUG("event ring (capacity %u) full, %u event(s) dropped, last type %d",
+                      (unsigned)ring->capacity, (unsigned)drops, (int)evt->type);
         return false;
     }
     ring->entries[ring->head] = *evt;
@@ -138,7 +142,11 @@ uint32_t usb_event_pending(const usb_event_ring_t *ring) {
 
 void usb_event_register_handler(usb_event_handler_t fn, void *ctx) {
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
-    if (s_intr_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
+    if (s_intr_handler_count >= USB_EVENT_MAX_HANDLERS) {
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        LOG_WARNING("handler table full (%d), handler %p dropped", USB_EVENT_MAX_HANDLERS, (void *)fn);
+        return;
+    }
     struct handler_entry *e = &s_intr_handlers[s_intr_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
@@ -160,7 +168,11 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
         table = s_intr_handlers; count = &s_intr_handler_count; break;
     }
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
-    if (*count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
+    if (*count >= USB_EVENT_MAX_HANDLERS) {
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        LOG_WARNING("handler table full (%d), handler %p dropped", USB_EVENT_MAX_HANDLERS, (void *)fn);
+        return;
+    }
     struct handler_entry *e = &table[(*count)++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
@@ -171,12 +183,18 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
     if (device) {
         struct usb_device *dev = (struct usb_device *)device;
         dev->driver_managed = 1;
+        LOG_DEBUG("handler %p bound to addr %u ep 0x%02x type %d", (void *)fn,
+                  (unsigned)dev->address, (unsigned)endpoint, (int)xfer_type);
     }
 }
 
 void usb_bulk_register_handler(usb_event_handler_t fn, void *ctx) {
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
-    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
+    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) {
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        LOG_WARNING("handler table full (%d), handler %p dropped", USB_EVENT_MAX_HANDLERS, (void *)fn);
+        return;
+    }
     struct handler_entry *e = &s_bulk_handlers[s_bulk_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
@@ -188,7 +206,11 @@ void usb_bulk_register_handler(usb_event_handler_t fn, void *ctx) {
 void usb_bulk_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint)
 {
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
-    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
+    if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) {
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        LOG_WARNING("handler table full (%d), handler %p dropped", USB_EVENT_MAX_HANDLERS, (void *)fn);
+        return;
+    }
     struct handler_entry *e = &s_bulk_handlers[s_bulk_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
@@ -199,7 +221,11 @@ void usb_bulk_register_handler_for_device(usb_event_handler_t fn, void *ctx, voi
 
 void usb_iso_register_handler(usb_event_handler_t fn, void *ctx) {
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
-    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
+    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) {
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        LOG_WARNING("handler table full (%d), handler %p dropped", USB_EVENT_MAX_HANDLERS, (void *)fn);
+        return;
+    }
     struct handler_entry *e = &s_iso_handlers[s_iso_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = NULL; e->endpoint = 0;
@@ -211,7 +237,11 @@ void usb_iso_register_handler(usb_event_handler_t fn, void *ctx) {
 void usb_iso_register_handler_for_device(usb_event_handler_t fn, void *ctx, void *device, uint8_t endpoint)
 {
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
-    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) { spin_unlock_irqrestore(&handlers_lock, flags); return; }
+    if (s_iso_handler_count >= USB_EVENT_MAX_HANDLERS) {
+        spin_unlock_irqrestore(&handlers_lock, flags);
+        LOG_WARNING("handler table full (%d), handler %p dropped", USB_EVENT_MAX_HANDLERS, (void *)fn);
+        return;
+    }
     struct handler_entry *e = &s_iso_handlers[s_iso_handler_count++];
     e->fn = fn; e->ctx = ctx;
     e->device = device; e->endpoint = endpoint;
@@ -255,6 +285,7 @@ static int remove_matching(struct handler_entry *table, int count, void *device)
 
 void usb_event_unregister_for_device(void *device) {
     if (!device) return;
+    LOG_DEBUG("removing handlers bound to device %p", device);
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
     s_intr_handler_count = remove_matching(s_intr_handlers, s_intr_handler_count, device);
     s_bulk_handler_count = remove_matching(s_bulk_handlers, s_bulk_handler_count, device);

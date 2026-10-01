@@ -7,6 +7,7 @@
 #include "service_usb_hotplug.h"
 
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "drivers/Timer/timer.h"
 
 #include "kernel/scheduler/scheduler.h"
@@ -28,12 +29,14 @@ void register_program(program_t *prog) {
 
     if (programs_count >= MAX_PROGRAMS) {
         spin_unlock(&programs_lock);
+        LOG_WARNING("program table full, '%s' not registered", prog->name);
         return;
     }
 
     for (int i = 0; i < programs_count; i++) {
         if (strncmp(programs_list[i]->name, prog->name, PROGRAM_NAME_MAX) == 0) {
             spin_unlock(&programs_lock);
+            LOG_WARNING("program '%s' already registered", prog->name);
             return;
         }
     }
@@ -42,6 +45,7 @@ void register_program(program_t *prog) {
     programs_list[programs_count++] = prog;
 
     spin_unlock(&programs_lock);
+    LOG_DEBUG("program '%s' registered with id %u", prog->name, prog->id);
 }
 
 program_t *get_program(uint32_t id) {
@@ -74,17 +78,27 @@ program_t *get_program_by_name(const char *name) {
 
 int run_program(uint32_t id) {
     program_t *prog = get_program(id);
-    if (!prog) return -1;
+    if (!prog) {
+        LOG_WARNING("no program with id %u", id);
+        return -1;
+    }
 
     struct task *t = task_create_balanced(prog->name, prog->entry, prog->arg, PRIO_DEFAULT);
+    if (!t) LOG_ERROR("failed to start program '%s'", prog->name);
+    else LOG_INFO("program '%s' started as tid %u", prog->name, t->tid);
     return t ? 0 : -2;
 }
 
 int run_program_by_name(const char *name) {
     program_t *prog = get_program_by_name(name);
-    if (!prog) return -1;
+    if (!prog) {
+        LOG_WARNING("no program named '%s'", name);
+        return -1;
+    }
 
     struct task *t = task_create_balanced(prog->name, prog->entry, prog->arg, PRIO_DEFAULT);
+    if (!t) LOG_ERROR("failed to start program '%s'", prog->name);
+    else LOG_INFO("program '%s' started as tid %u", prog->name, t->tid);
     return t ? 0 : -2;
 }
 
@@ -109,12 +123,14 @@ int register_service(service_t *svc) {
 
     if (services_count >= MAX_SERVICES) {
         spin_unlock(&services_lock);
+        LOG_ERROR("service table full, '%s' not registered", svc->name);
         return -2;
     }
 
     for (int i = 0; i < services_count; i++) {
         if (strncmp(services_list[i]->name, svc->name, SERVICE_NAME_MAX) == 0) {
             spin_unlock(&services_lock);
+            LOG_WARNING("service '%s' already registered", svc->name);
             return -3;
         }
     }
@@ -130,6 +146,8 @@ int register_service(service_t *svc) {
     services_count++;
 
     spin_unlock(&services_lock);
+    LOG_DEBUG("service '%s' registered: id %u, priority %d, %d dependency(ies), restart limit %u",
+              svc->name, svc->id, (int)svc->priority, svc->dependency_count, (unsigned)svc->restart_limit);
     return 0;
 }
 
@@ -175,6 +193,7 @@ int service_request_start(uint32_t id) {
         stop_requested[idx] = false;
     }
     spin_unlock(&services_lock);
+    LOG_INFO("start requested for service '%s'", svc->name);
     return 0;
 }
 
@@ -183,7 +202,9 @@ int service_request_stop(uint32_t id) {
     int idx = service_index(id);
     if (idx < 0) { spin_unlock(&services_lock); return -1; }
     stop_requested[idx] = true;
+    const char *name = services_list[idx]->name;
     spin_unlock(&services_lock);
+    LOG_INFO("stop requested for service '%s'", name);
     return 0;
 }
 
@@ -197,6 +218,7 @@ int service_request_restart(uint32_t id) {
     svc->restart_count = 0;
     stop_requested[idx] = false;
     spin_unlock(&services_lock);
+    LOG_INFO("restart requested for service '%s'", svc->name);
     return 0;
 }
 
@@ -227,6 +249,11 @@ static void service_trampoline(void *arg) {
                                      : SERVICE_STATE_NEEDS_RESTART;
     spin_unlock(&services_lock);
 
+    if (was_stop_requested)
+        LOG_INFO("service '%s' stopped", svc->name);
+    else
+        LOG_WARNING("service '%s' exited unexpectedly, will be restarted", svc->name);
+
     task_exit();
 }
 
@@ -249,6 +276,10 @@ static void try_start_service(service_t *svc) {
     if (t) {
         svc->task = t;
         svc->state = SERVICE_STATE_STARTING;
+        LOG_INFO("service '%s' starting as tid %u on core %d%s", svc->name, t->tid, t->core,
+                 svc->restart_count ? " (restart)" : "");
+    } else {
+        LOG_ERROR("failed to create task for service '%s'", svc->name);
     }
 }
 
@@ -271,6 +302,7 @@ static void service_manager_loop(void *arg) {
                         if (svc->state == SERVICE_STATE_NEEDS_RESTART &&
                             svc->update && svc->update(svc->arg)) {
                             svc->state = SERVICE_STATE_RUNNING;
+                            LOG_INFO("service '%s' recovered", svc->name);
                         }
                         break;
                     }
@@ -281,8 +313,12 @@ static void service_manager_loop(void *arg) {
                         if (svc->restart_limit != 0 &&
                             svc->restart_count > svc->restart_limit) {
                             svc->state = SERVICE_STATE_FAILED;
+                            LOG_ERROR("service '%s' failed: restart limit %u exceeded",
+                                      svc->name, (unsigned)svc->restart_limit);
                             break;
                         }
+                        LOG_WARNING("restarting service '%s', attempt %u/%u", svc->name,
+                                    (unsigned)svc->restart_count, (unsigned)svc->restart_limit);
                     }
                     if (dependencies_satisfied(svc)) {
                         try_start_service(svc);
@@ -291,11 +327,13 @@ static void service_manager_loop(void *arg) {
 
                 case SERVICE_STATE_STARTING:
                     svc->state = SERVICE_STATE_RUNNING;
+                    LOG_DEBUG("service '%s' running", svc->name);
                     break;
 
                 case SERVICE_STATE_RUNNING:
                     if (svc->update && !svc->update(svc->arg)) {
                         svc->state = SERVICE_STATE_NEEDS_RESTART;
+                        LOG_WARNING("service '%s' failed its health check", svc->name);
                     } else {
                         svc->restart_count = 0;
                     }
@@ -315,7 +353,10 @@ static void service_manager_loop(void *arg) {
 
 static void add_service_dependency(service_t *svc, service_t *on) {
     if (!svc || !on) return;
-    if (svc->dependency_count >= MAX_SERVICE_DEPENDENCIES) return;
+    if (svc->dependency_count >= MAX_SERVICE_DEPENDENCIES) {
+        LOG_WARNING("service '%s' has too many dependencies, '%s' dropped", svc->name, on->name);
+        return;
+    }
 
     svc->dependencies[svc->dependency_count++] = MAKE_SERVICE_DEPENDENCY(on->id);
 }
@@ -338,5 +379,8 @@ void start_service_manager(void) {
 
     register_service(shell);
 
-    task_create("service_manager", service_manager_loop, NULL, service_priority_to_sched[SERVICE_ROOT_PRIORITY]);
+    if (!task_create("service_manager", service_manager_loop, NULL, service_priority_to_sched[SERVICE_ROOT_PRIORITY]))
+        LOG_ERROR("failed to start the service manager task");
+    else
+        LOG_INFO("service manager started with %d service(s)", services_count);
 }

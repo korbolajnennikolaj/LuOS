@@ -2,6 +2,7 @@
 
 #include "mm.h"
 #include "pmm.h"
+#include "components/logger.h"
 #include "kernel/scheduler/spinlock.h"
 
 static uint64_t kernel_pml4_phys = 0;
@@ -74,7 +75,10 @@ static uint64_t* get_next_level(uint64_t* current_level, uint16_t index, int all
 
 void vmm_init(void) {
     kernel_pml4_phys = pmm_alloc_page();
-    if (!kernel_pml4_phys) return;
+    if (!kernel_pml4_phys) {
+        LOG_ERROR("could not allocate kernel PML4");
+        return;
+    }
 
     uint64_t* pml4_virt = (uint64_t*)mm_phys_to_virt(kernel_pml4_phys);
     vmm_memset(pml4_virt, 0, PAGE_SIZE);
@@ -88,6 +92,9 @@ void vmm_init(void) {
     }
 
     vmm_switch_address_space(kernel_pml4_phys);
+
+    LOG_DEBUG("kernel PML4 at 0x%llx, higher half copied from bootloader CR3 0x%llx",
+              (unsigned long long)kernel_pml4_phys, (unsigned long long)(current_cr3 & ~0xFFFULL));
 }
 
 uint64_t vmm_kernel_pml4(void) {
@@ -305,6 +312,8 @@ uint64_t vmm_map_mmio(uint64_t phys, uint64_t size, uint64_t extra_flags) {
 
     if (mmio_next_virt + map_size > VMM_MMIO_WINDOW_BASE + VMM_MMIO_WINDOW_SIZE) {
         spin_unlock_irqrestore(&vmm_lock, irq_flags);
+        LOG_ERROR("MMIO window exhausted, cannot map 0x%llx (+%llu bytes)",
+                  (unsigned long long)phys, (unsigned long long)size);
         return 0;
     }
 
@@ -315,6 +324,7 @@ uint64_t vmm_map_mmio(uint64_t phys, uint64_t size, uint64_t extra_flags) {
     for (uint64_t off = 0; off < map_size; off += PAGE_SIZE) {
         if (vmm_map_page_impl(kernel_pml4_phys, virt_base + off, phys_base + off, flags) != 0) {
             spin_unlock_irqrestore(&vmm_lock, irq_flags);
+            LOG_ERROR("failed to map MMIO page 0x%llx", (unsigned long long)(phys_base + off));
             return 0;
         }
     }
@@ -329,6 +339,8 @@ uint64_t vmm_map_mmio(uint64_t phys, uint64_t size, uint64_t extra_flags) {
     }
 
     spin_unlock_irqrestore(&vmm_lock, irq_flags);
+    LOG_DEBUG("MMIO 0x%llx (+%llu bytes) mapped at 0x%llx",
+              (unsigned long long)phys_base, (unsigned long long)map_size, (unsigned long long)virt_base);
     return virt_base + page_off;
 }
 

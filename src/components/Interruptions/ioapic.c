@@ -1,6 +1,7 @@
 #include "ioapic.h"
 
 #include "components/ACPI/madt.h"
+#include "components/logger.h"
 
 #include <stdint.h>
 
@@ -65,7 +66,12 @@ void ioapic_unmask_irq(uint8_t irq) {
 }
 
 void ioapic_map_pci_irq(uint8_t irq_line, uint8_t vector, uint8_t lapic_id) {
-    if (irq_line == 0xFF || irq_line == 0) return;
+    if (irq_line == 0xFF || irq_line == 0) {
+        LOG_WARNING("PCI IRQ line %u is not routable, vector 0x%02x not mapped", (unsigned)irq_line, (unsigned)vector);
+        return;
+    }
+    if (irq_line >= IOAPIC_MAX_IRQ)
+        LOG_WARNING("PCI IRQ line %u is beyond IOAPIC pin range", (unsigned)irq_line);
 
     uint8_t reg_lo = (uint8_t)(IOAPIC_REDTBL_BASE + irq_line * 2);
     uint8_t reg_hi = reg_lo + 1;
@@ -78,12 +84,15 @@ void ioapic_map_pci_irq(uint8_t irq_line, uint8_t vector, uint8_t lapic_id) {
     ioapic_write(reg_lo, lo | IOAPIC_MASKED);
     ioapic_write(reg_hi, hi);
     ioapic_write(reg_lo, lo);
+
+    LOG_DEBUG("PCI IRQ %u -> vector 0x%02x on LAPIC %u (level, active low)",
+              (unsigned)irq_line, (unsigned)vector, (unsigned)lapic_id);
 }
 
 void ioapic_apply_isa_overrides(void) {
 
     static const struct { uint8_t isa_irq; uint8_t vector; } legacy[] = {
-        { 0, 32 }, { 1, 33 }, { 12, 44 },
+        { 0, 32 }, { 1, 33 }, { 4, 36 }, { 12, 44 },
     };
 
     for (unsigned i = 0; i < sizeof(legacy) / sizeof(legacy[0]); i++) {
@@ -91,7 +100,10 @@ void ioapic_apply_isa_overrides(void) {
         uint8_t vector = legacy[i].vector;
 
         uint32_t gsi = madt_remap_isa_irq(isa_irq);
-        if (gsi > 23) continue;
+        if (gsi > 23) {
+            LOG_WARNING("ISA IRQ %u remapped to GSI %u, beyond IOAPIC range", (unsigned)isa_irq, gsi);
+            continue;
+        }
 
         uint16_t flags = 0;
         int iso_count = madt_get_iso_count();
@@ -120,6 +132,10 @@ void ioapic_apply_isa_overrides(void) {
         ioapic_write(reg_lo, lo | IOAPIC_MASKED);
         ioapic_write(reg_hi, hi);
         ioapic_write(reg_lo, lo | was_masked);
+
+        LOG_DEBUG("ISA IRQ %u -> GSI %u vector %u, %s, %s%s", (unsigned)isa_irq, gsi, (unsigned)vector,
+                  active_low ? "active low" : "active high", level_triggered ? "level" : "edge",
+                  was_masked ? ", masked" : "");
     }
 }
 
@@ -139,4 +155,8 @@ void init_ioapic(void) {
 
     ioapic_map_irq(12, 44, 0);
     ioapic_mask_irq(12);
+
+    uint32_t ver = ioapic_read(IOAPIC_REG_VER);
+    LOG_INFO("IOAPIC id %u version 0x%02x, %u redirection entries, all masked except IRQ0/IRQ1",
+             (unsigned)((ioapic_read(IOAPIC_REG_ID) >> 24) & 0x0F), (unsigned)(ver & 0xFF), (unsigned)max);
 }
