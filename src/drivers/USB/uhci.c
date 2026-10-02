@@ -169,6 +169,24 @@ static inline void uhci_writel(struct uhci_controller *u, uint16_t r, uint32_t v
     outl((uint16_t)(u->io_base + r), v);
 }
 
+static void uhci_wait_frames(struct uhci_controller *u, int frames) {
+    if (!(uhci_readw(u, UHCI_CMD) & UHCI_CMD_RUN)) return;
+    uint16_t last = uhci_readw(u, UHCI_FRNUM) & 0x7FF;
+    uint64_t t0 = uhci_now_us();
+    int seen = 0;
+    while (seen < frames) {
+        uint16_t now = uhci_readw(u, UHCI_FRNUM) & 0x7FF;
+        if (now != last) { last = now; seen++; continue; }
+        if (uhci_now_us_fn) {
+            if (uhci_now_us() - t0 > (uint64_t)(frames + 2) * 1000u) break;
+            asm volatile("pause");
+        } else {
+            uhci_sleep_ms(1);
+            seen++;
+        }
+    }
+}
+
 static inline uint16_t uhci_portsc_reg(uint8_t port) {
     return (uint16_t)(UHCI_PORTSC1 + (port - 1) * 2);
 }
@@ -453,6 +471,13 @@ static void uhci_qh_arm_interrupt(int res_idx, int qi) {
     asm volatile("mfence" ::: "memory");
 }
 
+static void uhci_qh_rescue_element(uhci_qh_hw_t *hw, struct uhci_td *td) {
+    if (!(hw->element & LP_TERMINATE)) return;
+    if (!(td->control_status & TD_CS_ACTIVE)) return;
+    hw->element = (uint32_t)mm_ptr_to_phys(td);
+    asm volatile("mfence" ::: "memory");
+}
+
 static int uhci_qh_poll_batch(int res_idx, int qi, uint16_t *added) {
     uhci_qh_meta_t *m = &uhci_resources[res_idx].qh_meta[qi];
     struct uhci_td *ring = uhci_resources[res_idx].td_ring[qi];
@@ -464,6 +489,7 @@ static int uhci_qh_poll_batch(int res_idx, int qi, uint16_t *added) {
         uint32_t cs = ring[i].control_status;
 
         if (cs & TD_CS_ACTIVE) {
+            uhci_qh_rescue_element(&uhci_resources[res_idx].qh_pool[qi], &ring[i]);
             *added = total;
             return 0;
         }
@@ -671,7 +697,11 @@ static int uhci_ctrl_run(int res_idx, struct uhci_td *ring, uint8_t nt, int *sto
         for (uint8_t i = 0; i < nt; i++) {
             uint32_t cs = ring[i].control_status;
 
-            if (cs & TD_CS_ACTIVE) { pending = 1; break; }
+            if (cs & TD_CS_ACTIVE) {
+                pending = 1;
+                uhci_qh_rescue_element(hw, &ring[i]);
+                break;
+            }
             if (cs & TD_CS_ERROR_MASK) { *stop_idx = i; result = UHCI_RUN_ERROR; break; }
 
             if (uhci_td_actual_len(cs) < uhci_td_requested_len(&ring[i])) {
@@ -691,6 +721,16 @@ static int uhci_ctrl_run(int res_idx, struct uhci_td *ring, uint8_t nt, int *sto
         uhci_sleep_ms(1);
     }
 
+    hw->element = LP_TERMINATE;
+    asm volatile("mfence" ::: "memory");
+
+    if (result == UHCI_RUN_TIMEOUT) {
+        for (uint8_t i = 0; i < nt; i++)
+            ring[i].control_status &= ~TD_CS_ACTIVE;
+        asm volatile("mfence" ::: "memory");
+    }
+
+    uhci_wait_frames(&uhci_resources[res_idx].ctrl, 2);
     hw->element = LP_TERMINATE;
     asm volatile("mfence" ::: "memory");
     return result;

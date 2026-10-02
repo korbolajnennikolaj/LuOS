@@ -75,7 +75,10 @@ static uint64_t (*uptime_ms)(void) = NULL;
 
 #define MSC_BULK_HOT_POLLS 400u
 #define MSC_BULK_WARM_MS 20u
-#define MSC_BULK_TIMEOUT_MS 600u
+#define MSC_CBW_TIMEOUT_MS 2000u
+#define MSC_DATA_TIMEOUT_MS 5000u
+#define MSC_CSW_TIMEOUT_MS 5000u
+#define MSC_INIT_MAX_TIMEOUTS 3u
 
 static void msc_bulk_backoff(unsigned poll, uint64_t elapsed_ms)
 {
@@ -167,7 +170,8 @@ static int msc_control(usb_msc_device_t *d, uint8_t type, uint8_t req, uint16_t 
 #define MSC_XFER_TIMEOUT 2
 #define MSC_XFER_ERROR 3
 
-static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t len, uint8_t direction)
+static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t len, uint8_t direction,
+                    uint32_t timeout_ms)
 {
     struct usb_core_driver *core = get_usb_core();
     if (!core->bulk_transfer) {
@@ -185,7 +189,7 @@ static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t l
         if (ret != -2) break;
 
         uint64_t elapsed = uptime_ms ? (uptime_ms() - t0) : (uint64_t)poll;
-        if (elapsed >= MSC_BULK_TIMEOUT_MS) break;
+        if (elapsed >= timeout_ms) break;
         if (!uptime_ms && poll >= 2000u) break;
 
         msc_bulk_backoff(poll, elapsed);
@@ -195,10 +199,15 @@ static int msc_bulk(usb_msc_device_t *d, uint8_t endpoint, void *buf, uint16_t l
         }
     }
 
-    if (ret == 0) return MSC_XFER_OK;
+    if (ret == 0) {
+        d->consecutive_timeouts = 0;
+        return MSC_XFER_OK;
+    }
 
     if (ret == -2) {
-        LOG_ERROR("bulk timeout after %d polls, ep=0x%02x, len=%u", attempts, (unsigned)endpoint, (unsigned)len);
+        LOG_ERROR("bulk timeout after %d polls (%u ms), ep=0x%02x, len=%u",
+                  attempts, (unsigned)timeout_ms, (unsigned)endpoint, (unsigned)len);
+        if (d->consecutive_timeouts < 255) d->consecutive_timeouts++;
 
         if (core->reset_endpoint_toggle)
             core->reset_endpoint_toggle(d->usb_dev, endpoint);
@@ -258,6 +267,12 @@ static void msc_bot_reset(usb_msc_device_t *d)
                          d->ep_bulk_out, 0, NULL);
     LOG_DEBUG("step 3/4 Clear STALL Bulk-OUT ep=0x%02x result=%d", (unsigned)d->ep_bulk_out, r3);
 
+    if (r1 != 0 && r2 != 0 && r3 != 0) {
+        LOG_ERROR("device addr %u rejects all control requests, giving up on it",
+                  (unsigned)(d->usb_dev ? d->usb_dev->address : 0));
+        d->consecutive_timeouts = MSC_INIT_MAX_TIMEOUTS;
+    }
+
     {
         struct usb_core_driver *_core = get_usb_core();
         if (_core->reset_endpoint_toggle) {
@@ -290,6 +305,11 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
         return MSC_ERR_PARAM;
     if (data_len > 0xFFFFu) return MSC_ERR_PARAM;
 
+    if (!d->present && d->consecutive_timeouts >= MSC_INIT_MAX_TIMEOUTS) {
+        MSC_TRACE("cmd 0x%02x skipped, device stopped responding", (unsigned)cmd[0]);
+        return MSC_ERR_IO;
+    }
+
     msc_bot_enter();
 
     MSC_TRACE("CDB len=%u cmd=0x%02x dir=%s data_len=%u",
@@ -308,7 +328,7 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
 
     MSC_HEXDUMP("CBW bytes: ", (const uint8_t *)&g_cbw, sizeof(g_cbw));
 
-    int xr = msc_bulk(d, d->ep_bulk_out, &g_cbw, sizeof(g_cbw), 0);
+    int xr = msc_bulk(d, d->ep_bulk_out, &g_cbw, sizeof(g_cbw), 0, MSC_CBW_TIMEOUT_MS);
     if (xr != MSC_XFER_OK) {
 
         if (xr == MSC_XFER_STALL) msc_clear_halt(d, d->ep_bulk_out);
@@ -323,7 +343,7 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
         uint8_t ep = (direction == CBW_FLAGS_IN) ? d->ep_bulk_in : d->ep_bulk_out;
         uint8_t dir = (direction == CBW_FLAGS_IN) ? 1 : 0;
 
-        xr = msc_bulk(d, ep, data, (uint16_t)data_len, dir);
+        xr = msc_bulk(d, ep, data, (uint16_t)data_len, dir, MSC_DATA_TIMEOUT_MS);
 
         if (xr == MSC_XFER_STALL) {
 
@@ -342,7 +362,7 @@ static int msc_execute(usb_msc_device_t *d, const uint8_t *cmd, uint8_t cmd_len,
         for (int i = 0; i < (int)sizeof(g_csw); i++)
             ((uint8_t *)&g_csw)[i] = 0;
 
-        cr = msc_bulk(d, d->ep_bulk_in, &g_csw, sizeof(g_csw), 1);
+        cr = msc_bulk(d, d->ep_bulk_in, &g_csw, sizeof(g_csw), 1, MSC_CSW_TIMEOUT_MS);
         if (cr == MSC_XFER_OK) break;
 
         if (cr == MSC_XFER_STALL && csw_try == 0) {
@@ -775,6 +795,11 @@ static void msc_init_device_locked(struct usb_device *dev)
                 break;
             }
             LOG_WARNING("INQUIRY attempt %d failed", inq_try + 1);
+            if (d->consecutive_timeouts >= MSC_INIT_MAX_TIMEOUTS) {
+                LOG_ERROR("device addr %u stopped responding during INQUIRY, initialization aborted (replug it)",
+                          (unsigned)dev->address);
+                return;
+            }
             if (delay_ms) delay_ms(50);
         }
         if (!inq_ok) {
@@ -794,6 +819,11 @@ static void msc_init_device_locked(struct usb_device *dev)
                 ready = 1;
                 LOG_DEBUG("device ready on attempt %d", attempt + 1);
                 break;
+            }
+            if (d->consecutive_timeouts >= MSC_INIT_MAX_TIMEOUTS) {
+                LOG_ERROR("device addr %u stopped responding, initialization aborted (replug it)",
+                          (unsigned)dev->address);
+                return;
             }
             msc_scsi_request_sense(d);
             if (delay_ms) delay_ms(100);

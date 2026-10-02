@@ -90,7 +90,8 @@ static inline bool usb_push_event (const usb_event_t *e) { return usb_event_enqu
 static inline bool usb_pop_event (usb_event_t *o) { return usb_event_dequeue(&g_usb_event_ring, o); }
 static inline uint32_t usb_events_pending (void) { return usb_event_pending(&g_usb_event_ring); }
 
-static inline bool usb_push_bulk_event (const usb_event_t *e) { return usb_event_enqueue(&g_usb_bulk_ring, e); }
+int usb_bulk_handler_count(void);
+static inline bool usb_push_bulk_event (const usb_event_t *e) { return usb_bulk_handler_count() ? usb_event_enqueue(&g_usb_bulk_ring, e) : true; }
 static inline bool usb_pop_bulk_event (usb_event_t *o) { return usb_event_dequeue(&g_usb_bulk_ring, o); }
 static inline uint32_t usb_bulk_events_pending(void) { return usb_event_pending(&g_usb_bulk_ring); }
 

@@ -340,6 +340,7 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
         if (type == TRB_TYPE_COMMAND_COMPL) {
             x->last_slot_id = ev_slot;
             x->last_completion_code = code;
+            x->last_cmd_code = code;
 
         } else if (type == TRB_TYPE_TRANSFER_EVENT) {
 
@@ -541,6 +542,7 @@ static int xhci_send_command_impl(struct xhci_controller *x, struct xhci_trb *cm
     if (!x || !x->initialized) return -1;
 
     struct xhci_trb *trb = &x->cmd_ring[x->cmd_ring_idx];
+    x->last_cmd_code = 0xFF;
     trb->param = cmd->param;
     trb->status = cmd->status;
     COMPILER_BARRIER();
@@ -572,36 +574,15 @@ static int xhci_send_command_impl(struct xhci_controller *x, struct xhci_trb *cm
 }
 
 static void xhci_wait_command(struct xhci_controller *x, int max_ms) {
+    if (max_ms < 100) max_ms = 100;
     for (int i = 0; i < max_ms; i++) {
-        int k = x->event_ring_idx;
-        volatile struct xhci_trb *ev = &x->event_ring[k];
-        CACHE_FLUSH((void *)ev);
-        FULL_BARRIER();
-
-        if ((ev->control & 1) == x->event_cycle) {
-            uint8_t t = (ev->control >> 10) & 0x3F;
-            uint8_t sl = (ev->control >> 24) & 0xFF;
-            uint8_t c = (ev->status >> 24) & 0xFF;
-
-            x->event_ring_idx = (k + 1) % TRB_RING_SIZE;
-            if (k + 1 >= TRB_RING_SIZE) x->event_cycle ^= 1;
-
-            volatile struct xhci_trb *next_ev = &x->event_ring[x->event_ring_idx];
-            wr64(x->rt_base, 0x38, ERDP_WITH_EHB(virt_to_phys((void *)next_ev)));
-            (void)rd32(x->rt_base, 0x38);
-            FULL_BARRIER();
-
-            if (t == TRB_TYPE_COMMAND_COMPL) {
-                x->last_slot_id = sl;
-                x->last_completion_code = c;
-                return;
-            }
+        xhci_poll_event_ring(x);
+        if (x->last_cmd_code != 0xFF) {
+            x->last_completion_code = x->last_cmd_code;
+            return;
         }
-
         asm volatile("pause");
         delay_ms(1);
-
-        if (x->last_completion_code != 0xFF) return;
     }
 }
 
@@ -1542,6 +1523,62 @@ static void xhci_control_ep0_recover(struct xhci_controller *x, uint8_t slot_id,
     ctrl_tr_cycle[idx][slot_id - 1] = 1;
 }
 
+static void xhci_stop_endpoint_cmd(struct xhci_controller *x, uint8_t slot_id, uint8_t dci) {
+    struct xhci_trb stop = {0};
+    stop.control = (TRB_TYPE_STOP_ENDPOINT << 10)
+    | ((uint32_t)slot_id << 24)
+    | ((uint32_t)dci << 16);
+    x->last_completion_code = 0xFF;
+    xhci_send_command(x, &stop);
+    xhci_wait_command(x, 100);
+}
+
+static int xhci_readd_endpoint(struct xhci_controller *x, int ci, int ki, uint8_t slot_id,
+                               uint8_t dci, uint64_t ring_base)
+{
+    uint32_t ctx_size = x->csz ? (uint32_t)x->csz : XHCI_CTX_SIZE_32;
+    uint8_t *ictx = (uint8_t *)xhci_mem[ci].input_ctx[ki];
+    uint8_t *dctx = (uint8_t *)xhci_mem[ci].dev_ctx[ki];
+
+    for (size_t _fi = 0; _fi < XHCI_DEV_CTX_BYTES; _fi += 64)
+        CACHE_FLUSH(dctx + _fi);
+    FULL_BARRIER();
+
+    struct xhci_slot_context *dev_slot = (struct xhci_slot_context *)xhci_dev_ctx_slot(dctx);
+    struct xhci_endpoint_context *dev_ep =
+        (struct xhci_endpoint_context *)xhci_dev_ctx_ep(dctx, ctx_size, dci);
+
+    memset(ictx, 0, XHCI_INPUT_CTX_BYTES);
+    uint32_t *ictrl = (uint32_t *)xhci_input_ctx_ctrl(ictx);
+    ictrl[0] = (1u << dci);
+    ictrl[1] = (1u << 0) | (1u << dci);
+
+    struct xhci_slot_context *in_slot = (struct xhci_slot_context *)xhci_input_ctx_slot(ictx, ctx_size);
+    in_slot->dw0 = dev_slot->dw0;
+    in_slot->dw1 = dev_slot->dw1;
+    in_slot->dw2 = dev_slot->dw2;
+    in_slot->dw3 = 0;
+
+    struct xhci_endpoint_context *in_ep =
+        (struct xhci_endpoint_context *)xhci_input_ctx_ep(ictx, ctx_size, dci);
+    in_ep->dw0 = dev_ep->dw0 & ~0x7u;
+    in_ep->dw1 = dev_ep->dw1 | (3u << 1);
+    in_ep->tr_dequeue_ptr = ring_base | 1u;
+    in_ep->dw4 = dev_ep->dw4;
+
+    for (size_t _fi = 0; _fi < XHCI_INPUT_CTX_BYTES; _fi += 64)
+        CACHE_FLUSH(ictx + _fi);
+    FULL_BARRIER();
+
+    struct xhci_trb cmd = {0};
+    cmd.param = virt_to_phys(ictx);
+    cmd.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_CONFIG_EP << 10);
+    x->last_completion_code = 0xFF;
+    if (xhci_send_command(x, &cmd) != 0) return -1;
+    xhci_wait_command(x, 100);
+    return (x->last_completion_code == 1) ? 0 : -1;
+}
+
 static void xhci_reset_bulk_toggle_locked(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint)
 {
     if (!x || !x->initialized || slot_id == 0) return;
@@ -1559,57 +1596,27 @@ static void xhci_reset_bulk_toggle_locked(struct xhci_controller *x, uint8_t slo
     uint8_t dir = is_in;
 
     if (!bulk_ep_configured[ci][ki][dir]) return;
+    if (bulk_slot_dci[ci][ki][dir]) dci = bulk_slot_dci[ci][ki][dir];
 
     uint64_t ring_base = virt_to_phys(xhci_mem[ci].bulk_rings[ki][dir]);
+    uint32_t ctx_size = x->csz ? (uint32_t)x->csz : XHCI_CTX_SIZE_32;
+    uint8_t *dctx = (uint8_t *)xhci_mem[ci].dev_ctx[ki];
+    struct xhci_endpoint_context *ep_ctx =
+        (struct xhci_endpoint_context *)xhci_dev_ctx_ep(dctx, ctx_size, dci);
 
-    {
-        uint32_t ctx_size = x->csz ? (uint32_t)x->csz : XHCI_CTX_SIZE_32;
-        uint8_t *dctx = (uint8_t *)xhci_mem[ci].dev_ctx[ki];
-        struct xhci_endpoint_context *ep_ctx =
-            (struct xhci_endpoint_context *)xhci_dev_ctx_ep(dctx, ctx_size, dci);
+    for (size_t _fi = 0; _fi < ctx_size; _fi += 64)
+        CACHE_FLUSH((uint8_t *)ep_ctx + _fi);
+    FULL_BARRIER();
+    LOAD_BARRIER();
+    uint8_t ep_state = ep_ctx->dw0 & 0x7u;
+    int halted = (ep_state == 2u);
 
-        for (size_t _fi = 0; _fi < ctx_size; _fi += 64)
-            CACHE_FLUSH((uint8_t *)ep_ctx + _fi);
-
-        FULL_BARRIER();
-        LOAD_BARRIER();
-        uint8_t ep_state = ep_ctx->dw0 & 0x7u;
-
-        if (ep_state == 3u || ep_state == 2u ) {
-
-            int _rr = xhci_reset_endpoint(x, slot_id, dci);
-            if (_rr != 0 && ep_state == 2u) {
-
-                struct xhci_trb stop = {0};
-                stop.control = (TRB_TYPE_STOP_ENDPOINT << 10)
-                | ((uint32_t)slot_id << 24)
-                | ((uint32_t)dci << 16);
-                x->last_completion_code = 0xFF;
-                xhci_send_command(x, &stop);
-                xhci_wait_command(x, 50);
-
-                for (size_t _fi2 = 0; _fi2 < ctx_size; _fi2 += 64)
-                    CACHE_FLUSH((uint8_t *)ep_ctx + _fi2);
-                FULL_BARRIER();
-            }
-
-        } else if (bulk_active[ci][ki][dir]) {
-
-            struct xhci_trb stop = {0};
-            stop.control = (TRB_TYPE_STOP_ENDPOINT << 10)
-            | ((uint32_t)slot_id << 24)
-            | ((uint32_t)dci << 16);
-            x->last_completion_code = 0xFF;
-            xhci_send_command(x, &stop);
-            xhci_wait_command(x, 50);
-
-            xhci_poll_event_ring(x);
-
-            for (size_t _fi2 = 0; _fi2 < ctx_size; _fi2 += 64)
-                CACHE_FLUSH((uint8_t *)ep_ctx + _fi2);
-            FULL_BARRIER();
-        }
-
+    if (halted) {
+        if (xhci_reset_endpoint(x, slot_id, dci) != 0)
+            xhci_stop_endpoint_cmd(x, slot_id, dci);
+    } else if (ep_state == 1u || bulk_active[ci][ki][dir]) {
+        xhci_stop_endpoint_cmd(x, slot_id, dci);
+        xhci_poll_event_ring(x);
     }
 
     {
@@ -1622,7 +1629,8 @@ static void xhci_reset_bulk_toggle_locked(struct xhci_controller *x, uint8_t slo
         FULL_BARRIER();
     }
 
-    xhci_set_tr_dequeue(x, slot_id, dci, ring_base);
+    if (halted || xhci_readd_endpoint(x, ci, ki, slot_id, dci, ring_base) != 0)
+        xhci_set_tr_dequeue(x, slot_id, dci, ring_base);
 
     bulk_tr_idx[ci][ki][dir] = 0u;
     bulk_cycle [ci][ki][dir] = 1u;

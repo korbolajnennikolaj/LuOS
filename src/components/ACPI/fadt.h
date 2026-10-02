@@ -110,6 +110,12 @@ bool fadt_has_fixed_hardware(const ACPI_FADT *fadt);
 
 bool fadt_read_pm_timer(const ACPI_FADT *fadt, uint32_t *out_value);
 
-void fadt_reset_system(const ACPI_FADT *fadt);
+bool fadt_reset_system(const ACPI_FADT *fadt);
+
+bool fadt_read_pm1_control(const ACPI_FADT *fadt, int block_b, uint16_t *out);
+
+bool fadt_write_pm1_control(const ACPI_FADT *fadt, int block_b, uint16_t value);
+
+bool fadt_get_smi_command(const ACPI_FADT *fadt, uint16_t *port, uint8_t *enable_value);
 
 #endif

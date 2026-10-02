@@ -59,8 +59,10 @@ static void calibrate_with_rtc() {
         last_tick = current_tick;
     }
 
-    if (total_ticks > 1000) {
+    if (total_ticks > 1000 * 1000 && total_ticks < 1400 * 1000) {
         ticks_per_ms = total_ticks / 1000;
+    } else if (total_ticks > 1000) {
+        LOG_WARNING("RTC calibration measured %u ticks/s, far from 1193182, keeping nominal %u ticks/ms", total_ticks, ticks_per_ms);
     } else {
         LOG_WARNING("RTC calibration measured only %u ticks, keeping %u ticks/ms", total_ticks, ticks_per_ms);
     }

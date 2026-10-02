@@ -228,7 +228,10 @@ static bool port_identify(ahci_port_t *ap)
     LOG_DEBUG("IDENTIFY issued in slot %d", slot);
 
     t = AHCI_TIMEOUT_MS * 10;
-    while (--t > 0 && (port->ci & (1u << slot))) delay_ms(1);
+    while (--t > 0 && (port->ci & (1u << slot))) {
+        if (port->is & HBA_IS_TFES) break;
+        delay_ms(1);
+    }
 
     if (t <= 0) {
         LOG_ERROR("IDENTIFY timed out IS=0x%08x TFD=0x%08x SERR=0x%08x", port->is, port->tfd, port->serr);
@@ -330,6 +333,7 @@ static bool port_init(ahci_port_t *ap, volatile hba_port_t *regs, int idx, int p
 
     LOG_DEBUG("port %d: link up, SIG=0x%08x TFD=0x%08x", port_no, regs->sig, regs->tfd);
 
+
     port_stop(regs);
     LOG_DEBUG("port %d: stopped, CMD=0x%08x", port_no, regs->cmd);
 
@@ -373,6 +377,14 @@ static bool port_init(ahci_port_t *ap, volatile hba_port_t *regs, int idx, int p
     }
     if (regs->tfd & 0x89) {
         LOG_ERROR("port %d: BSY/DRQ/ERR stuck, TFD=0x%08x", port_no, regs->tfd);
+        return false;
+    }
+
+    if (regs->sig == 0xEB140101u || regs->sig == 0xC33C0101u || regs->sig == 0x96690101u) {
+        LOG_INFO("port %d: %s device (SIG=0x%08x) is not a SATA disk, skipping", port_no,
+                 regs->sig == 0xEB140101u ? "ATAPI" : (regs->sig == 0x96690101u ? "port multiplier" : "SEMB"),
+                 regs->sig);
+        port_stop(regs);
         return false;
     }
 

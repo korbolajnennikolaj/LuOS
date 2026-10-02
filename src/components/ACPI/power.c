@@ -5,6 +5,8 @@
 #include "checksum.h"
 #include "components/logger.h"
 #include "components/Memory/mm.h"
+#include "components/drivers.h"
+#include "drivers/Timer/timer.h"
 #include "fadt.h"
 #include "tables.h"
 
@@ -85,31 +87,47 @@ bool acpi_find_s5_sleep_type(uint8_t *out_slp_typa, uint8_t *out_slp_typb) {
     return false;
 }
 
-static uint16_t read_pm1a_control(const ACPI_FADT *fadt) {
-    if (fadt->X_PM1aControlBlock.Address) return inw((uint16_t)fadt->X_PM1aControlBlock.Address);
-    if (fadt->PM1aControlBlock) return inw((uint16_t)fadt->PM1aControlBlock);
-    return 0;
+static void power_delay_us(uint64_t us) {
+    struct tsc_driver *tsc = (struct tsc_driver *)get_self_driver(TIMER_DRIVER, TSC_TIMER);
+    if (tsc && tsc->get_tsc_ticks_per_ms && tsc->get_tsc_ticks_per_ms()) {
+        tsc->sleep_tsc_us(us);
+        return;
+    }
+    for (uint64_t i = 0; i < us; i++) inb(0x80);
 }
 
 static void acpi_enable_if_needed(const ACPI_FADT *fadt) {
-    if (read_pm1a_control(fadt) & ACPI_PM1_CNT_SCI_EN) {
+    uint16_t cnt = 0;
+    if (fadt_read_pm1_control(fadt, 0, &cnt) && (cnt & ACPI_PM1_CNT_SCI_EN)) return;
+
+    uint16_t smi_port;
+    uint8_t enable_value;
+    if (!fadt_get_smi_command(fadt, &smi_port, &enable_value)) {
+        LOG_DEBUG("SCI_EN is clear and FADT has no SMI command, writing PM1 control directly");
         return;
     }
 
-    if (!fadt->SMICommandPort || !fadt->AcpiEnable) {
-        LOG_WARNING("SCI_EN is clear but FADT has no SMI command to enable ACPI mode");
-        return;
+    LOG_DEBUG("switching to ACPI mode via SMI port 0x%x", (unsigned)smi_port);
+    outb(smi_port, enable_value);
+
+    for (int i = 0; i < 300; i++) {
+        if (fadt_read_pm1_control(fadt, 0, &cnt) && (cnt & ACPI_PM1_CNT_SCI_EN)) return;
+        power_delay_us(1000);
     }
 
-    LOG_DEBUG("switching to ACPI mode via SMI port 0x%x", (unsigned)fadt->SMICommandPort);
-    outb((uint16_t)fadt->SMICommandPort, fadt->AcpiEnable);
+    LOG_WARNING("ACPI mode enable did not set SCI_EN, trying S5 anyway");
+}
 
-    for (volatile int i = 0; i < 1000000; i++) {
-        if (read_pm1a_control(fadt) & ACPI_PM1_CNT_SCI_EN) break;
+static void power_write_slp(const ACPI_FADT *fadt, int block_b, uint8_t slp_typ) {
+    uint16_t cnt = 0;
+    if (!fadt_read_pm1_control(fadt, block_b, &cnt)) {
+        if (block_b) return;
+        cnt = 0;
     }
-
-    if (!(read_pm1a_control(fadt) & ACPI_PM1_CNT_SCI_EN))
-        LOG_WARNING("ACPI mode enable did not set SCI_EN");
+    cnt &= (uint16_t)~((7u << ACPI_PM1_CNT_SLP_TYP_SHIFT) | ACPI_PM1_CNT_SLP_EN);
+    cnt |= (uint16_t)((slp_typ & 7u) << ACPI_PM1_CNT_SLP_TYP_SHIFT);
+    fadt_write_pm1_control(fadt, block_b, cnt);
+    fadt_write_pm1_control(fadt, block_b, (uint16_t)(cnt | ACPI_PM1_CNT_SLP_EN));
 }
 
 bool acpi_shutdown(void) {
@@ -132,34 +150,53 @@ bool acpi_shutdown(void) {
 
     acpi_enable_if_needed(fadt);
 
-    LOG_INFO("entering S5 (SLP_TYPa=%u SLP_TYPb=%u)", (unsigned)slp_typa, (unsigned)slp_typb);
+    LOG_INFO("entering S5 (SLP_TYPa=%u SLP_TYPb=%u, FADT rev %u, %u bytes)",
+             (unsigned)slp_typa, (unsigned)slp_typb,
+             (unsigned)fadt->Header.Revision, (unsigned)fadt->Header.Length);
 
-    uint16_t val_a = (uint16_t)((slp_typa << ACPI_PM1_CNT_SLP_TYP_SHIFT) | ACPI_PM1_CNT_SLP_EN);
-    uint16_t val_b = (uint16_t)((slp_typb << ACPI_PM1_CNT_SLP_TYP_SHIFT) | ACPI_PM1_CNT_SLP_EN);
+    uint64_t flags;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
 
-    if (fadt->X_PM1aControlBlock.Address) {
-        outw((uint16_t)fadt->X_PM1aControlBlock.Address, val_a);
-    } else if (fadt->PM1aControlBlock) {
-        outw((uint16_t)fadt->PM1aControlBlock, val_a);
-    }
+    power_write_slp(fadt, 0, slp_typa);
+    power_write_slp(fadt, 1, slp_typb);
 
-    if (fadt->X_PM1bControlBlock.Address) {
-        outw((uint16_t)fadt->X_PM1bControlBlock.Address, val_b);
-    } else if (fadt->PM1bControlBlock) {
-        outw((uint16_t)fadt->PM1bControlBlock, val_b);
-    }
+    for (int i = 0; i < 3000; i++) power_delay_us(1000);
 
-    for (;;) {
-        asm volatile("cli; hlt");
+    if (flags & (1u << 9)) asm volatile("sti" ::: "memory");
+    LOG_ERROR("S5 request was ignored by the firmware");
+    return false;
+}
+
+static void kbc_wait_input_empty(void) {
+    for (int i = 0; i < 0x10000; i++) {
+        if ((inb(0x64) & 0x02) == 0) return;
+        power_delay_us(2);
     }
 }
 
 static void reboot_via_8042(void) {
-
-    for (int timeout = 0; timeout < 100000; timeout++) {
-        if ((inb(0x64) & 0x02) == 0) break;
+    for (int i = 0; i < 10; i++) {
+        kbc_wait_input_empty();
+        power_delay_us(50);
+        outb(0x64, 0xFE);
+        power_delay_us(50);
     }
-    outb(0x64, 0xFE);
+}
+
+static void reboot_via_cf9(void) {
+    uint8_t cf9 = inb(0xCF9) & (uint8_t)~0x0E;
+    outb(0xCF9, (uint8_t)(cf9 | 0x02));
+    power_delay_us(50);
+    outb(0xCF9, (uint8_t)(cf9 | 0x06));
+    power_delay_us(50);
+    outb(0xCF9, (uint8_t)(cf9 | 0x0E));
+}
+
+static void reboot_via_port92(void) {
+    uint8_t v = inb(0x92);
+    outb(0x92, (uint8_t)(v & ~0x01));
+    power_delay_us(50);
+    outb(0x92, (uint8_t)(v | 0x01));
 }
 
 static void reboot_via_triple_fault(void) {
@@ -172,17 +209,27 @@ void acpi_reboot(void) {
     acpi_init();
 
     const ACPI_FADT *fadt = acpi_get_fadt();
-    if (fadt && (fadt->Flags & ACPI_FADT_RESET_REG_SUP)) {
-        LOG_INFO("resetting via FADT reset register");
-        fadt_reset_system(fadt);
+    LOG_INFO("rebooting");
+
+    asm volatile("cli" ::: "memory");
+
+    if (fadt && fadt_reset_system(fadt)) {
+        for (int i = 0; i < 500; i++) power_delay_us(1000);
+        LOG_WARNING("FADT reset register ineffective");
     }
 
-    LOG_WARNING("FADT reset unavailable/ineffective, trying 8042 controller");
     reboot_via_8042();
+    for (int i = 0; i < 500; i++) power_delay_us(1000);
+    LOG_WARNING("8042 reset ineffective, trying 0xCF9");
 
-    for (volatile int i = 0; i < 10000000; i++) { }
+    reboot_via_cf9();
+    for (int i = 0; i < 500; i++) power_delay_us(1000);
+    LOG_WARNING("0xCF9 reset ineffective, trying port 0x92");
 
-    LOG_WARNING("8042 reset ineffective, forcing a triple fault");
+    reboot_via_port92();
+    for (int i = 0; i < 500; i++) power_delay_us(1000);
+    LOG_WARNING("port 0x92 reset ineffective, forcing a triple fault");
+
     reboot_via_triple_fault();
 
     for (;;) {

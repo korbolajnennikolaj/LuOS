@@ -5,7 +5,7 @@
 
 #include <stdbool.h>
 
-#define ACPI_MAX_CACHED_TABLES 32
+#define ACPI_MAX_CACHED_TABLES 128
 
 ACPI_SDT_HEADER *acpi_find_table(const char signature[4], int index);
 

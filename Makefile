@@ -1,3 +1,10 @@
+NPROC := $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+
+ifeq ($(filter -j%,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(NPROC)
+endif
+MAKEFLAGS += --output-sync=target
+
 PROJECT_NAME = LuOS
 KERNEL = kernel.bin
 ISO_LIMINE = $(PROJECT_NAME)_limine.iso
@@ -14,6 +21,8 @@ MPY_FIRMWARE = $(MPY_BUILD_DIR)/firmware.o
 LIMINE_PATH = /usr/share/limine
 OVMF_PATH = /usr/share/edk2/x64/OVMF.4m.fd
 GCC_INCLUDE = $(shell $(CC) -print-file-name=include)
+
+DEPFLAGS = -MMD -MP
 
 CFLAGS_BASE = -m64 -ffreestanding -O2 -Wall -Wextra \
 	-nostdlib -nostdinc -fno-builtin \
@@ -136,16 +145,16 @@ $(BUILD_DIR)/%.o: %.asm
 $(LUA_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "[CC]  Compiling (Lua) $<..."
-	@$(CC) $(CFLAGS_LUA) -c $< -o $@
+	@$(CC) $(CFLAGS_LUA) $(DEPFLAGS) -c $< -o $@
 
 $(MATH_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "[CC]  Compiling (SSE2) $<..."
-	@$(CC) $(CFLAGS_MATH) -c $< -o $@
+	@$(CC) $(CFLAGS_MATH) $(DEPFLAGS) -c $< -o $@
 
 $(MPY_FIRMWARE): FORCE
 	@echo "[MPY] Building MicroPython bare-metal port..."
-	@$(MAKE) -j1 -C $(MPY_DIR)/ports/$(MPY_PORT)
+	@$(MAKE) -C $(MPY_DIR)/ports/$(MPY_PORT)
 
 .PHONY: FORCE
 FORCE:
@@ -153,7 +162,9 @@ FORCE:
 $(NORMAL_OBJECTS): $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "[CC]  Compiling $<..."
-	@$(CC) $(CFLAGS) -c $< -o $@
+	@$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+-include $(OBJECTS:.o=.d)
 
 $(KERNEL): $(OBJECTS) $(MPY_FIRMWARE)
 	@echo "[LD]  Linking kernel with MicroPython..."

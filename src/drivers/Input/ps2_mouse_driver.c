@@ -4,6 +4,7 @@
 #include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/logger.h"
+#include "drivers/Timer/timer.h"
 #include "kernel/scheduler/spinlock.h"
 #include "ps2_keyboard_driver.h"
 #include "mouse_driver.h"
@@ -21,21 +22,53 @@ static uint8_t packet_buf[4];
 static uint8_t packet_pos = 0;
 static uint8_t packet_size = PACKET_SIZE_STD;
 
+#define MOUSE_WRITE_TIMEOUT_MS 20
+#define MOUSE_READ_TIMEOUT_MS 50
+#define MOUSE_RESET_TIMEOUT_MS 750
+#define MOUSE_NO_DATA 0x00
+
+static uint64_t (*mouse_uptime_ms)(void) = NULL;
+
+static uint64_t mouse_now_ms(void) {
+    return mouse_uptime_ms ? mouse_uptime_ms() : 0;
+}
+
+static bool mouse_wait_status(uint8_t mask, bool want_set, uint32_t timeout_ms) {
+    uint64_t t0 = mouse_now_ms();
+    uint32_t spins = 0;
+    for (;;) {
+        bool set = (inb(PS2_STATUS_PORT) & mask) != 0;
+        if (set == want_set) return true;
+        if (mouse_uptime_ms) {
+            if (mouse_now_ms() - t0 >= timeout_ms) return false;
+        } else if (++spins > 100000u) {
+            return false;
+        }
+        asm volatile("pause");
+    }
+}
+
 static void mouse_wait_write(void) {
-    uint32_t timeout = 100000;
-    while (timeout-- && (inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL));
+    mouse_wait_status(PS2_STATUS_INPUT_FULL, false, MOUSE_WRITE_TIMEOUT_MS);
+}
+
+static bool mouse_wait_read_ms(uint32_t timeout_ms) {
+    return mouse_wait_status(PS2_STATUS_OUTPUT_FULL, true, timeout_ms);
 }
 
 static void mouse_wait_read(void) {
-    uint32_t timeout = 100000;
-    while (timeout-- && !(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL));
+    mouse_wait_read_ms(MOUSE_READ_TIMEOUT_MS);
+}
+
+static uint8_t mouse_read_byte(uint32_t timeout_ms) {
+    if (!mouse_wait_read_ms(timeout_ms)) return MOUSE_NO_DATA;
+    return inb(PS2_DATA_PORT);
 }
 
 static uint8_t mouse_write(uint8_t cmd) {
     mouse_wait_write(); outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_AUX);
     mouse_wait_write(); outb(PS2_DATA_PORT, cmd);
-    mouse_wait_read();
-    return inb(PS2_DATA_PORT);
+    return mouse_read_byte(MOUSE_READ_TIMEOUT_MS);
 }
 
 static bool mouse_detect_wheel(void) {
@@ -43,7 +76,7 @@ static bool mouse_detect_wheel(void) {
     mouse_write(MOUSE_CMD_SET_SAMPLE_RATE); mouse_write(100);
     mouse_write(MOUSE_CMD_SET_SAMPLE_RATE); mouse_write(80);
     mouse_write(MOUSE_CMD_GET_DEVICE_ID);
-    return (inb(PS2_DATA_PORT) == 3);
+    return mouse_read_byte(MOUSE_READ_TIMEOUT_MS) == 3;
 }
 
 static void ps2_mouse_apply_packet(void) {
@@ -104,6 +137,10 @@ static void ps2_mouse_irq_wrapper(struct registers *r) {
 }
 
 static void mouse_init(void) {
+    struct tsc_driver *tsc = (struct tsc_driver *)get_self_driver(TIMER_DRIVER, TSC_TIMER);
+    if (tsc && tsc->get_tsc_ticks_per_ms && tsc->get_tsc_ticks_per_ms())
+        mouse_uptime_ms = tsc->get_tsc_uptime_ms;
+
     uint64_t bus_flags = ps2_bus_acquire();
 
     while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL)
@@ -120,8 +157,18 @@ static void mouse_init(void) {
     mouse_wait_write(); outb(PS2_DATA_PORT, config);
 
     uint8_t reset_ack = mouse_write(MOUSE_CMD_RESET);
-    mouse_wait_read(); uint8_t self_test = inb(PS2_DATA_PORT);
-    mouse_wait_read(); uint8_t device_id = inb(PS2_DATA_PORT);
+    uint8_t self_test = mouse_read_byte(MOUSE_RESET_TIMEOUT_MS);
+    uint8_t device_id = mouse_read_byte(MOUSE_READ_TIMEOUT_MS);
+
+    if (reset_ack != 0xFA && self_test != 0xAA && reset_ack != 0xAA) {
+        irq_register_handler(PS2_MOUSE_IRQ_VECTOR, ps2_mouse_irq_wrapper);
+        ps2_bus_release(bus_flags);
+        packet_size = PACKET_SIZE_STD;
+        mouse_state.has_wheel = false;
+        LOG_WARNING("no PS/2 mouse answered reset (ack=0x%02x self-test=0x%02x), aux port left idle",
+                    (unsigned)reset_ack, (unsigned)self_test);
+        return;
+    }
 
     uint8_t defaults_ack = mouse_write(MOUSE_CMD_SET_DEFAULTS);
 

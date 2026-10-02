@@ -88,7 +88,6 @@ void pmm_init(void) {
     for (uint64_t i = 0; i < mm->entry_count; i++) {
         struct limine_memmap_entry *e = mm->entries[i];
         uint64_t end = e->base + e->length;
-        if (end > highest_addr) highest_addr = end;
 
         LOG_DEBUG("memmap 0x%016llx-0x%016llx type %llu (%llu KiB)",
                   (unsigned long long)e->base, (unsigned long long)(end - 1),
@@ -99,6 +98,7 @@ void pmm_init(void) {
             e->type == LIMINE_MEMMAP_ACPI_RECLAIMABLE ||
             e->type == LIMINE_MEMMAP_KERNEL_AND_MODULES) {
             pmm_usable_total += e->length / PAGE_SIZE;
+            if (end > highest_addr) highest_addr = end;
         }
     }
 

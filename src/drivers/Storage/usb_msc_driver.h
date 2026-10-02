@@ -102,6 +102,7 @@ typedef struct usb_msc_device {
     uint32_t cbw_tag;
     uint32_t max_xfer;
     bool bulk_configured;
+    uint8_t consecutive_timeouts;
     struct block_device blkdev;
 } usb_msc_device_t;
 

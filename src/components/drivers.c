@@ -88,6 +88,8 @@ void init_drivers() {
 
     register_driver(return_meta_limine_video_driver());
 
+    acpi_init();
+
     register_driver(return_meta_rtc_driver());
     register_driver(return_meta_pit_driver());
     register_driver(return_meta_tsc_driver());

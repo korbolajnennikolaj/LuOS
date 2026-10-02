@@ -57,6 +57,7 @@ typedef struct xhci_controller {
 
     volatile uint8_t last_slot_id;
     volatile uint8_t last_completion_code;
+    volatile uint8_t last_cmd_code;
     volatile uint8_t pending_xfer_valid;
     volatile uint8_t pending_xfer_slot;
     volatile uint8_t pending_xfer_code;

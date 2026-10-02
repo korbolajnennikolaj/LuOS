@@ -188,6 +188,10 @@ void usb_event_register_handler_for_device(usb_event_handler_t fn, void *ctx, vo
     }
 }
 
+int usb_bulk_handler_count(void) {
+    return __atomic_load_n(&s_bulk_handler_count, __ATOMIC_RELAXED);
+}
+
 void usb_bulk_register_handler(usb_event_handler_t fn, void *ctx) {
     uint64_t flags = spin_lock_irqsave(&handlers_lock);
     if (s_bulk_handler_count >= USB_EVENT_MAX_HANDLERS) {

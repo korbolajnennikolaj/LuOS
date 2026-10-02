@@ -9,6 +9,7 @@
 #define USB_HOTPLUG_TOPOLOGY_TICKS 5
 #define USB_HOTPLUG_SURVEY_TICKS 25
 #define USB_HOTPLUG_WATCHDOG_MS 5000
+#define USB_HOTPLUG_BUSY_WATCHDOG_MS 120000
 #define USB_HOTPLUG_MAX_TRACKED 64
 
 static volatile uint64_t usb_hotplug_last_beat_ms = 0;
@@ -93,12 +94,17 @@ static void usb_hotplug_entry(void *arg) {
         }
 
         if (usb && usb->poll_transfers) {
+            usb_hotplug_scanning = true;
             usb->poll_transfers();
+            usb_hotplug_scanning = false;
             usb_hotplug_polls++;
         }
 
-        if (usb && usb->poll_topology && (tick % USB_HOTPLUG_TOPOLOGY_TICKS) == 0)
+        if (usb && usb->poll_topology && (tick % USB_HOTPLUG_TOPOLOGY_TICKS) == 0) {
+            usb_hotplug_scanning = true;
             usb->poll_topology();
+            usb_hotplug_scanning = false;
+        }
 
         if ((tick % USB_HOTPLUG_SURVEY_TICKS) == 0) usb_hotplug_survey();
 
@@ -111,11 +117,11 @@ static void usb_hotplug_entry(void *arg) {
 static bool usb_hotplug_update(void *arg) {
     (void)arg;
     if (usb_hotplug_last_beat_ms == 0) return true;
-    if (usb_hotplug_scanning) return true;
     uint64_t silent = service_uptime_ms() - usb_hotplug_last_beat_ms;
-    if (silent < USB_HOTPLUG_WATCHDOG_MS) return true;
-    LOG_WARNING("hotplug loop silent for %llu ms (watchdog %u ms)",
-                (unsigned long long)silent, USB_HOTPLUG_WATCHDOG_MS);
+    uint32_t limit = usb_hotplug_scanning ? USB_HOTPLUG_BUSY_WATCHDOG_MS : USB_HOTPLUG_WATCHDOG_MS;
+    if (silent < limit) return true;
+    LOG_WARNING("hotplug loop silent for %llu ms (watchdog %u ms%s)",
+                (unsigned long long)silent, (unsigned)limit, usb_hotplug_scanning ? ", busy in USB stack" : "");
     return false;
 }
 

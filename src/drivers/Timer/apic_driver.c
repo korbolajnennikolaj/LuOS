@@ -81,10 +81,14 @@ static void apic_enable(void) {
 }
 
 static void apic_calibrate(struct pit_driver *pit) {
+    struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
+    int use_tsc = tsc && tsc->get_tsc_ticks_per_ms && tsc->get_tsc_ticks_per_ms() != 0;
+
     apic_write(APIC_REG_TIMER_DIV, 0x3);
     apic_write(APIC_REG_TIMER_INIT, 0xFFFFFFFF);
 
-    pit->sleep_pit_ms(10);
+    if (use_tsc) tsc->sleep_tsc_ms(10);
+    else pit->sleep_pit_ms(10);
 
     uint32_t elapsed = 0xFFFFFFFF - apic_read(APIC_REG_TIMER_CUR);
     ticks_per_ms = elapsed / 10;
@@ -152,7 +156,8 @@ struct apic_driver *return_apic_driver(void) {
 
 struct driver *return_meta_apic_driver(void) {
     static struct dependency dep[] = {
-        MAKE_DEPENDENCY(TIMER_DRIVER, PIT_TIMER)
+        MAKE_DEPENDENCY(TIMER_DRIVER, PIT_TIMER),
+        MAKE_DEPENDENCY(TIMER_DRIVER, TSC_TIMER)
     };
 
     static struct driver meta = {
@@ -160,8 +165,8 @@ struct driver *return_meta_apic_driver(void) {
         .type = TIMER_DRIVER,
         .sub_type = APIC_TIMER,
         .status = DRIVER_STATUS_UNINITIALIZED,
-        .dependencies = { &dep[0] },
-        .dependency_count = 1,
+        .dependencies = { &dep[0], &dep[1] },
+        .dependency_count = 2,
         .self = &apic_driver_loaded,
         .init = (void *)return_apic_driver
     };
