@@ -46,12 +46,68 @@ typedef struct ehci_pending_xfer {
     int ri;
     void *cookie;
     uint8_t endpoint;
+    uint8_t addr;
+    uint8_t result_ready;
+    int8_t last_result;
     struct usb_device *device;
 } ehci_pending_xfer;
 
 #define MAX_EHCI_HID_SLOTS 4
 #define MAX_EHCI_PENDING (MAX_EHCI_CONTROLLERS * MAX_EHCI_HID_SLOTS)
 static struct ehci_pending_xfer s_ehci_pending[MAX_EHCI_CONTROLLERS][MAX_EHCI_HID_SLOTS];
+
+uint8_t ehci_dev_speed[MAX_EHCI_CONTROLLERS][128];
+uint8_t ehci_dev_tt_hub[MAX_EHCI_CONTROLLERS][128];
+uint8_t ehci_dev_tt_port[MAX_EHCI_CONTROLLERS][128];
+uint8_t ehci_dev_mps0[MAX_EHCI_CONTROLLERS][128];
+
+int ehci_controller_index(struct ehci_controller *e) {
+    for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++)
+        if (&ehci_resources[i].ctrl == e) return i;
+    return -1;
+}
+
+static uint32_t ehci_endpoint_chars(int ri, uint8_t addr, uint8_t ep_num, uint32_t mps,
+                                    int is_control, int periodic, uint32_t *caps_out) {
+    uint8_t a = addr & 0x7Fu;
+    uint8_t speed = ehci_dev_speed[ri][a];
+    uint32_t eps = (speed == 1) ? 0u : (speed == 2) ? 1u : 2u;
+
+    uint32_t chars = (uint32_t)a
+                   | ((uint32_t)(ep_num & 0xFu) << 8)
+                   | (eps << 12)
+                   | (mps << 16);
+    uint32_t caps = (1u << 30);
+
+    if (eps != 2u) {
+        if (is_control) chars |= (1u << 27);
+        caps |= ((uint32_t)(ehci_dev_tt_hub[ri][a] & 0x7Fu) << 16)
+              | ((uint32_t)(ehci_dev_tt_port[ri][a] & 0x7Fu) << 23);
+        if (periodic) caps |= 0x01u | (0x1Cu << 8);
+    } else if (periodic) {
+        caps |= 0x01u;
+    }
+
+    if (caps_out) *caps_out = caps;
+    return chars;
+}
+
+static uint32_t ehci_control_mps(struct ehci_controller *e, int ri, uint8_t addr) {
+    if (addr == 0) return 8u;
+
+    uint8_t m = ehci_dev_mps0[ri][addr & 0x7Fu];
+    if (m == 8 || m == 16 || m == 32 || m == 64) return m;
+
+    for (int i = 0; i < MAX_USB_DEVICES; i++) {
+        struct usb_device *d = (struct usb_device *)device_table[USB_DEVICE][i];
+        if (!d || d->address != addr || d->ctrl != (struct usb_controller *)e) continue;
+        uint8_t dm = d->desc.bMaxPacketSize0;
+        if (dm == 8 || dm == 16 || dm == 32 || dm == 64) return dm;
+        break;
+    }
+
+    return (ehci_dev_speed[ri][addr & 0x7Fu] == 2) ? 8u : 64u;
+}
 
 static inline uint64_t get_hhdm_offset(void) {
     return hhdm_req.response ? hhdm_req.response->offset : 0xffff800000000000ULL;
@@ -318,36 +374,25 @@ static int ehci_control_transfer_impl(struct ehci_controller *e, uint8_t dev_add
     qtd_status->alt_next_qtd = 1;
     qtd_status->token = 0x80 | (pid_s << 8) | (3 << 10) | (1u << 31);
 
-    uint32_t mps = 8u;
-    if (dev_addr != 0) {
-        for (int _ci = 0; _ci < MAX_USB_DEVICES; _ci++) {
-            struct usb_device *_cd = (struct usb_device *)device_table[USB_DEVICE][_ci];
-            if (_cd && (uint8_t)_cd->address == dev_addr && _cd->max_packet_size > 0) {
-                mps = _cd->max_packet_size;
-                break;
-            }
-        }
-        if (mps == 8u) mps = 64u;
-    }
+    uint32_t mps = ehci_control_mps(e, ri, dev_addr);
 
     struct ehci_qh *qh = &ehci_resources[ri].async_head;
-    qh->characteristics = (dev_addr & 0x7F)
-                        | ((endpoint & 0xF) << 8)
-                        | (2u << 12)
+    uint32_t ctl_caps = 0;
+    qh->characteristics = ehci_endpoint_chars(ri, dev_addr, endpoint, mps, 1, 0, &ctl_caps)
                         | (1u << 14)
-                        | (1u << 15)
-                        | (mps << 16);
+                        | (1u << 15);
+    qh->caps_overlay = ctl_caps;
     ehci_reset_qh_overlay(qh);
     qh->next_link = (uint32_t)mm_ptr_to_phys(qtd_setup);
     asm volatile("mfence" ::: "memory");
 
-    ehci_write(e, EHCI_ASYNCLISTADDR,
-               (uint32_t)mm_ptr_to_phys(&ehci_resources[ri].async_head));
-
     {
         uint32_t cmd = ehci_read(e, EHCI_USBCMD);
-        if (!(cmd & (1 << 5)))
+        if (!(cmd & (1 << 5))) {
+            ehci_write(e, EHCI_ASYNCLISTADDR,
+                       (uint32_t)mm_ptr_to_phys(&ehci_resources[ri].async_head));
             ehci_write(e, EHCI_USBCMD, cmd | (1 << 5));
+        }
     }
     asm volatile("mfence" ::: "memory");
 
@@ -421,12 +466,16 @@ static int ehci_interrupt_transfer_impl(struct ehci_controller *e, uint8_t dev_a
     int slot_idx = -1;
     for (int _s = 0; _s < MAX_EHCI_HID_SLOTS; _s++) {
         struct ehci_pending_xfer *_p = &s_ehci_pending[ri][_s];
-        if (_p->active && _p->device) {
-            if ((uint8_t)_p->device->address == dev_addr) { slot_idx = _s; break; }
-        }
+        if ((_p->active || _p->result_ready) &&
+            _p->addr == dev_addr && _p->endpoint == endpoint) { slot_idx = _s; break; }
     }
     if (slot_idx < 0) {
 
+        for (int _s = 0; _s < MAX_EHCI_HID_SLOTS; _s++) {
+            if (!s_ehci_pending[ri][_s].active && !s_ehci_pending[ri][_s].result_ready) { slot_idx = _s; break; }
+        }
+    }
+    if (slot_idx < 0) {
         for (int _s = 0; _s < MAX_EHCI_HID_SLOTS; _s++) {
             if (!s_ehci_pending[ri][_s].active) { slot_idx = _s; break; }
         }
@@ -466,10 +515,18 @@ static int ehci_interrupt_transfer_impl(struct ehci_controller *e, uint8_t dev_a
             };
             usb_push_event(&evt);
             pend->active = 0;
+            pend->result_ready = 1;
+            pend->last_result = ok ? 0 : -1;
         } else {
 
             return -2;
         }
+    }
+
+    if (pend->result_ready) {
+        pend->result_ready = 0;
+        if (pend->data == data && pend->addr == dev_addr && pend->endpoint == endpoint)
+            return pend->last_result;
     }
 
     if (direction) {
@@ -494,7 +551,7 @@ static int ehci_interrupt_transfer_impl(struct ehci_controller *e, uint8_t dev_a
     uint32_t ehci_mps = 8u;
     for (int _mi = 0; _mi < MAX_USB_DEVICES; _mi++) {
         struct usb_device *_md = (struct usb_device *)device_table[USB_DEVICE][_mi];
-        if (_md && (uint8_t)_md->address == dev_addr) {
+        if (_md && (uint8_t)_md->address == dev_addr && _md->ctrl == (struct usb_controller *)e) {
 
             if (_md->device_class == 0x09 && _md->hub_status_ep == endpoint) {
                 if (_md->hub_status_ep_mps) ehci_mps = _md->hub_status_ep_mps;
@@ -504,11 +561,9 @@ static int ehci_interrupt_transfer_impl(struct ehci_controller *e, uint8_t dev_a
             break;
         }
     }
-    iqh->characteristics = (dev_addr & 0x7F)
-                         | ((ep_num & 0xF) << 8)
-                         | (2 << 12)
-
-                         | (ehci_mps << 16);
+    uint32_t int_caps = 0;
+    iqh->characteristics = ehci_endpoint_chars(ri, dev_addr, ep_num, ehci_mps, 0, 1, &int_caps);
+    iqh->caps_overlay = int_caps;
     ehci_reset_qh_overlay(iqh);
     iqh->next_link = (uint32_t)mm_ptr_to_phys(qtd);
     asm volatile("mfence" ::: "memory");
@@ -520,6 +575,8 @@ static int ehci_interrupt_transfer_impl(struct ehci_controller *e, uint8_t dev_a
     pend->direction = direction;
     pend->ri = ri;
     pend->endpoint = endpoint;
+    pend->addr = dev_addr;
+    pend->result_ready = 0;
 
     pend->device = NULL;
     for (int _di = 0; _di < MAX_USB_DEVICES; _di++) {
@@ -592,6 +649,8 @@ void ehci_irq(void) {
         };
         usb_push_event(&evt);
         pend->active = 0;
+        pend->result_ready = 1;
+        pend->last_result = ok ? 0 : -1;
         }
     }
 }
@@ -760,13 +819,13 @@ static int ehci_bulk_transfer_impl(struct ehci_controller *e, uint8_t dev_addr, 
         }
     }
     if (bulk_mps == 0u || bulk_mps > 1024u) bulk_mps = 512u;
+    if (ehci_dev_speed[ri][dev_addr & 0x7Fu] == 1 && bulk_mps > 64u) bulk_mps = 64u;
 
     struct ehci_qh *qh = &ehci_resources[ri].async_head;
-    qh->characteristics = (dev_addr & 0x7Fu)
-                        | ((uint32_t)(ep_num & 0xFu) << 8)
-                        | (2u << 12)
-                        | ((uint32_t)bulk_mps << 16)
+    uint32_t bulk_caps = 0;
+    qh->characteristics = ehci_endpoint_chars(ri, dev_addr, ep_num, bulk_mps, 0, 0, &bulk_caps)
                         | (1u << 15);
+    qh->caps_overlay = bulk_caps;
 
     {
         uint8_t dt_da = (uint8_t)(dev_addr & 0x7Fu);
@@ -1048,6 +1107,33 @@ void ehci_notify_disconnect(struct usb_device *dev) {
             p->active = 0;
             p->device = NULL;
             p->cookie = NULL;
+        }
+
+        for (int s = 0; s < MAX_EHCI_HID_SLOTS; s++) {
+            struct ehci_pending_xfer *p = &s_ehci_pending[ri][s];
+            if (p->result_ready && p->addr == dev->address &&
+                dev->ctrl == (struct usb_controller *)&ehci_resources[ri].ctrl)
+                p->result_ready = 0;
+        }
+
+        struct ehci_bulk_pending *b = &s_ehci_bulk_pending[ri];
+        if (b->active && b->device == dev) {
+            ehci_resources[ri].async_head.next_link = 1;
+            asm volatile("mfence" ::: "memory");
+            free_qtd(ri, b->qtd);
+            b->active = 0;
+            b->device = NULL;
+            b->cookie = NULL;
+        }
+
+        if (ri < ehci_controller_count &&
+            dev->ctrl == (struct usb_controller *)&ehci_resources[ri].ctrl) {
+            uint8_t a = dev->address & 0x7Fu;
+            ehci_dev_speed[ri][a] = 0;
+            ehci_dev_tt_hub[ri][a] = 0;
+            ehci_dev_tt_port[ri][a] = 0;
+            ehci_dev_mps0[ri][a] = 0;
+            for (int i = 0; i < EHCI_DT_EP_DIRS; i++) ehci_bulk_dt[ri][a][i] = 0;
         }
     }
 }

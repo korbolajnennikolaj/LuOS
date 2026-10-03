@@ -90,6 +90,14 @@ typedef struct usb_device {
 
     uint32_t route_string;
 
+    uint8_t speed_id;
+
+    uint8_t tt_hub_slot;
+    uint8_t tt_port;
+
+    int16_t parent_slot;
+    uint8_t parent_port;
+
     uint8_t endpoint_address;
     uint16_t max_packet_size;
     uint8_t hid_interface;

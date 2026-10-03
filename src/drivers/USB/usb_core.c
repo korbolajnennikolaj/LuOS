@@ -56,7 +56,7 @@ int usb_interrupt_transfer(struct usb_device *dev, uint8_t endpoint, void *data,
 static void usb_core_enqueue_event(const usb_event_t *evt);
 static void usb_core_poll_transfers(void);
 void usb_init_device(void *ctrl_ptr, uint8_t port, bool is_xhci);
-void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
+int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                            uint8_t root_port, uint8_t hub_depth,
                            uint32_t route_string, uint8_t parent_hub_slot,
                            uint8_t speed_id);
@@ -522,7 +522,7 @@ static void usb_root_ports_reset_state(void) {
 static int usb_root_find_device_slot(struct usb_controller *ctrl_generic, uint8_t port) {
     for (int i = 0; i < usb_device_count; i++) {
         struct usb_device *dev = &usb_device_pool[i];
-        if (dev->valid && dev->ctrl == ctrl_generic && dev->port == port) return i;
+        if (dev->valid && dev->ctrl == ctrl_generic && dev->hub_depth == 0 && dev->port == port) return i;
     }
     return -1;
 }
@@ -1002,22 +1002,61 @@ void usb_init_device(void *ctrl_ptr, uint8_t port, bool is_xhci) {
     usb_init_device_topo(ctrl_ptr, port, is_xhci, port, 0, 0, 0, 0);
 }
 
-void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
+static int usb_find_parent_hub_slot(void *ctrl_ptr, uint8_t hub_address) {
+    if (hub_address == 0) return -1;
+    for (int i = 0; i < usb_device_count; i++) {
+        struct usb_device *d = &usb_device_pool[i];
+        if (d->valid && d->ctrl == (struct usb_controller *)ctrl_ptr &&
+            d->device_class == 0x09 && d->address == hub_address)
+            return i;
+    }
+    return -1;
+}
+
+static uint16_t usb_xhci_default_ep0_mps(uint8_t speed) {
+    switch (speed) {
+        case 2: return 8;
+        case 1:
+        case 3: return 64;
+        default: return 512;
+    }
+}
+
+int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                            uint8_t root_port, uint8_t hub_depth,
                            uint32_t route_string, uint8_t parent_hub_slot,
                            uint8_t speed_id) {
     int slot = usb_reserve_slot();
-    if (slot < 0) return;
+    if (slot < 0) return -1;
     struct usb_device *dev = &usb_device_pool[slot];
 
     uint8_t *p = (uint8_t *)dev;
     for (size_t i = 0; i < sizeof(struct usb_device); i++) p[i] = 0;
     dev->valid = 1;
+    dev->parent_slot = -1;
 
     dev->port = port;
     dev->ctrl = (struct usb_controller *)ctrl_ptr;
     dev->root_port = root_port;
     dev->hub_depth = hub_depth;
+    dev->speed_id = speed_id;
+
+    int parent_idx = (hub_depth > 0) ? usb_find_parent_hub_slot(ctrl_ptr, parent_hub_slot) : -1;
+    if (parent_idx >= 0) {
+        dev->parent_slot = (int16_t)parent_idx;
+        dev->parent_port = port;
+    }
+
+    if (hub_depth > 0 && (speed_id == 1 || speed_id == 2) && parent_idx >= 0) {
+        struct usb_device *parent = &usb_device_pool[parent_idx];
+        if (parent->speed_id == 3) {
+            dev->tt_hub_slot = parent->address;
+            dev->tt_port = port;
+        } else {
+            dev->tt_hub_slot = parent->tt_hub_slot;
+            dev->tt_port = parent->tt_port;
+        }
+    }
     LOG_DEBUG("enumerating %s port %u (root %u, depth %u, route 0x%05x, parent slot %u)",
               is_xhci ? "xHCI" : "legacy", (unsigned)port, (unsigned)root_port,
               (unsigned)hub_depth, route_string, (unsigned)parent_hub_slot);
@@ -1035,13 +1074,29 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
             my_route |= ((uint32_t)(port & 0xFu) << (4 * (hub_depth - 1)));
         dev->route_string = my_route;
 
+        uint8_t dev_speed = speed_id;
+        if (hub_depth == 0) {
+            struct xhci_hub rh = { .ctrl = (struct xhci_controller *)ctrl_ptr };
+            uint32_t ps = xhci_hub_exec(&rh, HUB_CMD_PORT_STATUS, root_port, 0);
+            dev_speed = (uint8_t)((ps >> 10) & 0xFu);
+        }
+        if (dev_speed == 0) dev_speed = 1;
+        dev->speed_id = dev_speed;
+
         struct xhci_topology topo = {
             .root_port = root_port,
             .route_string = my_route,
             .parent_hub_slot = parent_hub_slot,
             .parent_port = (parent_hub_slot != 0) ? port : 0,
             .speed_id = speed_id,
+            .tt_hub_slot = dev->tt_hub_slot,
+            .tt_port = dev->tt_port,
         };
+
+        if (hub_depth > 0)
+            LOG_DEBUG("slot %d: route 0x%05x, speed %u, TT hub slot %u port %u",
+                      slot_id, my_route, (unsigned)dev_speed,
+                      (unsigned)dev->tt_hub_slot, (unsigned)dev->tt_port);
 
         if (x_drv->address_device((struct xhci_controller *)ctrl_ptr,
             slot_id, &topo) != 0) {
@@ -1055,6 +1110,35 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
         delay_ms(100);
 
         static uint8_t desc_tmp[64] __attribute__((aligned(64)));
+        for (int i = 0; i < 64; i++) desc_tmp[i] = 0;
+        struct usb_setup_packet setup8 = {0x80, 0x06, 0x0100, 0, 8};
+        if (x_drv->control_transfer((struct xhci_controller *)dev->ctrl,
+            dev->address, 0, &setup8, 8, desc_tmp, 8, 1) != 0) {
+            LOG_ERROR("slot %d: GET_DESCRIPTOR(device, 8) failed", slot_id);
+            if (x_drv->disable_slot)
+                x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
+            goto fail;
+        }
+
+        uint16_t cur_mps0 = usb_xhci_default_ep0_mps(dev_speed);
+        uint16_t want_mps0 = cur_mps0;
+        if (dev_speed >= 4) {
+            if (desc_tmp[7] >= 3 && desc_tmp[7] <= 15) want_mps0 = (uint16_t)(1u << desc_tmp[7]);
+        } else if (dev_speed == 1) {
+            if (desc_tmp[7] == 8 || desc_tmp[7] == 16 || desc_tmp[7] == 32 || desc_tmp[7] == 64)
+                want_mps0 = desc_tmp[7];
+        }
+        if (want_mps0 != cur_mps0) {
+            if (!x_drv->update_ep0_mps ||
+                x_drv->update_ep0_mps((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id, want_mps0) != 0) {
+                LOG_ERROR("slot %d: could not set EP0 max packet size %u", slot_id, (unsigned)want_mps0);
+                if (x_drv->disable_slot)
+                    x_drv->disable_slot((struct xhci_controller *)ctrl_ptr, (uint8_t)slot_id);
+                goto fail;
+            }
+        }
+
+        for (int i = 0; i < 64; i++) desc_tmp[i] = 0;
         struct usb_setup_packet setup = {0x80, 0x06, 0x0100, 0, 18};
         if (x_drv->control_transfer((struct xhci_controller *)dev->ctrl,
             dev->address, 0, &setup, 8, desc_tmp, 18, 1) != 0) {
@@ -1078,6 +1162,37 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                   (unsigned)dev->desc.bcdUSB, (unsigned)dev->desc.bMaxPacketSize0);
     } else {
         dev->address = 0;
+
+        if (dev->ctrl && dev->ctrl->type == USB_TYPE_UHCI) {
+            int ki = uhci_controller_index((struct uhci_controller *)dev->ctrl);
+            if (ki >= 0) {
+                if (hub_depth > 0) uhci_dev_is_ls[ki][0] = (speed_id == 2) ? 1 : 0;
+                else dev->speed_id = uhci_dev_is_ls[ki][0] ? 2 : 1;
+            }
+        }
+
+        if (dev->ctrl && dev->ctrl->type == USB_TYPE_OHCI) {
+            int ki = ohci_controller_index((struct ohci_controller *)dev->ctrl);
+            if (ki >= 0) {
+                if (hub_depth > 0) ohci_dev_is_ls[ki][0] = (speed_id == 2) ? 1 : 0;
+                else dev->speed_id = ohci_dev_is_ls[ki][0] ? 2 : 1;
+            }
+        }
+
+        if (dev->ctrl && dev->ctrl->type == USB_TYPE_EHCI) {
+            int ki = ehci_controller_index((struct ehci_controller *)dev->ctrl);
+            if (hub_depth == 0 || dev->speed_id == 0) dev->speed_id = 3;
+            if (ki >= 0) {
+                ehci_dev_speed[ki][0] = dev->speed_id;
+                ehci_dev_tt_hub[ki][0] = dev->tt_hub_slot;
+                ehci_dev_tt_port[ki][0] = dev->tt_port;
+                ehci_dev_mps0[ki][0] = 0;
+            }
+            if (hub_depth > 0)
+                LOG_DEBUG("ehci child port %u: speed %u, TT hub addr %u port %u",
+                          (unsigned)port, (unsigned)dev->speed_id,
+                          (unsigned)dev->tt_hub_slot, (unsigned)dev->tt_port);
+        }
 
         static uint8_t b8[8] __attribute__((aligned(64)));
         for (int i = 0; i < 8; i++) b8[i] = 0;
@@ -1131,6 +1246,17 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                 uhci_dev_mps0[ki][new_addr & 0x7F] = (uint8_t)dev->max_packet_size;
                 LOG_DEBUG("uhci%d addr %u: low_speed=%u mps0=%u",
                           ki, (unsigned)new_addr, (unsigned)uhci_dev_is_ls[ki][0], (unsigned)dev->max_packet_size);
+            }
+        }
+
+        if (dev->ctrl && dev->ctrl->type == USB_TYPE_EHCI) {
+            int ki = ehci_controller_index((struct ehci_controller *)dev->ctrl);
+            if (ki >= 0) {
+                dev->is_low_speed = (dev->speed_id == 2) ? 1 : 0;
+                ehci_dev_speed[ki][new_addr & 0x7F] = ehci_dev_speed[ki][0];
+                ehci_dev_tt_hub[ki][new_addr & 0x7F] = ehci_dev_tt_hub[ki][0];
+                ehci_dev_tt_port[ki][new_addr & 0x7F] = ehci_dev_tt_port[ki][0];
+                ehci_dev_mps0[ki][new_addr & 0x7F] = (uint8_t)dev->max_packet_size;
             }
         }
 
@@ -1277,13 +1403,14 @@ void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
 
         LOG_DEBUG("hub at addr %u: downstream enumeration done", (unsigned)dev->address);
     }
-    return;
+    return slot;
 
 fail:
     LOG_WARNING("enumeration of port %u failed", (unsigned)port);
     { uint64_t flags = spin_lock_irqsave(&usb_core_lock);
     dev->valid = 0;
     spin_unlock_irqrestore(&usb_core_lock, flags); }
+    return -1;
 }
 
 static void usb_scan_all_locked(void) {

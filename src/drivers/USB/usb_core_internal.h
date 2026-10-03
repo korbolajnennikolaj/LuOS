@@ -15,7 +15,7 @@ int usb_interrupt_transfer(struct usb_device *dev, uint8_t endpoint,
 
 void usb_init_device(void *ctrl_ptr, uint8_t port, bool is_xhci);
 
-void usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
+int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                            uint8_t root_port, uint8_t hub_depth,
                            uint32_t route_string, uint8_t parent_hub_slot,
                            uint8_t speed_id);

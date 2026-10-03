@@ -30,6 +30,10 @@ typedef struct xhci_topology {
 
     uint8_t speed_id;
 
+    uint8_t tt_hub_slot;
+
+    uint8_t tt_port;
+
 } xhci_topology;
 
 typedef struct xhci_controller {
@@ -85,7 +89,10 @@ typedef struct xhci_driver {
     int (*disable_slot)(struct xhci_controller* x, uint8_t slot_id);
     int (*address_device)(struct xhci_controller* x, uint8_t slot_id, const struct xhci_topology* topo);
 
-    int (*evaluate_hub_slot)(struct xhci_controller* x, uint8_t slot_id, uint8_t port_count);
+    int (*evaluate_hub_slot)(struct xhci_controller* x, uint8_t slot_id, uint8_t port_count,
+                             uint8_t think_time, uint8_t multi_tt);
+
+    int (*update_ep0_mps)(struct xhci_controller* x, uint8_t slot_id, uint16_t mps);
 
     int (*control_transfer)(struct xhci_controller* x, uint8_t slot_id, uint8_t endpoint,
                             void* setup, uint16_t setup_len,

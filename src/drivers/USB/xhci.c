@@ -314,7 +314,9 @@ static int xhci_reset_port_impl(struct xhci_controller *x, uint8_t port);
 static int xhci_enable_slot_impl(struct xhci_controller *x);
 static int xhci_disable_slot_impl(struct xhci_controller *x, uint8_t slot_id);
 static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, const struct xhci_topology *topo);
-static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count);
+static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count,
+                                       uint8_t think_time, uint8_t multi_tt);
+static int xhci_update_ep0_mps_impl(struct xhci_controller *x, uint8_t slot_id, uint16_t mps);
 
 static void xhci_event_leave(struct xhci_controller *x) {
     uint64_t flags = spin_lock_irqsave(&x->event_lock);
@@ -414,7 +416,7 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
                         struct usb_device *ev_dev = NULL;
                         for (int _di = 0; _di < MAX_USB_DEVICES; _di++) {
                             struct usb_device *_d = (struct usb_device *)device_table[USB_DEVICE][_di];
-                            if (_d && (uint8_t)_d->address == ev_slot) { ev_dev = _d; break; }
+                            if (_d && _d->valid && (struct xhci_controller *)_d->ctrl == x && (uint8_t)_d->address == ev_slot) { ev_dev = _d; break; }
                         }
                         uint8_t ep_num = ev_ep >> 1;
                         uint8_t is_in = (ev_ep & 1);
@@ -814,7 +816,7 @@ static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, 
     LOG_DEBUG("Address Device, slot %u", (unsigned)slot_id);
     if (slot_id == 0 || slot_id > MAX_SLOTS) { LOG_ERROR("Bad slot, code 0x%x", slot_id); return -1; }
 
-    static const struct xhci_topology root_topo_default = {0, 0, 0, 0, 0};
+    static const struct xhci_topology root_topo_default = {0, 0, 0, 0, 0, 0, 0};
     if (!topo) topo = &root_topo_default;
 
     int idx = x - ctrls;
@@ -870,7 +872,7 @@ static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, 
 
     ic[W + 0] = (topo->route_string & 0xFFFFFu) | (1u << 27) | (ss << 20);
     ic[W + 1] = ((uint32_t)topo->root_port << 16);
-    ic[W + 2] = ((uint32_t)topo->parent_hub_slot) | ((uint32_t)topo->parent_port << 8);
+    ic[W + 2] = ((uint32_t)topo->tt_hub_slot) | ((uint32_t)topo->tt_port << 8);
 
     ic[2 * W + 1] = (mps << 16) | (4 << 3) | (3 << 1);
     uint64_t tr_phys = virt_to_phys(tr);
@@ -916,16 +918,38 @@ static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, 
     return -1;
 }
 
-int xhci_evaluate_hub_slot(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count)
+int xhci_evaluate_hub_slot(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count,
+                           uint8_t think_time, uint8_t multi_tt)
 {
     if (!x) return -1;
     xhci_ctrl_enter(x);
-    int _r = xhci_evaluate_hub_slot_impl(x, slot_id, port_count);
+    int _r = xhci_evaluate_hub_slot_impl(x, slot_id, port_count, think_time, multi_tt);
     xhci_ctrl_leave(x);
     return _r;
 }
 
-static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count) {
+static int xhci_hub_slot_command(struct xhci_controller *x, uint8_t slot_id, uint32_t *ic, uint32_t trb_type) {
+    for (size_t i = 0; i < XHCI_INPUT_CTX_BYTES; i += 64) CACHE_FLUSH((uint8_t *)ic + i);
+    FULL_BARRIER();
+
+    struct xhci_trb cmd = {0};
+    cmd.param = virt_to_phys(ic);
+    cmd.control = ((uint32_t)slot_id << 24) | (trb_type << 10);
+    x->last_completion_code = 0xFF;
+
+    if (xhci_send_command(x, &cmd) != 0) return -1;
+
+    for (int i = 0; i < 5000; i++) {
+        xhci_poll_event_ring(x);
+        if (x->last_completion_code != 0xFF) break;
+        delay_ms(2);
+    }
+
+    return (x->last_completion_code == 1) ? 0 : -1;
+}
+
+static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t port_count,
+                                       uint8_t think_time, uint8_t multi_tt) {
     if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots) return -1;
 
     int idx = x - ctrls;
@@ -934,45 +958,110 @@ static int xhci_evaluate_hub_slot_impl(struct xhci_controller *x, uint8_t slot_i
     uint32_t *ic = (uint32_t *)xhci_mem[idx].input_ctx[slot_id - 1];
     uint8_t *dc = (uint8_t *)xhci_mem[idx].dev_ctx[slot_id - 1];
 
-    memset(ic, 0, XHCI_INPUT_CTX_BYTES);
-
     for (size_t i = 0; i < XHCI_DEV_CTX_BYTES; i += 64) CACHE_FLUSH(dc + i);
     FULL_BARRIER();
 
     struct xhci_slot_context *dev_slot = (struct xhci_slot_context *)xhci_dev_ctx_slot(dc);
+    uint32_t dw0 = dev_slot->dw0;
+    uint32_t dw1 = dev_slot->dw1;
+    uint32_t dw2 = dev_slot->dw2;
+    uint32_t speed = (dw0 >> 20) & 0xFu;
 
-    ic[1] = 0x1;
+    uint32_t hci_version = rd32(x->base_addr, 0x00) >> 16;
 
-    uint32_t *slot_w = ic + W;
-    slot_w[0] = dev_slot->dw0 | (1u << 26);
-    slot_w[1] = (dev_slot->dw1 & 0x0000FFFFu) | ((uint32_t)port_count << 24);
-    slot_w[2] = dev_slot->dw2;
-    slot_w[3] = dev_slot->dw3;
+    dw0 |= (1u << 26);
+    if (speed == 3u && multi_tt) dw0 |= (1u << 25);
+    else dw0 &= ~(1u << 25);
+    dw1 = (dw1 & 0x00FFFFFFu) | ((uint32_t)port_count << 24);
+    dw2 &= ~(0x3u << 16);
+    if (speed == 3u) dw2 |= ((uint32_t)(think_time & 0x3u) << 16);
 
-    for (size_t i = 0; i < XHCI_INPUT_CTX_BYTES; i += 64) CACHE_FLUSH((uint8_t *)ic + i);
-    FULL_BARRIER();
+    uint32_t types[2];
+    int n_types = 0;
+    if (hci_version > 0x95u) types[n_types++] = TRB_TYPE_CONFIG_EP;
+    types[n_types++] = TRB_TYPE_EVALUATE_CONTEXT;
 
-    struct xhci_trb cmd = {0};
-    cmd.param = virt_to_phys(ic);
-    cmd.control = ((uint32_t)slot_id << 24) | (TRB_TYPE_EVALUATE_CONTEXT << 10);
-    x->last_completion_code = 0xFF;
+    for (int t = 0; t < n_types; t++) {
+        memset(ic, 0, XHCI_INPUT_CTX_BYTES);
+        ic[1] = 0x1;
 
-    if (xhci_send_command(x, &cmd) != 0) { LOG_ERROR("EVAL_HUB_SLOT send fail"); return -1; }
+        uint32_t *slot_w = ic + W;
+        slot_w[0] = dw0;
+        slot_w[1] = dw1;
+        slot_w[2] = dw2;
+        slot_w[3] = 0;
 
-    for (int i = 0; i < 5000; i++) {
-        xhci_poll_event_ring(x);
-        if (x->last_completion_code != 0xFF) break;
-        delay_ms(2);
+        if (xhci_hub_slot_command(x, slot_id, ic, types[t]) == 0) {
+            for (size_t i = 0; i < XHCI_DEV_CTX_BYTES; i += 64) CACHE_FLUSH(dc + i);
+            FULL_BARRIER();
+            LOG_DEBUG("Hub slot marked (Hub=1) 0x%x, %u ports, speed %u, TTT %u, %s",
+                      slot_id, (unsigned)port_count, (unsigned)speed, (unsigned)(think_time & 0x3u),
+                      types[t] == TRB_TYPE_CONFIG_EP ? "Configure Endpoint" : "Evaluate Context");
+            return 0;
+        }
+        LOG_WARNING("hub slot %u: %s failed, code 0x%x", (unsigned)slot_id,
+                    types[t] == TRB_TYPE_CONFIG_EP ? "Configure Endpoint" : "Evaluate Context",
+                    x->last_completion_code);
     }
 
-    if (x->last_completion_code != 1) {
-        LOG_ERROR("EVAL_HUB_SLOT FAILED, code 0x%x", x->last_completion_code);
+    LOG_ERROR("EVAL_HUB_SLOT FAILED, code 0x%x", x->last_completion_code);
+    return -1;
+}
+
+int xhci_update_ep0_mps(struct xhci_controller *x, uint8_t slot_id, uint16_t mps)
+{
+    if (!x) return -1;
+    xhci_ctrl_enter(x);
+    int _r = xhci_update_ep0_mps_impl(x, slot_id, mps);
+    xhci_ctrl_leave(x);
+    return _r;
+}
+
+static int xhci_update_ep0_mps_impl(struct xhci_controller *x, uint8_t slot_id, uint16_t mps) {
+    if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots || mps == 0) return -1;
+
+    int idx = x - ctrls;
+    uint32_t ctx_size = x->csz ? (uint32_t)x->csz : XHCI_CTX_SIZE_32;
+    uint8_t *ictx = (uint8_t *)xhci_mem[idx].input_ctx[slot_id - 1];
+    uint8_t *dctx = (uint8_t *)xhci_mem[idx].dev_ctx[slot_id - 1];
+
+    for (size_t i = 0; i < XHCI_DEV_CTX_BYTES; i += 64) CACHE_FLUSH(dctx + i);
+    FULL_BARRIER();
+
+    struct xhci_slot_context *dev_slot = (struct xhci_slot_context *)xhci_dev_ctx_slot(dctx);
+    struct xhci_endpoint_context *dev_ep0 =
+        (struct xhci_endpoint_context *)xhci_dev_ctx_ep(dctx, ctx_size, 1);
+
+    uint16_t old_mps = (uint16_t)(dev_ep0->dw1 >> 16);
+    if (old_mps == mps) return 0;
+
+    memset(ictx, 0, XHCI_INPUT_CTX_BYTES);
+    uint32_t *ictrl = (uint32_t *)xhci_input_ctx_ctrl(ictx);
+    ictrl[0] = 0;
+    ictrl[1] = (1u << 1);
+
+    struct xhci_slot_context *in_slot = (struct xhci_slot_context *)xhci_input_ctx_slot(ictx, ctx_size);
+    in_slot->dw0 = dev_slot->dw0;
+    in_slot->dw1 = dev_slot->dw1;
+    in_slot->dw2 = dev_slot->dw2;
+    in_slot->dw3 = 0;
+
+    struct xhci_endpoint_context *in_ep0 =
+        (struct xhci_endpoint_context *)xhci_input_ctx_ep(ictx, ctx_size, 1);
+    in_ep0->dw0 = dev_ep0->dw0 & ~0x7u;
+    in_ep0->dw1 = (dev_ep0->dw1 & 0x0000FFFFu) | ((uint32_t)mps << 16);
+    in_ep0->tr_dequeue_ptr = dev_ep0->tr_dequeue_ptr;
+    in_ep0->dw4 = dev_ep0->dw4;
+
+    if (xhci_hub_slot_command(x, slot_id, (uint32_t *)ictx, TRB_TYPE_EVALUATE_CONTEXT) != 0) {
+        LOG_ERROR("slot %u: EP0 max packet %u -> %u failed, code 0x%x",
+                  (unsigned)slot_id, (unsigned)old_mps, (unsigned)mps, x->last_completion_code);
         return -1;
     }
 
-    for (size_t i = 0; i < XHCI_DEV_CTX_BYTES; i += 64) CACHE_FLUSH(dc + i);
+    for (size_t i = 0; i < XHCI_DEV_CTX_BYTES; i += 64) CACHE_FLUSH(dctx + i);
     FULL_BARRIER();
-    LOG_DEBUG("Hub slot marked (Hub=1) 0x%x", slot_id);
+    LOG_DEBUG("slot %u: EP0 max packet %u -> %u", (unsigned)slot_id, (unsigned)old_mps, (unsigned)mps);
     return 0;
 }
 
@@ -1658,6 +1747,8 @@ static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_
     int ci = x - ctrls;
     int ki = slot_id - 1;
 
+    if (xhci_mem[ci].dcbaa[slot_id] == 0) return -1;
+
     uint8_t ep_num = endpoint & 0x0F;
     uint8_t is_in = (endpoint & 0x80) ? 1 : 0;
     uint8_t dci = (ep_num * 2) + is_in;
@@ -1729,7 +1820,7 @@ static int xhci_interrupt_transfer_impl(struct xhci_controller *x, uint8_t slot_
         uint8_t ep_interval = 4;
         for (int _di = 0; _di < MAX_USB_DEVICES; _di++) {
             struct usb_device *_d = (struct usb_device *)device_table[USB_DEVICE][_di];
-            if (_d && (uint8_t)_d->address == slot_id) {
+            if (_d && _d->valid && (struct xhci_controller *)_d->ctrl == x && (uint8_t)_d->address == slot_id) {
                 if (_d->device_class == 0x09 && _d->hub_status_ep == endpoint) {
 
                     if (_d->hub_status_ep_mps) ep_mps = _d->hub_status_ep_mps;
@@ -1898,7 +1989,7 @@ static int xhci_bulk_transfer_impl(struct xhci_controller *x, uint8_t slot_id, u
         uint8_t ep_out_addr = 0, ep_in_addr = 0;
         for (int _di = 0; _di < MAX_USB_DEVICES; _di++) {
             struct usb_device *_d = (struct usb_device *)device_table[USB_DEVICE][_di];
-            if (!_d || (uint8_t)_d->address != slot_id) continue;
+            if (!_d || !_d->valid || (struct xhci_controller *)_d->ctrl != x || (uint8_t)_d->address != slot_id) continue;
             for (int _bi = 0; _bi < _d->bulk_ep_count; _bi++) {
                 uint8_t ba = _d->bulk_ep[_bi].address;
                 uint16_t bm = _d->bulk_ep[_bi].max_packet_size ? _d->bulk_ep[_bi].max_packet_size : 512u;
@@ -2324,6 +2415,7 @@ struct xhci_driver xhci_driver_loaded = {
     .enable_slot = xhci_enable_slot,
     .address_device = xhci_address_device,
     .evaluate_hub_slot = xhci_evaluate_hub_slot,
+    .update_ep0_mps = xhci_update_ep0_mps,
     .disable_slot = xhci_disable_slot,
     .interrupt_transfer = xhci_interrupt_transfer,
     .bulk_transfer = xhci_bulk_transfer,

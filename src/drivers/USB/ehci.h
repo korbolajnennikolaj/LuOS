@@ -91,6 +91,13 @@ typedef struct ehci_driver {
     void (*stop)(struct ehci_controller* ehci);
 } ehci_driver;
 
+extern uint8_t ehci_dev_speed[MAX_EHCI_CONTROLLERS][128];
+extern uint8_t ehci_dev_tt_hub[MAX_EHCI_CONTROLLERS][128];
+extern uint8_t ehci_dev_tt_port[MAX_EHCI_CONTROLLERS][128];
+extern uint8_t ehci_dev_mps0[MAX_EHCI_CONTROLLERS][128];
+
+int ehci_controller_index(struct ehci_controller* e);
+
 struct ehci_driver* return_ehci_driver(void);
 struct driver* return_meta_ehci_driver(void);
 void ehci_irq(void);

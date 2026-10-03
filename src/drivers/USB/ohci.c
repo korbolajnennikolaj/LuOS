@@ -172,6 +172,8 @@ typedef struct ohci_pending_xfer {
     uint8_t endpoint;
     void *cookie;
     uint8_t armed;
+    uint8_t result_ready;
+    int8_t last_result;
     struct usb_device *device;
 } ohci_pending_xfer;
 
@@ -341,6 +343,8 @@ static void ohci_report_interrupt(int ri, int slot, uint8_t cc, uint16_t len) {
     };
     usb_push_event(&evt);
     pend->active = 0;
+    pend->result_ready = 1;
+    pend->last_result = ok ? 0 : -1;
 }
 
 static uint16_t ohci_td_transferred(struct ohci_td_hw *td, void *buf, uint16_t requested) {
@@ -622,6 +626,11 @@ static int ohci_interrupt_transfer_impl(struct ohci_controller *o, uint8_t addr,
 
     if (pend->active) {
         if (!ohci_service_interrupt_slot(ri, slot_idx)) return -2;
+    }
+
+    if (pend->result_ready) {
+        pend->result_ready = 0;
+        if (pend->data == data) return pend->last_result;
     }
 
     if (direction) {
@@ -1257,6 +1266,7 @@ void ohci_notify_disconnect(struct usb_device *dev) {
 
             p->active = 0;
             p->armed = 0;
+            p->result_ready = 0;
             p->device = NULL;
             p->cookie = NULL;
             p->td = NULL;
