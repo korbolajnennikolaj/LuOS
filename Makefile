@@ -8,6 +8,7 @@ MAKEFLAGS += --output-sync=target
 PROJECT_NAME = LuOS
 KERNEL = kernel.bin
 ISO_LIMINE = $(PROJECT_NAME)_limine.iso
+INITRD ?=
 
 CC = gcc
 LD = ld
@@ -435,6 +436,11 @@ iso-limine: $(KERNEL)
 	@echo "/LuOS" >> $(ISO_DIR_LIMINE)/limine.conf
 	@echo "    PROTOCOL:limine" >> $(ISO_DIR_LIMINE)/limine.conf
 	@echo "    KERNEL_PATH:boot():/kernel.bin" >> $(ISO_DIR_LIMINE)/limine.conf
+	@if [ -n "$(INITRD)" ]; then \
+		cp "$(INITRD)" $(ISO_DIR_LIMINE)/initrd; \
+		echo "    MODULE_PATH:boot():/initrd" >> $(ISO_DIR_LIMINE)/limine.conf; \
+		echo "[ISO] Added initrd module: $(INITRD)"; \
+	fi
 
 	@cp $(LIMINE_PATH)/limine-bios.sys $(ISO_DIR_LIMINE)/
 	@cp $(LIMINE_PATH)/limine-bios-cd.bin $(ISO_DIR_LIMINE)/
@@ -637,6 +643,7 @@ help:
 	@echo "BUILD:"
 	@echo "  make all                 - Compile the kernel (kernel.bin)"
 	@echo "  make iso-limine          - Create a bootable ISO"
+	@echo "  make iso-limine INITRD=f - Same, with file f loaded as initrd (rd0)"
 	@echo "  make clean               - Remove build artifacts and logs"
 	@echo ""
 	@echo "RUN (QEMU):"

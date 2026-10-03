@@ -83,12 +83,144 @@ static bool ascii_ieq(const char *a, const char *b) {
     return *a == '\0' && *b == '\0';
 }
 
+static size_t utf8_put(char *out, size_t pos, size_t cap, uint32_t cp) {
+    char tmp[4];
+    size_t n;
+    if (cp < 0x80) { tmp[0] = (char)cp; n = 1; }
+    else if (cp < 0x800) { tmp[0] = (char)(0xC0 | (cp >> 6)); tmp[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) {
+        tmp[0] = (char)(0xE0 | (cp >> 12)); tmp[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[2] = (char)(0x80 | (cp & 0x3F)); n = 3;
+    } else {
+        tmp[0] = (char)(0xF0 | (cp >> 18)); tmp[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        tmp[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); tmp[3] = (char)(0x80 | (cp & 0x3F)); n = 4;
+    }
+    if (pos + n >= cap) return pos;
+    memcpy(out + pos, tmp, n);
+    return pos + n;
+}
+
+static void joliet_name(const uint8_t *raw, uint8_t raw_len, char *out, size_t out_cap) {
+    size_t pos = 0;
+    for (int i = 0; i + 1 < raw_len; i += 2) {
+        uint32_t cp = ((uint32_t)raw[i] << 8) | raw[i + 1];
+        if (cp == ';') break;
+        if (cp >= 0xD800 && cp < 0xDC00 && i + 3 < raw_len) {
+            uint32_t lo = ((uint32_t)raw[i + 2] << 8) | raw[i + 3];
+            if (lo >= 0xDC00 && lo < 0xE000) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i += 2;
+            }
+        }
+        pos = utf8_put(out, pos, out_cap, cp);
+    }
+    if (pos > 1 && out[pos - 1] == '.') pos--;
+    out[pos] = '\0';
+}
+
+static uint32_t rd32(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static void rr_scan(iso9660_fs_t *fs, const uint8_t *recp, char *name, size_t name_cap,
+                    bool *has_name, uint32_t *child_lba, bool *relocated) {
+    uint8_t name_len = recp[32];
+    uint32_t start = 33u + name_len + ((name_len & 1) ? 0u : 1u) + fs->susp_skip;
+    const uint8_t *area = recp + start;
+    uint32_t len = recp[0] > start ? recp[0] - start : 0;
+    uint8_t *ce_buf = NULL;
+    size_t pos = 0;
+    bool name_done = false;
+
+    for (int hops = 0; hops < 8 && len; hops++) {
+        uint32_t ce_lba = 0, ce_off = 0, ce_len = 0;
+        uint32_t o = 0;
+        while (o + 4 <= len) {
+            const uint8_t *e = area + o;
+            uint8_t el = e[2];
+            if (el < 4 || o + el > len) break;
+            if (e[0] == 'S' && e[1] == 'T') break;
+            if (e[0] == 'N' && e[1] == 'M' && el >= 5 && !name_done) {
+                uint8_t fl = e[4];
+                if (!(fl & 0x06)) {
+                    for (uint32_t k = 5; k < el && pos + 1 < name_cap; k++) name[pos++] = (char)e[k];
+                    *has_name = true;
+                }
+                if (!(fl & 0x01)) name_done = true;
+            } else if (e[0] == 'C' && e[1] == 'E' && el >= 28) {
+                ce_lba = rd32(e + 4);
+                ce_off = rd32(e + 12);
+                ce_len = rd32(e + 20);
+            } else if (e[0] == 'C' && e[1] == 'L' && el >= 12) {
+                *child_lba = rd32(e + 4);
+            } else if (e[0] == 'R' && e[1] == 'E') {
+                *relocated = true;
+            }
+            o += el;
+        }
+        if (!ce_len || ce_off >= ISO9660_BLOCK_SIZE) break;
+        if (!ce_buf) ce_buf = kmalloc(ISO9660_BLOCK_SIZE);
+        if (!ce_buf || read_iso_block(fs, ce_lba, ce_buf) != FS_OK) break;
+        if (ce_off + ce_len > ISO9660_BLOCK_SIZE) ce_len = ISO9660_BLOCK_SIZE - ce_off;
+        area = ce_buf + ce_off;
+        len = ce_len;
+    }
+
+    if (ce_buf) kfree(ce_buf);
+    name[pos] = '\0';
+}
+
 typedef struct {
     uint32_t extent_lba;
     uint32_t data_length;
     bool is_dir;
     char name_utf8[FS_MAX_NAME + 1];
 } iso9660_entry_info_t;
+
+static int decode_record(iso9660_fs_t *fs, const uint8_t *recp, iso9660_entry_info_t *out) {
+    iso9660_dirrecord_t rec;
+    memcpy(&rec, recp, sizeof(rec));
+    const char *ident = (const char *)(recp + sizeof(iso9660_dirrecord_t));
+    if (rec.name_len == 1 && (ident[0] == 0x00 || ident[0] == 0x01)) return 0;
+
+    out->extent_lba = rec.extent_lba_le;
+    out->data_length = rec.data_len_le;
+    out->is_dir = (rec.file_flags & ISO9660_FLAG_DIRECTORY) != 0;
+
+    if (fs->name_mode == ISO9660_NAMES_JOLIET) {
+        joliet_name((const uint8_t *)ident, rec.name_len, out->name_utf8, sizeof(out->name_utf8));
+        return out->name_utf8[0] ? 1 : 0;
+    }
+
+    if (fs->name_mode == ISO9660_NAMES_ROCKRIDGE) {
+        bool has_name = false, relocated = false;
+        uint32_t child = 0;
+        rr_scan(fs, recp, out->name_utf8, sizeof(out->name_utf8), &has_name, &child, &relocated);
+        if (relocated) return 0;
+        if (child) {
+            uint8_t *blk = kmalloc(ISO9660_BLOCK_SIZE);
+            if (!blk) return FS_ERR_NOMEM;
+            if (read_iso_block(fs, child, blk) != FS_OK) { kfree(blk); return FS_ERR_IO; }
+            iso9660_dirrecord_t dot;
+            memcpy(&dot, blk, sizeof(dot));
+            out->extent_lba = dot.extent_lba_le;
+            out->data_length = dot.data_len_le;
+            out->is_dir = true;
+            kfree(blk);
+        }
+        if (has_name && out->name_utf8[0]) return 1;
+    }
+
+    clean_iso_name(ident, rec.name_len, out->name_utf8, sizeof(out->name_utf8));
+    return 1;
+}
+
+static bool names_equal(iso9660_fs_t *fs, const char *a, const char *b) {
+    if (fs->name_mode == ISO9660_NAMES_ROCKRIDGE) return strcmp(a, b) == 0;
+    return ascii_ieq(a, b);
+}
 
 static int dir_find(iso9660_fs_t *fs, uint32_t dir_extent_lba, uint32_t dir_data_length,
                      const char *name, iso9660_entry_info_t *out) {
@@ -98,32 +230,20 @@ static int dir_find(iso9660_fs_t *fs, uint32_t dir_extent_lba, uint32_t dir_data
 
     int ret = FS_ERR_NOENT;
     uint32_t off = 0;
-    while (off < dir_data_length) {
+    while (off < dir_data_length && off < buf_len) {
         uint8_t reclen = buf[off];
-        if (reclen == 0) {
-
+        if (reclen == 0 || off + reclen > buf_len) {
             off = (off + ISO9660_BLOCK_SIZE) & ~(ISO9660_BLOCK_SIZE - 1);
             continue;
         }
 
-        iso9660_dirrecord_t rec;
-        memcpy(&rec, buf + off, sizeof(rec));
-        const char *ident = (const char *)(buf + off + sizeof(iso9660_dirrecord_t));
-
-        if (rec.name_len == 1 && (ident[0] == 0x00 || ident[0] == 0x01)) {
-
-        } else {
-            char cleaned[FS_MAX_NAME + 1];
-            clean_iso_name(ident, rec.name_len, cleaned, sizeof(cleaned));
-            if (ascii_ieq(cleaned, name)) {
-                out->extent_lba = rec.extent_lba_le;
-                out->data_length = rec.data_len_le;
-                out->is_dir = (rec.file_flags & ISO9660_FLAG_DIRECTORY) != 0;
-                strncpy(out->name_utf8, cleaned, FS_MAX_NAME);
-                out->name_utf8[FS_MAX_NAME] = '\0';
-                ret = FS_OK;
-                break;
-            }
+        iso9660_entry_info_t info;
+        int d = decode_record(fs, buf + off, &info);
+        if (d < 0) { ret = d; break; }
+        if (d > 0 && names_equal(fs, info.name_utf8, name)) {
+            *out = info;
+            ret = FS_OK;
+            break;
         }
 
         off += reclen;
@@ -229,25 +349,22 @@ static int iso9660_op_opendir(fs_t *fsroot, const char *path, fs_dir_t *out) {
 static int iso9660_op_readdir(fs_dir_t *dir, fs_dirent_t *out) {
     iso9660_diriter_t *it = (iso9660_diriter_t *)dir->priv;
 
-    while (it->offset < it->data_len) {
+    while (it->offset < it->data_len && it->offset < it->buf_len) {
         uint8_t reclen = it->buf[it->offset];
-        if (reclen == 0) {
+        if (reclen == 0 || it->offset + reclen > it->buf_len) {
             it->offset = (it->offset + ISO9660_BLOCK_SIZE) & ~(ISO9660_BLOCK_SIZE - 1);
             continue;
         }
 
-        iso9660_dirrecord_t rec;
-        memcpy(&rec, it->buf + it->offset, sizeof(rec));
-        const char *ident = (const char *)(it->buf + it->offset + sizeof(iso9660_dirrecord_t));
+        iso9660_entry_info_t info;
+        int d = decode_record(it->fs, it->buf + it->offset, &info);
         it->offset += reclen;
+        if (d < 0) return d;
+        if (d == 0) continue;
 
-        if (rec.name_len == 1 && (ident[0] == 0x00 || ident[0] == 0x01)) continue;
-
-        char cleaned[FS_MAX_NAME + 1];
-        clean_iso_name(ident, rec.name_len, cleaned, sizeof(cleaned));
-        strncpy(out->name, cleaned, FS_MAX_NAME); out->name[FS_MAX_NAME] = '\0';
-        out->type = (rec.file_flags & ISO9660_FLAG_DIRECTORY) ? FS_ENTRY_DIR : FS_ENTRY_FILE;
-        out->size = rec.data_len_le;
+        strncpy(out->name, info.name_utf8, FS_MAX_NAME); out->name[FS_MAX_NAME] = '\0';
+        out->type = info.is_dir ? FS_ENTRY_DIR : FS_ENTRY_FILE;
+        out->size = info.data_length;
         return FS_OK;
     }
     return FS_ERR_EOF;
@@ -358,6 +475,27 @@ int iso9660_mount(struct block_device *dev, fs_t *out) {
     fs->label[32] = '\0';
     for (int i = 31; i >= 0 && fs->label[i] == ' '; i--) fs->label[i] = '\0';
 
+    if (read_iso_block(fs, fs->root_extent_lba, pvd) == FS_OK && pvd[0] >= 41 && pvd[32] == 1 &&
+        pvd[34] == 'S' && pvd[35] == 'P' && pvd[36] >= 7 && pvd[38] == 0xBE && pvd[39] == 0xEF) {
+        fs->name_mode = ISO9660_NAMES_ROCKRIDGE;
+        fs->susp_skip = pvd[40];
+    }
+
+    if (fs->name_mode == ISO9660_NAMES_PLAIN) {
+        for (uint32_t lba = ISO9660_PVD_LBA + 1; lba < ISO9660_PVD_LBA + 32; lba++) {
+            if (read_iso_block(fs, lba, pvd) != FS_OK) break;
+            if (memcmp(pvd + 1, ISO9660_ID, 5) != 0 || pvd[0] == ISO9660_VD_TYPE_TERMINATOR) break;
+            if (pvd[0] == ISO9660_VD_TYPE_SUPPLEMENTARY && pvd[88] == '%' && pvd[89] == '/' &&
+                (pvd[90] == '@' || pvd[90] == 'C' || pvd[90] == 'E')) {
+                memcpy(&root, pvd + 156, sizeof(root));
+                fs->root_extent_lba = root.extent_lba_le;
+                fs->root_data_length = root.data_len_le;
+                fs->name_mode = ISO9660_NAMES_JOLIET;
+                break;
+            }
+        }
+    }
+
     kfree(pvd);
 
     out->type = FS_TYPE_ISO9660;
@@ -367,9 +505,11 @@ int iso9660_mount(struct block_device *dev, fs_t *out) {
     strncpy(out->label, fs->label, sizeof(out->label) - 1);
     out->label[sizeof(out->label) - 1] = '\0';
 
-    LOG_DEBUG("mounted volume '%s' (read-only), root_extent=%u, size=%u bytes",
+    LOG_DEBUG("mounted volume '%s' (read-only), root_extent=%u, size=%u bytes, names=%s",
          fs->label[0] ? fs->label : "(no label)",
-         (unsigned)fs->root_extent_lba, (unsigned)fs->root_data_length);
+         (unsigned)fs->root_extent_lba, (unsigned)fs->root_data_length,
+         fs->name_mode == ISO9660_NAMES_ROCKRIDGE ? "rock ridge" :
+         fs->name_mode == ISO9660_NAMES_JOLIET ? "joliet" : "iso9660");
 
     return FS_OK;
 }

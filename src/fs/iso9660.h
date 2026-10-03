@@ -13,9 +13,16 @@
 #define ISO9660_ID "CD001"
 
 #define ISO9660_VD_TYPE_PRIMARY 1
+#define ISO9660_VD_TYPE_SUPPLEMENTARY 2
 #define ISO9660_VD_TYPE_TERMINATOR 255
 
 #define ISO9660_FLAG_DIRECTORY 0x02
+
+enum iso9660_names {
+    ISO9660_NAMES_PLAIN = 0,
+    ISO9660_NAMES_JOLIET = 1,
+    ISO9660_NAMES_ROCKRIDGE = 2,
+};
 
 typedef struct __attribute__((packed)) {
     uint8_t record_len;
@@ -39,6 +46,8 @@ typedef struct iso9660_fs {
     uint32_t sectors_per_block;
     uint32_t root_extent_lba;
     uint32_t root_data_length;
+    uint8_t name_mode;
+    uint8_t susp_skip;
     char label[33];
 } iso9660_fs_t;
 

@@ -31,6 +31,11 @@ enum fs_type {
     FS_TYPE_EXT4 = 2,
     FS_TYPE_EXFAT = 4,
     FS_TYPE_ISO9660 = 5,
+    FS_TYPE_FAT12 = 6,
+    FS_TYPE_FAT16 = 7,
+    FS_TYPE_RAMFS = 8,
+    FS_TYPE_NTFS = 9,
+    FS_TYPE_ARCHIVE = 10,
 };
 
 enum fs_entry_type {
@@ -98,6 +103,25 @@ int exfat_mount(struct block_device *dev, fs_t *out);
 
 int iso9660_probe(struct block_device *dev);
 int iso9660_mount(struct block_device *dev, fs_t *out);
+
+int ntfs_probe(struct block_device *dev);
+int ntfs_mount(struct block_device *dev, fs_t *out);
+
+int archive_probe(struct block_device *dev);
+int archive_mount(struct block_device *dev, fs_t *out);
+
+int ramfs_mount(fs_t *out);
+
+int fat_format(struct block_device *dev, enum fs_type type, const char *label, uint64_t hidden_sectors);
+int exfat_format(struct block_device *dev, const char *label, uint64_t hidden_sectors);
+
+int fs_dev_zero(struct block_device *dev, uint64_t lba, uint64_t count);
+int fs_dev_wipe(struct block_device *dev);
+uint32_t fs_new_serial(void);
+int fs_format_type_from_name(const char *name, struct block_device *dev, enum fs_type *out);
+int fs_format(struct block_device *dev, enum fs_type type, const char *label, uint64_t hidden_sectors);
+
+const char *fs_type_name(enum fs_type type);
 
 int fs_mount_auto(struct block_device *dev, fs_t *out);
 int fs_mount_type(struct block_device *dev, enum fs_type type, fs_t *out);

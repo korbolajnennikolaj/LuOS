@@ -16,6 +16,7 @@
 #include "drivers/Storage/block_device.h"
 #include "drivers/Storage/nvme.h"
 #include "drivers/Storage/partition.h"
+#include "drivers/Storage/ramdisk.h"
 #include "drivers/Storage/usb_msc_driver.h"
 #include "drivers/Timer/timer.h"
 #include "drivers/USB/usb_controller.h"
@@ -138,6 +139,7 @@ void init_drivers() {
     register_driver(return_meta_usb_mouse_driver());
     register_driver(return_meta_mouse_driver());
 
+    register_driver(return_meta_ramdisk_driver());
     register_driver(return_meta_ahci_driver());
     register_driver(return_meta_nvme_driver());
     register_driver(return_meta_usb_msc_driver());

@@ -30,6 +30,7 @@
 #include "kernel/rootfs.h"
 #include "kernel/math_test.h"
 #include "kernel/libc_test.h"
+#include "kernel/fs_test.h"
 #include "components/Memory/pmm.h"
 #include "components/Memory/vmm.h"
 #include "components/Memory/heap.h"
@@ -2384,6 +2385,80 @@ static void cmd_fs_umount(limine_video_driver *video, const char *arg) {
     printf_color(0xFFAAAA00, "Disk '%s' unmounted from '%s'.\n", device, point);
 }
 
+static void cmd_fs_mkfs(limine_video_driver *video, const char *args) {
+    (void)video;
+
+    char type_name[16];
+    char name[ROOTFS_DEVICE_NAME_MAX];
+    size_t n = 0;
+
+    while (*args == ' ') args++;
+    while (args[n] && args[n] != ' ' && n < sizeof(type_name) - 1) { type_name[n] = args[n]; n++; }
+    type_name[n] = '\0';
+    args += n;
+    while (*args == ' ') args++;
+
+    n = 0;
+    while (args[n] && args[n] != ' ' && n < sizeof(name) - 1) { name[n] = args[n]; n++; }
+    name[n] = '\0';
+    args += n;
+    while (*args == ' ') args++;
+    const char *label = args;
+
+    if (!type_name[0] || !name[0]) {
+        printf_color(0xFFFF5555, "Usage: mkfs <fat|fat12|fat16|fat32|exfat> <disk_or_partition_name> [label]\n");
+        return;
+    }
+
+    uint32_t idx = get_disk_index_from_name(name);
+    struct block_device *dev = (idx == UINT32_MAX) ? NULL : block_device_get(idx);
+    if (!dev) {
+        printf_color(0xFFFF5555, "Device '%s' not found. Available devices: 'disks'.\n", name);
+        return;
+    }
+
+    enum fs_type type;
+    if (fs_format_type_from_name(type_name, dev, &type) != FS_OK) {
+        printf_color(0xFFFF5555, "mkfs: '%s' is not supported, use fat, fat12, fat16, fat32 or exfat.\n", type_name);
+        return;
+    }
+
+    uint64_t size_mb = dev->sector_count * (dev->sector_size ? dev->sector_size : 512) / (1024 * 1024);
+    printf_color(0xFFAAAA00, "Formatting '%s' (%llu MB) as %s...\n", name, (unsigned long long)size_mb, rootfs_type_name(type));
+
+    int fs_err = FS_OK;
+    int r = rootfs_format_device(name, type, label, &fs_err);
+    switch (r) {
+        case ROOTFS_OK:
+            break;
+        case ROOTFS_ERR_NODEV:
+            printf_color(0xFFFF5555, "Device '%s' not found. Available devices: 'disks'.\n", name);
+            return;
+        case ROOTFS_ERR_BUSY:
+            printf_color(0xFFFF5555, "'%s' or one of its partitions is mounted. Run 'umount' first.\n", name);
+            return;
+        case ROOTFS_ERR_FS:
+            if (fs_err == FS_ERR_NOSPACE)
+                printf_color(0xFFFF5555, "mkfs: '%s' is too small for %s.\n", name, rootfs_type_name(type));
+            else if (fs_err == FS_ERR_NOSUPP)
+                printf_color(0xFFFF5555, "mkfs: %s cannot be created on '%s' (size or sector size).\n", rootfs_type_name(type), name);
+            else if (fs_err == FS_ERR_PARAM)
+                printf_color(0xFFFF5555, "mkfs: invalid label '%s'.\n", label);
+            else
+                printf_color(0xFFFF5555, "mkfs: failed to format '%s' (error code %d).\n", name, fs_err);
+            return;
+        default:
+            printf_color(0xFFFF5555, "Usage: mkfs <fat|fat12|fat16|fat32|exfat> <disk_or_partition_name> [label]\n");
+            return;
+    }
+
+    if (label[0])
+        printf_color(0xFF55FF55, "Formatted: '%s' as %s (label \"%s\"). Use 'mount %s POINT'.\n",
+                     name, rootfs_type_name(type), label, name);
+    else
+        printf_color(0xFF55FF55, "Formatted: '%s' as %s. Use 'mount %s POINT'.\n", name, rootfs_type_name(type), name);
+}
+
 static fs_t *shell_path(const char *arg, const char *usage, char *abs, size_t abs_cap,
                         char *rel, size_t rel_cap) {
     if (!rootfs_is_mounted()) {
@@ -3008,6 +3083,9 @@ static void shell_entry(void *arg) {
             printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "rmdir PATH    - remove empty dir", "rm PATH       - delete file");
             printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "cat PATH      - print contents", "touch PATH    - create empty file");
             printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "stat PATH     - name/type/size", "partitions    - disk partition tables");
+            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "fs-test [DIR] - filesystem self-test", "fs-sum [DIR]  - CRC32 of every file");
+            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "mount ramfs POINT - in-memory filesystem", "mkfs TYPE NAME [LABEL] - format disk");
+            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "  TYPE: fat, fat12, fat16, fat32, exfat", "");
 
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Hardware / Input --\n");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "usb           - USB controllers", "usb-ports     - root hub ports");
@@ -3126,6 +3204,12 @@ static void shell_entry(void *arg) {
         else if (str_starts_with(cmd_buffer, "cat ")) { cmd_fs_cat(video, cmd_buffer + 4); }
         else if (str_starts_with(cmd_buffer, "touch ")) { cmd_fs_touch(video, cmd_buffer + 6); }
         else if (str_starts_with(cmd_buffer, "stat ")) { cmd_fs_stat(video, cmd_buffer + 5); }
+        else if (str_cmp(cmd_buffer, "mkfs") == 0) { cmd_fs_mkfs(video, ""); }
+        else if (str_starts_with(cmd_buffer, "mkfs ")) { cmd_fs_mkfs(video, cmd_buffer + 5); }
+        else if (str_cmp(cmd_buffer, "fs-test") == 0) { cmd_fs_test(video, ""); }
+        else if (str_starts_with(cmd_buffer, "fs-test ")) { cmd_fs_test(video, cmd_buffer + 8); }
+        else if (str_cmp(cmd_buffer, "fs-sum") == 0) { cmd_fs_sum(video, ""); }
+        else if (str_starts_with(cmd_buffer, "fs-sum ")) { cmd_fs_sum(video, cmd_buffer + 7); }
         else if (str_cmp(cmd_buffer, "kbd-test") == 0) { cmd_kbd_test(video, kbd); }
         else if (str_cmp(cmd_buffer, "mouse") == 0) { cmd_mouse_status(video); }
         else if (str_cmp(cmd_buffer, "mouse-test") == 0) { cmd_mouse_test(video, mouse, tsc); }

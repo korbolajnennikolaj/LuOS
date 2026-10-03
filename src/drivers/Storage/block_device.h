@@ -14,6 +14,7 @@ enum STORAGE_TYPE
     NVME_STORAGE = 1,
     USBMSC_STORAGE = 2,
     ATA_STORAGE = 3,
+    RAMDISK_STORAGE = 4,
 };
 
 typedef struct block_device {

@@ -367,3 +367,46 @@ int partition_register_all(struct block_device *disk) {
     spin_unlock(&partition_lock);
     return registered;
 }
+
+bool partition_lookup(struct block_device *dev, struct block_device **parent, uint64_t *start_lba) {
+    bool found = false;
+    spin_lock(&partition_lock);
+    for (int i = 0; i < MAX_BLOCK_DEVICES; i++) {
+        if (!g_partition_storage[i].parent || &g_partition_blkdevs[i] != dev) continue;
+        if (parent) *parent = g_partition_storage[i].parent;
+        if (start_lba) *start_lba = g_partition_storage[i].start_lba;
+        found = true;
+        break;
+    }
+    spin_unlock(&partition_lock);
+    return found;
+}
+
+int partition_set_mbr_type(struct block_device *part, uint8_t type) {
+    struct block_device *disk = NULL;
+    uint64_t start = 0;
+    if (!partition_lookup(part, &disk, &start)) return -1;
+
+    uint32_t ss = disk->sector_size ? disk->sector_size : 512;
+    uint8_t *buf = kmalloc(ss);
+    if (!buf) return -1;
+    if (read_sector(disk, 0, buf) != 0) { kfree(buf); return -1; }
+
+    int ret = 1;
+    if (buf[MBR_SIG_OFFSET] == 0x55 && buf[MBR_SIG_OFFSET + 1] == 0xAA) {
+        for (int i = 0; i < 4; i++) {
+            mbr_entry_t e;
+            memcpy(&e, buf + MBR_ENTRY_OFFSET + i * sizeof(mbr_entry_t), sizeof(e));
+            if (e.type == PART_TYPE_GPT_PROTECTIVE) break;
+            if (e.type == 0 || e.type == PART_TYPE_EXTENDED_CHS || e.type == PART_TYPE_EXTENDED_LBA) continue;
+            if (e.lba_start != start) continue;
+            if (e.type == type) { ret = 0; break; }
+            buf[MBR_ENTRY_OFFSET + i * sizeof(mbr_entry_t) + 4] = type;
+            ret = disk->write_sectors(disk, 0, 1, buf) == 0 ? 0 : -1;
+            if (ret == 0) LOG_INFO("%s: MBR partition type set to 0x%02x", part->name, (unsigned)type);
+            break;
+        }
+    }
+    kfree(buf);
+    return ret;
+}

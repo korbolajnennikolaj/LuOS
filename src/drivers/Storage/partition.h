@@ -28,4 +28,8 @@ int partition_register_all(struct block_device *disk);
 
 int partition_unregister_all(struct block_device *disk);
 
+bool partition_lookup(struct block_device *dev, struct block_device **parent, uint64_t *start_lba);
+
+int partition_set_mbr_type(struct block_device *part, uint8_t type);
+
 #endif

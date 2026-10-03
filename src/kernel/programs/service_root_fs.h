@@ -32,6 +32,7 @@ typedef struct rootfs_mount {
 
 int rootfs_mount_device(const char *device_name, const char *mount_point, int *out_fs_err);
 int rootfs_unmount_point(const char *mount_point);
+int rootfs_format_device(const char *device_name, enum fs_type type, const char *label, int *out_fs_err);
 
 int rootfs_mount_count(void);
 const rootfs_mount_t *rootfs_mount_at(int index);

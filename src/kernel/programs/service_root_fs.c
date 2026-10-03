@@ -3,6 +3,8 @@
 #include "components/drivers.h"
 #include "components/logger.h"
 #include "drivers/Storage/block_device.h"
+#include "drivers/Storage/partition.h"
+#include "fs/ramfs.h"
 #include "kernel/scheduler/scheduler.h"
 #include "kernel/scheduler/spinlock.h"
 
@@ -25,6 +27,17 @@ static struct block_device *auto_mount_reported[MAX_BLOCK_DEVICES];
 static uint32_t auto_mount_reported_devices = 0;
 
 static volatile uint64_t root_fs_last_beat_ms = 0;
+
+static struct block_device *formatting_dev = NULL;
+
+static bool devices_overlap(struct block_device *a, struct block_device *b) {
+    if (!a || !b) return false;
+    if (a == b) return true;
+    struct block_device *pa = NULL, *pb = NULL;
+    partition_lookup(a, &pa, NULL);
+    partition_lookup(b, &pb, NULL);
+    return pa == b || pb == a;
+}
 
 static void fs_normalize_path(const char *base_cwd, const char *input, char *out, size_t out_cap) {
     char combined[FS_MAX_PATH];
@@ -119,13 +132,7 @@ void rootfs_normalize_path(const char *input, char *out, size_t out_cap) {
 }
 
 const char *rootfs_type_name(enum fs_type type) {
-    switch (type) {
-        case FS_TYPE_FAT32:   return "FAT32";
-        case FS_TYPE_EXFAT:   return "exFAT";
-        case FS_TYPE_EXT4:    return "ext4";
-        case FS_TYPE_ISO9660: return "ISO9660";
-        default:              return "unknown";
-    }
+    return fs_type_name(type);
 }
 
 const char *rootfs_root_device(void) {
@@ -213,20 +220,24 @@ static int rootfs_mount_device_ex(const char *device_name, const char *mount_poi
     char point[ROOTFS_MOUNT_PATH_MAX];
     fs_normalize_path("/", mount_point, point, sizeof(point));
 
-    uint32_t idx = get_disk_index_from_name(device_name);
-    if (idx == UINT32_MAX) return ROOTFS_ERR_NODEV;
+    bool is_ramfs = strcmp(device_name, RAMFS_DEVICE_NAME) == 0;
+    struct block_device *dev = NULL;
+    if (!is_ramfs) {
+        uint32_t idx = get_disk_index_from_name(device_name);
+        if (idx == UINT32_MAX) return ROOTFS_ERR_NODEV;
 
-    struct block_device *dev = block_device_get(idx);
-    if (!dev) return ROOTFS_ERR_NODEV;
+        dev = block_device_get(idx);
+        if (!dev) return ROOTFS_ERR_NODEV;
+    }
 
     spin_lock(&rootfs_lock);
 
-    if (find_mount_slot(point) >= 0) {
+    if (find_mount_slot(point) >= 0 || (dev && devices_overlap(formatting_dev, dev))) {
         spin_unlock(&rootfs_lock);
         return ROOTFS_ERR_BUSY;
     }
 
-    for (int i = 0; i < ROOTFS_MAX_MOUNTS; i++) {
+    for (int i = 0; i < ROOTFS_MAX_MOUNTS && !is_ramfs; i++) {
         if (mounts[i].mounted && strcmp(mounts[i].device, device_name) == 0) {
             spin_unlock(&rootfs_lock);
             return ROOTFS_ERR_BUSY;
@@ -250,7 +261,7 @@ static int rootfs_mount_device_ex(const char *device_name, const char *mount_poi
     }
 
     fs_t fs;
-    int r = fs_mount_auto(dev, &fs);
+    int r = is_ramfs ? ramfs_mount(&fs) : fs_mount_auto(dev, &fs);
     if (r != FS_OK) {
         mount_pending[slot] = false;
         if (out_fs_err) *out_fs_err = r;
@@ -317,9 +328,67 @@ int rootfs_unmount_point(const char *mount_point) {
     return ROOTFS_OK;
 }
 
+static uint8_t mbr_type_for(enum fs_type type, struct block_device *dev) {
+    switch (type) {
+        case FS_TYPE_FAT12: return 0x01;
+        case FS_TYPE_FAT16:
+            return dev->sector_count * (dev->sector_size ? dev->sector_size : 512) < 32ull * 1024 * 1024 ? 0x04 : 0x0E;
+        case FS_TYPE_FAT32: return 0x0C;
+        case FS_TYPE_EXFAT: return 0x07;
+        default: return 0;
+    }
+}
+
+int rootfs_format_device(const char *device_name, enum fs_type type, const char *label, int *out_fs_err) {
+    if (out_fs_err) *out_fs_err = FS_OK;
+    if (!device_name || !device_name[0] || strcmp(device_name, RAMFS_DEVICE_NAME) == 0) return ROOTFS_ERR_PARAM;
+
+    uint32_t idx = get_disk_index_from_name(device_name);
+    if (idx == UINT32_MAX) return ROOTFS_ERR_NODEV;
+    struct block_device *dev = block_device_get(idx);
+    if (!dev) return ROOTFS_ERR_NODEV;
+
+    spin_lock(&rootfs_lock);
+    if (formatting_dev) {
+        spin_unlock(&rootfs_lock);
+        return ROOTFS_ERR_BUSY;
+    }
+    for (int i = 0; i < ROOTFS_MAX_MOUNTS; i++) {
+        if (mount_pending[i] || (mounts[i].mounted && devices_overlap(mounts[i].fs.dev, dev))) {
+            spin_unlock(&rootfs_lock);
+            return ROOTFS_ERR_BUSY;
+        }
+    }
+    formatting_dev = dev;
+    spin_unlock(&rootfs_lock);
+
+    uint64_t hidden = 0;
+    bool is_partition = partition_lookup(dev, NULL, &hidden);
+    int r = fs_format(dev, type, label, hidden);
+    if (r == FS_OK) {
+        if (is_partition) {
+            partition_set_mbr_type(dev, mbr_type_for(type, dev));
+        } else {
+            partition_unregister_all(dev);
+            partition_register_all(dev);
+        }
+    }
+
+    spin_lock(&rootfs_lock);
+    formatting_dev = NULL;
+    spin_unlock(&rootfs_lock);
+
+    if (r != FS_OK) {
+        if (out_fs_err) *out_fs_err = r;
+        return ROOTFS_ERR_FS;
+    }
+    return ROOTFS_OK;
+}
+
 static void rootfs_drop_lost_mounts(void) {
     for (int i = 0; i < ROOTFS_MAX_MOUNTS; i++) {
         if (!mounts[i].mounted || mount_pending[i]) continue;
+        if (!mounts[i].fs.dev) continue;
 
         uint32_t idx = get_disk_index_from_name(mounts[i].device);
         struct block_device *dev = (idx == UINT32_MAX) ? NULL : block_device_get(idx);
@@ -346,9 +415,12 @@ static void rootfs_try_auto_mount(void) {
         auto_mount_reported_devices = count;
     }
 
+    for (uint32_t pass = 0; pass < 2; pass++)
     for (uint32_t i = 0; i < count; i++) {
         struct block_device *dev = block_device_get(i);
         if (!dev) continue;
+        bool ramdisk = dev->name[0] == 'r' && dev->name[1] == 'd';
+        if ((pass == 0) != ramdisk) continue;
 
         bool taken = false;
         for (int m = 1; m < ROOTFS_MAX_MOUNTS; m++) {

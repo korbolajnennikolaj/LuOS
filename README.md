@@ -8,9 +8,9 @@ A hobby x86-64 kernel built from scratch, booted via [Limine](https://limine-boo
 |---|---|
 | Boot | Limine, BIOS and UEFI |
 | Memory | Heap allocator based on a red-black tree (fast block lookup/insert/delete) |
-| Storage | AHCI, ATA/IDE, NVMe |
-| USB | xHCI (USB 3.0), EHCI (USB 2.0), OHCI/UHCI (USB 1.1), USB Mass Storage, USB hotplug |
-| Filesystems | FAT32, exFAT, ext4, ISO9660 |
+| Storage | AHCI, ATA/IDE, NVMe, RAM disk (Limine modules / initrd), MBR and GPT partitions |
+| USB | xHCI (USB 3.0), EHCI (USB 2.0), OHCI/UHCI (USB 1.1), external hubs (incl. USB 3.0 and Transaction Translators), USB Mass Storage, USB hotplug |
+| Filesystems | FAT12/16/32 and exFAT (read/write, `mkfs`), ramfs, ext4, NTFS, ISO9660 with Rock Ridge and Joliet, tar/cpio initrd (read-only) — see [Filesystems](#filesystems) |
 | Scripting | Embedded Lua and MicroPython — `.lua` and `.py` scripts can be run directly from disk or a USB drive |
 | Scheduler | Preemptive SMP scheduler: per-core run queues, 16-level multi-level feedback queue (dynamic priority, level-dependent quantum), aging against starvation, wake-up placement, work stealing and load balancing, per-task FPU/SSE state, stack overflow canary |
 | Services | Service manager with priorities, dependencies, health checks and restarts (root fs, keyboard updater, mouse updater, USB hotplug, shell) |
@@ -78,6 +78,39 @@ make run-ehci-bios    # EHCI (USB 2.0)
 make run-ohci-bios    # OHCI (USB 1.1)
 ```
 
+## Filesystems
+
+| Filesystem | Read | Write | Format (`mkfs`) | Notes |
+|---|---|---|---|---|
+| FAT12 / FAT16 / FAT32 | Yes | Yes | Yes | Long names in UTF-8, Windows lowercase flags for short names |
+| exFAT | Yes | Yes | Yes | Allocation bitmap, FAT chains and contiguous files, VolumeDirty flag while mounted |
+| ramfs | Yes | Yes | — | In-memory, contents are lost on unmount or reboot |
+| ext4 | Yes | No | No | |
+| NTFS | Yes | No | No | Compressed and encrypted files are not supported |
+| ISO9660 | Yes | No | No | Rock Ridge and Joliet names |
+| tar / cpio (initrd) | Yes | No | No | ustar, GNU long names, pax, cpio newc |
+
+Filesystem shell commands:
+
+```
+mount NAME [POINT]          # mount a disk or partition (auto-detects the filesystem)
+mount ramfs POINT           # mount an empty in-memory filesystem
+umount [POINT]
+mkfs TYPE NAME [LABEL]      # format a disk or partition: fat, fat12, fat16, fat32, exfat
+fs-test [DIR]               # write/read self-test, leaves a check set in DIR/fskeep
+fs-sum [DIR]                # CRC32 and size of every file, written to the log
+```
+
+`mkfs fat` picks FAT12, FAT16 or FAT32 by size. A device cannot be formatted while it or any of its partitions is mounted. Formatting a partition also updates its MBR type; formatting a whole disk replaces its partition table.
+
+### initrd
+
+Any file passed as a Limine module becomes a RAM disk (`rd0`, `rd1`, ...), and an `rd*` device is preferred when the root filesystem is mounted automatically. The image can be a tar or cpio archive or an image of any supported filesystem (a FAT or exFAT image stays writable in RAM).
+
+```bash
+make iso-limine INITRD=initrd.tar
+```
+
 ## Running on Real Hardware
 
 Build the ISO with `make iso-limine`, then flash `LuOS_limine.iso` onto a USB drive. [USBImager](https://bztsrc.gitlab.io/usbimager/) is recommended — it writes the image byte-for-byte with no extra magic, and works the same way on Linux, Windows, and macOS.
@@ -94,7 +127,7 @@ make clean
 src/
 ├── components/   # ACPI, PCI, memory management, interrupts, logger, panic
 ├── drivers/      # Storage, USB, Video, Input, Timer, Serial drivers
-├── fs/           # FAT32, exFAT, ext4, ISO9660 implementations
+├── fs/           # FAT12/16/32, exFAT, ext4, NTFS, ISO9660, ramfs, tar/cpio archive implementations
 ├── kernel/       # core kernel, console, games
 │   ├── programs/ # service manager and system services
 │   ├── scheduler/# task scheduler

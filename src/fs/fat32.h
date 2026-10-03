@@ -88,8 +88,19 @@ typedef struct __attribute__((packed)) {
 #define FAT32_CLUSTER_EOC 0x0FFFFFFFu
 #define FAT32_CLUSTER_MASK 0x0FFFFFFFu
 
+#define FAT_ROOT_PSEUDO_BASE 0x0FF00000u
+
+#define FAT32_FSINFO_LEAD_SIG 0x41615252u
+#define FAT32_FSINFO_STRUC_SIG 0x61417272u
+
 typedef struct fat32_fs {
     struct block_device *dev;
+
+    uint8_t fat_bits;
+    uint32_t root_dir_lba;
+    uint32_t root_dir_sectors;
+    uint32_t fsinfo_sector;
+    bool fsinfo_invalidated;
 
     uint32_t bytes_per_sector;
     uint32_t sectors_per_cluster;

@@ -37,12 +37,19 @@ volatile struct limine_smp_request smp_request = {
 };
 
 __attribute__((used, section(".requests")))
+volatile struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST,
+    .revision = 0
+};
+
+__attribute__((used, section(".requests")))
 static volatile void *limine_requests[] = {
     (void *)&framebuffer_request,
     (void *)&hhdm_req,
     (void *)&kernel_address_request,
     (void *)&rsdp_request,
     (void *)&smp_request,
+    (void *)&module_request,
     NULL
 };
 
@@ -58,4 +65,8 @@ struct limine_framebuffer_request* get_framebuffer_request() {
 
 struct limine_smp_request* get_smp_request() {
     return (struct limine_smp_request*)&smp_request;
+}
+
+struct limine_module_request* get_module_request() {
+    return (struct limine_module_request*)&module_request;
 }
