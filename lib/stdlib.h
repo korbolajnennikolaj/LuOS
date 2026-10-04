@@ -29,9 +29,9 @@ static inline int atoi(const char *s) { return (int)strtol(s, (char**)0, 10); }
 static inline long atol(const char *s) { return strtol(s, (char**)0, 10); }
 static inline double atof(const char *s) { return strtod(s, (char**)0); }
 
-static inline int abs (int x) { return x < 0 ? -x : x; }
-static inline long labs (long x) { return x < 0 ? -x : x; }
-static inline long long llabs(long long x) { return x < 0 ? -x : x; }
+static inline int abs (int x) { return x < 0 ? (int)(0u - (unsigned int)x) : x; }
+static inline long labs (long x) { return x < 0 ? (long)(0ul - (unsigned long)x) : x; }
+static inline long long llabs(long long x) { return x < 0 ? (long long)(0ull - (unsigned long long)x) : x; }
 
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;

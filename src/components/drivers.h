@@ -7,10 +7,10 @@
 #include <stdint.h>
 
 #define MAX_DRIVERS_PER_TYPE 64
-#define AMOUNT_DRIVERS_TYPE 7
+#define AMOUNT_DRIVERS_TYPE 8
 
 #define MAX_DEVICES_PER_TYPE 64
-#define AMOUNT_DEVICES_TYPE 3
+#define AMOUNT_DEVICES_TYPE 4
 
 #define MAX_DEPENDENCIES_PER_DRIVER 8
 
@@ -24,12 +24,14 @@ enum DRIVER_TYPE {
     MOUSE_DRIVER = 5,
     USB_DRIVER = 4,
     STORAGE_DRIVER = 6,
+    AUDIO_DRIVER = 7,
 };
 
 enum DEVICE_TYPE {
     PCI_DEVICE = 0,
     USB_DEVICE = 1,
     STORAGE_DEVICE = 2,
+    AUDIO_DEVICE = 3,
 };
 
 enum DRIVER_STATUS{

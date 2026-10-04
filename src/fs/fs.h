@@ -2,6 +2,7 @@
 #define LUOS_FS_H
 
 #include "drivers/Storage/block_device.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -36,6 +37,8 @@ enum fs_type {
     FS_TYPE_RAMFS = 8,
     FS_TYPE_NTFS = 9,
     FS_TYPE_ARCHIVE = 10,
+    FS_TYPE_EXT2 = 11,
+    FS_TYPE_EXT3 = 12,
 };
 
 enum fs_entry_type {
@@ -84,19 +87,35 @@ typedef struct fs_ops {
     int (*unmount)(struct fs *fs);
 } fs_ops_t;
 
+typedef struct fs_lock {
+    spinlock_t spin;
+    void *volatile owner;
+    volatile uint32_t depth;
+} fs_lock_t;
+
 typedef struct fs {
     enum fs_type type;
     struct block_device *dev;
     const fs_ops_t *ops;
     char label[32];
     void *priv;
+    fs_lock_t vlock;
 } fs_t;
+
+void fs_volume_lock_init(fs_t *fs);
+void fs_volume_lock(fs_t *fs);
+void fs_volume_unlock(fs_t *fs);
 
 int fat32_probe(struct block_device *dev);
 int fat32_mount(struct block_device *dev, fs_t *out);
 
 int ext4_probe(struct block_device *dev);
 int ext4_mount(struct block_device *dev, fs_t *out);
+
+int ext2_probe(struct block_device *dev);
+int ext2_mount(struct block_device *dev, fs_t *out);
+int ext2_is_ext3(struct block_device *dev);
+int ext2_format(struct block_device *dev, const char *label, int is_ext3);
 
 int exfat_probe(struct block_device *dev);
 int exfat_mount(struct block_device *dev, fs_t *out);
@@ -124,6 +143,9 @@ int fs_format(struct block_device *dev, enum fs_type type, const char *label, ui
 const char *fs_type_name(enum fs_type type);
 
 int fs_mount_auto(struct block_device *dev, fs_t *out);
+
+void fs_lock(void);
+void fs_unlock(void);
 int fs_mount_type(struct block_device *dev, enum fs_type type, fs_t *out);
 
 typedef struct fs_path_parts {
@@ -160,74 +182,118 @@ static inline int fs_open(fs_t *fs, const char *path, bool create, bool truncate
     out->size = 0;
     out->pos = 0;
     out->writable = false;
-    return fs->ops->open(fs, path, create, truncate, out);
+    fs_volume_lock(fs);
+    int r = fs->ops->open(fs, path, create, truncate, out);
+    fs_volume_unlock(fs);
+    return r;
 }
 
 static inline int fs_close(fs_file_t *f) {
     if (!f || !f->fs || !f->fs->ops->close) return FS_ERR_NOSUPP;
-    return f->fs->ops->close(f);
+    fs_volume_lock(f->fs);
+    int r = f->fs->ops->close(f);
+    fs_volume_unlock(f->fs);
+    return r;
 }
 
 static inline int64_t fs_read(fs_file_t *f, void *buf, uint64_t size) {
     if (!f || !f->fs || !f->fs->ops->read) return FS_ERR_NOSUPP;
-    return f->fs->ops->read(f, buf, size);
+    fs_volume_lock(f->fs);
+    int64_t r = f->fs->ops->read(f, buf, size);
+    fs_volume_unlock(f->fs);
+    return r;
 }
 
 static inline int64_t fs_write(fs_file_t *f, const void *buf, uint64_t size) {
     if (!f || !f->fs || !f->fs->ops->write) return FS_ERR_NOSUPP;
-    return f->fs->ops->write(f, buf, size);
+    fs_volume_lock(f->fs);
+    int64_t r = f->fs->ops->write(f, buf, size);
+    fs_volume_unlock(f->fs);
+    return r;
 }
 
 static inline int fs_seek(fs_file_t *f, uint64_t pos) {
     if (!f || !f->fs || !f->fs->ops->seek) return FS_ERR_NOSUPP;
-    return f->fs->ops->seek(f, pos);
+    fs_volume_lock(f->fs);
+    int r = f->fs->ops->seek(f, pos);
+    fs_volume_unlock(f->fs);
+    return r;
 }
 
 static inline int fs_truncate(fs_file_t *f, uint64_t size) {
     if (!f || !f->fs || !f->fs->ops->truncate) return FS_ERR_NOSUPP;
-    return f->fs->ops->truncate(f, size);
+    fs_volume_lock(f->fs);
+    int r = f->fs->ops->truncate(f, size);
+    fs_volume_unlock(f->fs);
+    return r;
 }
 
 static inline int fs_opendir(fs_t *fs, const char *path, fs_dir_t *out) {
     if (!fs || !fs->ops || !fs->ops->opendir || !out) return FS_ERR_NOSUPP;
     out->fs = fs;
     out->priv = NULL;
-    return fs->ops->opendir(fs, path, out);
+    fs_volume_lock(fs);
+    int r = fs->ops->opendir(fs, path, out);
+    fs_volume_unlock(fs);
+    return r;
 }
 
 static inline int fs_readdir(fs_dir_t *dir, fs_dirent_t *out) {
     if (!dir || !dir->fs || !dir->fs->ops->readdir) return FS_ERR_NOSUPP;
-    return dir->fs->ops->readdir(dir, out);
+    fs_volume_lock(dir->fs);
+    int r = dir->fs->ops->readdir(dir, out);
+    fs_volume_unlock(dir->fs);
+    return r;
 }
 
 static inline int fs_closedir(fs_dir_t *dir) {
     if (!dir || !dir->fs || !dir->fs->ops->closedir) return FS_ERR_NOSUPP;
-    return dir->fs->ops->closedir(dir);
+    fs_volume_lock(dir->fs);
+    int r = dir->fs->ops->closedir(dir);
+    fs_volume_unlock(dir->fs);
+    return r;
 }
 
 static inline int fs_mkdir(fs_t *fs, const char *path) {
     if (!fs || !fs->ops || !fs->ops->mkdir) return FS_ERR_NOSUPP;
-    return fs->ops->mkdir(fs, path);
+    fs_volume_lock(fs);
+    int r = fs->ops->mkdir(fs, path);
+    fs_volume_unlock(fs);
+    return r;
 }
 
 static inline int fs_unlink(fs_t *fs, const char *path) {
     if (!fs || !fs->ops || !fs->ops->unlink) return FS_ERR_NOSUPP;
-    return fs->ops->unlink(fs, path);
+    fs_volume_lock(fs);
+    int r = fs->ops->unlink(fs, path);
+    fs_volume_unlock(fs);
+    return r;
 }
 
 static inline int fs_rmdir(fs_t *fs, const char *path) {
     if (!fs || !fs->ops || !fs->ops->rmdir) return FS_ERR_NOSUPP;
-    return fs->ops->rmdir(fs, path);
+    fs_volume_lock(fs);
+    int r = fs->ops->rmdir(fs, path);
+    fs_volume_unlock(fs);
+    return r;
 }
 
 static inline int fs_stat(fs_t *fs, const char *path, fs_dirent_t *out) {
     if (!fs || !fs->ops || !fs->ops->stat) return FS_ERR_NOSUPP;
-    return fs->ops->stat(fs, path, out);
+    fs_volume_lock(fs);
+    int r = fs->ops->stat(fs, path, out);
+    fs_volume_unlock(fs);
+    return r;
 }
 
 static inline int fs_unmount(fs_t *fs) {
     if (!fs || !fs->ops || !fs->ops->unmount) return FS_ERR_NOSUPP;
-    return fs->ops->unmount(fs);
+    fs_lock();
+    fs_volume_lock(fs);
+    int r = fs->ops->unmount(fs);
+    fs_volume_unlock(fs);
+    fs_unlock();
+    return r;
 }
 
 #endif

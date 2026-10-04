@@ -29,6 +29,7 @@
 //  https://tools.ietf.org/html/rfc2132 -- DHCP Options and BOOTP Vendor Extensions
 
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 #include "py/mperrno.h"
 #include "py/mphal.h"
@@ -146,14 +147,37 @@ static int dhcp_socket_sendto(struct udp_pcb **udp, struct netif *netif, const v
     return len;
 }
 
-static uint8_t *opt_find(uint8_t *opt, uint8_t cmd) {
-    for (int i = 0; i < 308 && opt[i] != DHCP_OPT_END;) {
+static uint8_t *opt_find(uint8_t *opt, uint8_t cmd, size_t opt_len) {
+    for (size_t i = 0; i + 1 < opt_len && opt[i] != DHCP_OPT_END;) {
         if (opt[i] == cmd) {
             return &opt[i];
         }
         i += 2 + opt[i + 1];
     }
     return NULL;
+}
+
+static bool opt_valid(uint8_t *opt, size_t len, uint8_t *o, size_t need) {
+    return (size_t)(o - opt) + need <= len;
+}
+
+#define DHCPS_MAX_LEASES_PER_MAC 2
+
+static bool dhcp_rate_limit_ok(dhcp_server_t *d) {
+    uint32_t now = mp_hal_ticks_ms();
+    uint32_t active = 0;
+    for (int i = 0; i < DHCPS_MAX_IP; ++i) {
+        if (d->lease[i].mac[0] || d->lease[i].mac[1] || d->lease[i].mac[2] ||
+            d->lease[i].mac[3] || d->lease[i].mac[4] || d->lease[i].mac[5]) {
+            uint32_t expiry = d->lease[i].expiry << 16 | 0xffff;
+            if ((int32_t)(expiry - now) >= 0) {
+                active++;
+            } else {
+                memset(d->lease[i].mac, 0, MAC_LEN);
+            }
+        }
+    }
+    return active < DHCPS_MAX_IP;
 }
 
 static void opt_write_n(uint8_t **opt, uint8_t cmd, size_t n, const void *data) {
@@ -193,6 +217,7 @@ static void dhcp_server_process(void *arg, struct udp_pcb *upcb, struct pbuf *p,
     dhcp_msg_t dhcp_msg;
 
     #define DHCP_MIN_SIZE (240 + 3)
+    #define DHCP_OPT_AREA (sizeof(dhcp_msg_t) - offsetof(dhcp_msg_t, options))
     if (p->tot_len < DHCP_MIN_SIZE) {
         goto ignore_request;
     }
@@ -202,14 +227,42 @@ static void dhcp_server_process(void *arg, struct udp_pcb *upcb, struct pbuf *p,
         goto ignore_request;
     }
 
+    static const uint8_t cookie[4] = {99, 130, 83, 99};
+    if (memcmp(dhcp_msg.options, cookie, 4) != 0) {
+        goto ignore_request;
+    }
+
+    size_t opt_len = len - offsetof(dhcp_msg_t, options);
+    if (opt_len > DHCP_OPT_AREA) opt_len = DHCP_OPT_AREA;
+    if (opt_len < 8) {
+        goto ignore_request;
+    }
+
     dhcp_msg.op = DHCPOFFER;
     memcpy(&dhcp_msg.yiaddr, &ip_2_ip4(&d->ip)->addr, 4);
 
     uint8_t *opt = (uint8_t *)&dhcp_msg.options;
-    opt += 4; // assume magic cookie: 99, 130, 83, 99
+    opt += 4; // magic cookie: 99, 130, 83, 99 (validated above)
+
+    size_t rem = opt_len - 4;
+    if (!opt_valid((uint8_t *)&dhcp_msg.options, opt_len, opt, 3) ||
+        opt[0] != DHCP_OPT_MSG_TYPE || opt[1] != 1) {
+        goto ignore_request;
+    }
+
+    if (!dhcp_rate_limit_ok(d)) {
+        goto ignore_request;
+    }
 
     switch (opt[2]) {
         case DHCPDISCOVER: {
+            int leases = 0;
+            for (int i = 0; i < DHCPS_MAX_IP; ++i) {
+                if (memcmp(d->lease[i].mac, dhcp_msg.chaddr, MAC_LEN) == 0) leases++;
+            }
+            if (leases >= DHCPS_MAX_LEASES_PER_MAC) {
+                goto ignore_request;
+            }
             int yi = DHCPS_MAX_IP;
             for (int i = 0; i < DHCPS_MAX_IP; ++i) {
                 if (memcmp(d->lease[i].mac, dhcp_msg.chaddr, MAC_LEN) == 0) {
@@ -241,9 +294,12 @@ static void dhcp_server_process(void *arg, struct udp_pcb *upcb, struct pbuf *p,
         }
 
         case DHCPREQUEST: {
-            uint8_t *o = opt_find(opt, DHCP_OPT_REQUESTED_IP);
+            uint8_t *o = opt_find(opt, DHCP_OPT_REQUESTED_IP, rem);
             if (o == NULL) {
                 // Should be NACK
+                goto ignore_request;
+            }
+            if (!opt_valid(opt, rem, o, 6)) {
                 goto ignore_request;
             }
             if (memcmp(o + 2, &ip_2_ip4(&d->ip)->addr, 3) != 0) {
@@ -286,6 +342,9 @@ static void dhcp_server_process(void *arg, struct udp_pcb *upcb, struct pbuf *p,
     opt_write_n(&opt, DHCP_OPT_DNS, 4, &ip_2_ip4(&d->ip)->addr);
     opt_write_u32(&opt, DHCP_OPT_IP_LEASE_TIME, DEFAULT_LEASE_TIME_S);
     *opt++ = DHCP_OPT_END;
+    if ((size_t)(opt - (uint8_t *)&dhcp_msg) > len) {
+        goto ignore_request;
+    }
     struct netif *netif = ip_current_input_netif();
     dhcp_socket_sendto(&d->udp, netif, &dhcp_msg, opt - (uint8_t *)&dhcp_msg, 0xffffffff, PORT_DHCP_CLIENT);
 

@@ -1,6 +1,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <errno.h>
 
 #include "components/drivers.h"
 #include "drivers/Timer/timer.h"
@@ -39,13 +40,14 @@ static int _is_leap(int y)
 static int _month_days(int mon, int year)
 {
     static const int days[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    if (mon == 1 && _is_leap(year)) return 29;
-    return days[mon];
+    if (mon < 1 || mon > 12) return 30;
+    if (mon == 2 && _is_leap(year)) return 29;
+    return days[mon - 1];
 }
 
 static void _epoch_to_tm(time_t t, struct tm *out)
 {
-    time_t days = t / (time_t)SECS_PER_DAY;
+    int64_t days = (int64_t)(t / (time_t)SECS_PER_DAY);
     int secs = (int)(t % (time_t)SECS_PER_DAY);
     if (secs < 0) { secs += SECS_PER_DAY; days--; }
 
@@ -53,41 +55,51 @@ static void _epoch_to_tm(time_t t, struct tm *out)
     out->tm_min = (secs / 60) % 60;
     out->tm_hour = secs / 3600;
 
-    int wday = (int)((days + 4) % 7);
+    int64_t wday = (days + 4) % 7;
     if (wday < 0) wday += 7;
-    out->tm_wday = wday;
+    out->tm_wday = (int)wday;
 
-    int year = 1970;
-    while (1) {
-        int dy = _is_leap(year) ? 366 : 365;
-        if (days < (time_t)dy) break;
-        days -= dy; year++;
-    }
-    out->tm_year = year - 1900;
-    out->tm_yday = (int)days;
+    uint64_t z = (uint64_t)(days + 719468);
+    uint64_t era = z / 146097;
+    uint64_t doe = z - era * 146097;
+    uint64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint64_t y = yoe + era * 400;
+    uint64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint64_t mp = (5 * doy + 2) / 153;
+    uint64_t d = doy - (153 * mp + 2) / 5 + 1;
+    uint64_t m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
 
-    int mon = 0;
-    while (mon < 11) {
-        int dm = _month_days(mon, year);
-        if (days < dm) break;
-        days -= dm; mon++;
-    }
-    out->tm_mon = mon;
-    out->tm_mday = (int)days + 1;
+    if (y > (uint64_t)INT32_MAX) y = (uint64_t)INT32_MAX;
+
+    out->tm_year = (int)y - 1900;
+    out->tm_yday = (int)doy;
+    out->tm_mon = (int)(m - 1);
+    out->tm_mday = (int)d;
     out->tm_isdst = 0;
 }
 
 time_t rtc_system_time_to_epoch(const struct system_time *st)
 {
+    if (st->month < 1 || st->month > 12) return (time_t)-1;
+    if (st->day < 1 || st->day > 31) return (time_t)-1;
+    if (st->hours > 23 || st->minutes > 59 || st->seconds > 60) return (time_t)-1;
+    if (st->day > _month_days((int)st->month, (int)st->year)) return (time_t)-1;
+
     int year = (int)st->year;
     int mon = (int)st->month - 1;
     int day = (int)st->day - 1;
     time_t days = 0;
 
-    for (int y = 1970; y < year; y++)
-        days += _is_leap(y) ? 366 : 365;
+    if (year >= 1970) {
+        for (int y = 1970; y < year; y++)
+            days += _is_leap(y) ? 366 : 365;
+    } else {
+        for (int y = year; y < 1970; y++)
+            days -= _is_leap(y) ? 366 : 365;
+    }
     for (int m = 0; m < mon; m++)
-        days += _month_days(m, year);
+        days += _month_days(m + 1, year);
     days += day;
 
     return days * (time_t)SECS_PER_DAY
@@ -126,8 +138,12 @@ time_t rtc_read_epoch_direct(void)
         hr = ((hr & 0x7F) + 12) % 24;
 
     struct system_time st = {
-        .seconds=sec, .minutes=min, .hours=hr,
-        .day=day, .month=mon, .year=(uint16_t)(2000+yr)
+        .seconds = sec > 59 ? 59 : sec,
+        .minutes = min > 59 ? 59 : min,
+        .hours = hr > 23 ? 23 : hr,
+        .day = (day >= 1 && day <= 31) ? day : 1,
+        .month = (mon >= 1 && mon <= 12) ? mon : 1,
+        .year = (uint16_t)(2000 + (yr > 99 ? 99 : yr))
     };
     return rtc_system_time_to_epoch(&st);
 }
@@ -230,6 +246,16 @@ time_t mktime(struct tm *tm)
 {
     if (!tm) return (time_t)-1;
 
+    if (tm->tm_sec > 59 || tm->tm_sec < 0 ||
+        tm->tm_min > 59 || tm->tm_min < 0 ||
+        tm->tm_hour > 23 || tm->tm_hour < 0 ||
+        tm->tm_mday > 31 || tm->tm_mday < 1 ||
+        tm->tm_mon > 11 || tm->tm_mon < -1 ||
+        tm->tm_year < -1900 || tm->tm_year > 8099 - 1900) {
+        errno = EOVERFLOW;
+        return (time_t)-1;
+    }
+
     while (tm->tm_sec >= 60) { tm->tm_min++; tm->tm_sec -= 60; }
     while (tm->tm_sec < 0) { tm->tm_min--; tm->tm_sec += 60; }
     while (tm->tm_min >= 60) { tm->tm_hour++; tm->tm_min -= 60; }
@@ -243,21 +269,31 @@ time_t mktime(struct tm *tm)
 
     while (tm->tm_mday <= 0) {
         if (--tm->tm_mon < 0) { tm->tm_mon = 11; tm->tm_year--; year--; }
-        tm->tm_mday += _month_days(tm->tm_mon, year);
+        tm->tm_mday += _month_days(tm->tm_mon + 1, year);
     }
     {
         int dm;
-        while (tm->tm_mday > (dm = _month_days(tm->tm_mon, year))) {
+        while (tm->tm_mday > (dm = _month_days(tm->tm_mon + 1, year))) {
             tm->tm_mday -= dm;
             if (++tm->tm_mon >= 12) { tm->tm_mon = 0; tm->tm_year++; year++; }
         }
     }
 
+    if (year < 1 || year > 9999) {
+        errno = EOVERFLOW;
+        return (time_t)-1;
+    }
+
     time_t days = 0;
-    for (int y = 1970; y < year; y++)
-        days += _is_leap(y) ? 366 : 365;
+    if (year >= 1970) {
+        for (int y = 1970; y < year; y++)
+            days += _is_leap(y) ? 366 : 365;
+    } else {
+        for (int y = year; y < 1970; y++)
+            days -= _is_leap(y) ? 366 : 365;
+    }
     for (int m = 0; m < tm->tm_mon; m++)
-        days += _month_days(m, year);
+        days += _month_days(m + 1, year);
     days += tm->tm_mday - 1;
 
     int wday = (int)((days + 4) % 7);

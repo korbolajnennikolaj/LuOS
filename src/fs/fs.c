@@ -4,8 +4,11 @@
 #include "components/Memory/heap.h"
 #include "fs/exfat.h"
 #include "fs/ext4.h"
+#include "fs/ext2.h"
 #include "fs/fat32.h"
 #include "fs/iso9660.h"
+#include "kernel/scheduler/scheduler.h"
+#include "kernel/scheduler/spinlock.h"
 
 #include <string.h>
 
@@ -15,6 +18,8 @@ const char *fs_type_name(enum fs_type type) {
         case FS_TYPE_FAT16: return "FAT16";
         case FS_TYPE_FAT32: return "FAT32";
         case FS_TYPE_EXFAT: return "exFAT";
+        case FS_TYPE_EXT2: return "ext2";
+        case FS_TYPE_EXT3: return "ext3";
         case FS_TYPE_EXT4: return "ext4";
         case FS_TYPE_ISO9660: return "ISO9660";
         case FS_TYPE_RAMFS: return "ramfs";
@@ -29,12 +34,14 @@ static const char *fs_type_label(enum fs_type type) {
 }
 
 static int fs_log_mount(struct block_device *dev, enum fs_type type, fs_t *out, int r) {
-    const char *name = dev->name[0] ? dev->name : "?";
-    if (r == FS_OK)
+    if (r == FS_OK) {
+        fs_volume_lock_init(out);
+        const char *name = dev->name[0] ? dev->name : "?";
         LOG_DEBUG("mounted %s on '%s'%s%s%s", fs_type_label(out->type), name,
                  out->label[0] ? " (label \"" : "", out->label, out->label[0] ? "\")" : "");
-    else
-        LOG_WARNING("mounting %s on '%s' failed (error %d)", fs_type_label(type), name, r);
+    } else {
+        LOG_WARNING("mounting %s on '%s' failed (error %d)", fs_type_label(type), dev->name, r);
+    }
     return r;
 }
 
@@ -47,12 +54,76 @@ int fs_mount_type(struct block_device *dev, enum fs_type type, fs_t *out) {
         case FS_TYPE_NTFS: return fs_log_mount(dev, type, out, ntfs_mount(dev, out));
         case FS_TYPE_ARCHIVE: return fs_log_mount(dev, type, out, archive_mount(dev, out));
         case FS_TYPE_EXFAT: return fs_log_mount(dev, type, out, exfat_mount(dev, out));
+        case FS_TYPE_EXT2:
+        case FS_TYPE_EXT3: return fs_log_mount(dev, type, out, ext2_mount(dev, out));
         case FS_TYPE_EXT4: return fs_log_mount(dev, type, out, ext4_mount(dev, out));
         case FS_TYPE_ISO9660: return fs_log_mount(dev, type, out, iso9660_mount(dev, out));
         default:
             LOG_ERROR("unsupported filesystem type %d requested for '%s'", (int)type, dev->name);
             return FS_ERR_PARAM;
     }
+}
+
+static spinlock_t fs_owner_lock = SPINLOCK_INIT;
+static void *volatile fs_owner = NULL;
+static volatile uint32_t fs_depth = 0;
+
+static void *fs_lock_identity(void) {
+    struct task *t = current_task();
+    if (t) return t;
+    return (void *)(uintptr_t)(current_core() + 1);
+}
+
+void fs_volume_lock_init(fs_t *fs) {
+    spin_lock_init(&fs->vlock.spin);
+    fs->vlock.owner = NULL;
+    fs->vlock.depth = 0;
+}
+
+void fs_volume_lock(fs_t *fs) {
+    void *me = fs_lock_identity();
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&fs->vlock.spin);
+        if (!fs->vlock.owner || fs->vlock.owner == me) {
+            fs->vlock.owner = me;
+            fs->vlock.depth++;
+            spin_unlock_irqrestore(&fs->vlock.spin, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&fs->vlock.spin, flags);
+        if (current_task()) scheduler_sleep_ms(1);
+        else asm volatile("pause");
+    }
+}
+
+void fs_volume_unlock(fs_t *fs) {
+    uint64_t flags = spin_lock_irqsave(&fs->vlock.spin);
+    if (fs->vlock.depth > 0) fs->vlock.depth--;
+    if (fs->vlock.depth == 0) fs->vlock.owner = NULL;
+    spin_unlock_irqrestore(&fs->vlock.spin, flags);
+}
+
+void fs_lock(void) {
+    void *me = fs_lock_identity();
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&fs_owner_lock);
+        if (!fs_owner || fs_owner == me) {
+            fs_owner = me;
+            fs_depth++;
+            spin_unlock_irqrestore(&fs_owner_lock, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&fs_owner_lock, flags);
+        if (current_task()) scheduler_sleep_ms(1);
+        else asm volatile("pause");
+    }
+}
+
+void fs_unlock(void) {
+    uint64_t flags = spin_lock_irqsave(&fs_owner_lock);
+    if (fs_depth > 0) fs_depth--;
+    if (fs_depth == 0) fs_owner = NULL;
+    spin_unlock_irqrestore(&fs_owner_lock, flags);
 }
 
 int fs_mount_auto(struct block_device *dev, fs_t *out) {
@@ -62,6 +133,10 @@ int fs_mount_auto(struct block_device *dev, fs_t *out) {
     if (ntfs_probe(dev) == FS_OK) return fs_log_mount(dev, FS_TYPE_NTFS, out, ntfs_mount(dev, out));
     if (fat32_probe(dev) == FS_OK) return fs_log_mount(dev, FS_TYPE_FAT32, out, fat32_mount(dev, out));
     if (ext4_probe(dev) == FS_OK) return fs_log_mount(dev, FS_TYPE_EXT4, out, ext4_mount(dev, out));
+    if (ext2_probe(dev) == FS_OK) {
+        enum fs_type t = ext2_is_ext3(dev) ? FS_TYPE_EXT3 : FS_TYPE_EXT2;
+        return fs_log_mount(dev, t, out, ext2_mount(dev, out));
+    }
     if (iso9660_probe(dev) == FS_OK) return fs_log_mount(dev, FS_TYPE_ISO9660, out, iso9660_mount(dev, out));
     if (archive_probe(dev) == FS_OK) return fs_log_mount(dev, FS_TYPE_ARCHIVE, out, archive_mount(dev, out));
 
@@ -137,6 +212,8 @@ int fs_format_type_from_name(const char *name, struct block_device *dev, enum fs
     else if (fs_name_ieq(name, "fat16")) *out = FS_TYPE_FAT16;
     else if (fs_name_ieq(name, "fat32") || fs_name_ieq(name, "vfat")) *out = FS_TYPE_FAT32;
     else if (fs_name_ieq(name, "exfat")) *out = FS_TYPE_EXFAT;
+    else if (fs_name_ieq(name, "ext2")) *out = FS_TYPE_EXT2;
+    else if (fs_name_ieq(name, "ext3")) *out = FS_TYPE_EXT3;
     else if (fs_name_ieq(name, "fat") || fs_name_ieq(name, "msdos")) {
         if (!dev) return FS_ERR_PARAM;
         uint64_t bytes = dev->sector_count * (dev->sector_size ? dev->sector_size : 512);
@@ -157,6 +234,8 @@ int fs_format(struct block_device *dev, enum fs_type type, const char *label, ui
         case FS_TYPE_FAT16:
         case FS_TYPE_FAT32: r = fat_format(dev, type, label, hidden_sectors); break;
         case FS_TYPE_EXFAT: r = exfat_format(dev, label, hidden_sectors); break;
+        case FS_TYPE_EXT2: r = ext2_format(dev, label, 0); break;
+        case FS_TYPE_EXT3: r = ext2_format(dev, label, 1); break;
         default: return FS_ERR_NOSUPP;
     }
     if (r == FS_OK && dev->flush) dev->flush(dev);

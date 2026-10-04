@@ -104,8 +104,13 @@ void soft_timer_handler(void) {
             entry->c_callback(entry);
         }
         if (entry->mode == SOFT_TIMER_MODE_PERIODIC) {
-            entry->expiry_ms += entry->delta_ms;
-            heap = (soft_timer_entry_t *)mp_pairheap_push(soft_timer_lt, SOFT_TIMER_HEAP(heap), &entry->pairheap);
+            if (entry->delta_ms == 0) {
+                // Guard against a zero-period timer busy-looping the IRQ handler.
+                entry->mode = SOFT_TIMER_MODE_ONE_SHOT;
+            } else {
+                entry->expiry_ms += entry->delta_ms;
+                heap = (soft_timer_entry_t *)mp_pairheap_push(soft_timer_lt, SOFT_TIMER_HEAP(heap), &entry->pairheap);
+            }
         }
     }
     soft_timer_heap = heap;
@@ -142,11 +147,14 @@ void soft_timer_static_init(soft_timer_entry_t *entry, uint16_t mode, uint32_t d
     mp_pairheap_init_node(soft_timer_lt, &entry->pairheap);
     entry->flags = 0;
     entry->mode = mode;
-    entry->delta_ms = delta_ms;
+    entry->delta_ms = (delta_ms == 0 && mode == SOFT_TIMER_MODE_PERIODIC) ? 1 : delta_ms;
     entry->c_callback = cb;
 }
 
 void soft_timer_insert(soft_timer_entry_t *entry, uint32_t initial_delta_ms) {
+    if (entry->mode == SOFT_TIMER_MODE_PERIODIC && entry->delta_ms == 0) {
+        entry->delta_ms = 1;
+    }
     mp_pairheap_init_node(soft_timer_lt, &entry->pairheap);
     entry->expiry_ms = soft_timer_get_ms() + initial_delta_ms;
     MICROPY_PY_PENDSV_ENTER;

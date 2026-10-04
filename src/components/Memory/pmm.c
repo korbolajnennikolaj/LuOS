@@ -192,6 +192,112 @@ uint64_t pmm_alloc_page(void) {
     return p;
 }
 
+static uint64_t pmm_alloc_run_locked(uint64_t count, uint64_t limit_frame) {
+    uint64_t consecutive = 0;
+    uint64_t start_frame = 0;
+    uint64_t end = pmm_total < limit_frame ? pmm_total : limit_frame;
+
+    for (uint64_t frame = 1; frame < end; frame++) {
+        if ((frame % BITS_PER_ENTRY) == 0 && pmm_bitmap[frame / BITS_PER_ENTRY] == 0xFFFFFFFFFFFFFFFFULL &&
+            frame + BITS_PER_ENTRY <= end) {
+            consecutive = 0;
+            frame += BITS_PER_ENTRY - 1;
+            continue;
+        }
+        if (!_bitmap_test(frame)) {
+            if (consecutive == 0) start_frame = frame;
+            consecutive++;
+            if (consecutive == count) {
+                for (uint64_t i = start_frame; i < start_frame + count; i++) _bitmap_set(i);
+                pmm_free -= count;
+                return PAGE_TO_PHYS(start_frame);
+            }
+        } else {
+            consecutive = 0;
+        }
+    }
+    return PMM_ALLOC_FAIL;
+}
+
+uint64_t pmm_alloc_pages_below(uint64_t count, uint64_t limit) {
+    if (!pmm_bitmap || count == 0 || pmm_free < count) return PMM_ALLOC_FAIL;
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    uint64_t p = pmm_alloc_run_locked(count, PHYS_TO_PAGE(limit));
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return p;
+}
+
+#define PMM_DMA32_POOL_MAX PMM_DMA32_POOL_PAGES
+
+static uint64_t dma32_base = 0;
+static uint64_t dma32_pages = 0;
+static uint64_t dma32_free = 0;
+static uint64_t dma32_bits[PMM_DMA32_POOL_MAX / 64];
+static spinlock_t dma32_lock = SPINLOCK_INIT;
+
+void pmm_dma32_pool_init(uint64_t pages) {
+    if (dma32_pages) return;
+    if (pages > PMM_DMA32_POOL_MAX) pages = PMM_DMA32_POOL_MAX;
+    for (uint64_t try_pages = pages; try_pages >= 64; try_pages /= 2) {
+        uint64_t phys = pmm_alloc_pages_below(try_pages, PMM_DMA32_LIMIT);
+        if (!phys) continue;
+        dma32_base = phys;
+        dma32_pages = try_pages;
+        dma32_free = try_pages;
+        for (uint64_t i = 0; i < PMM_DMA32_POOL_MAX / 64; i++) dma32_bits[i] = 0;
+        LOG_INFO("32-bit DMA pool: %llu KiB at 0x%llx", (unsigned long long)(try_pages * PAGE_SIZE / 1024),
+                 (unsigned long long)phys);
+        return;
+    }
+    LOG_WARNING("no memory below 4 GiB for the 32-bit DMA pool");
+}
+
+uint64_t pmm_alloc_dma32_pages(uint64_t count) {
+    if (count == 0) return PMM_ALLOC_FAIL;
+    if (dma32_pages && count <= dma32_free) {
+        uint64_t flags = spin_lock_irqsave(&dma32_lock);
+        uint64_t run = 0, start = 0;
+        for (uint64_t i = 0; i < dma32_pages; i++) {
+            if (dma32_bits[i / 64] & (1ULL << (i % 64))) {
+                run = 0;
+                continue;
+            }
+            if (run == 0) start = i;
+            if (++run == count) {
+                for (uint64_t k = start; k < start + count; k++) dma32_bits[k / 64] |= 1ULL << (k % 64);
+                dma32_free -= count;
+                spin_unlock_irqrestore(&dma32_lock, flags);
+                return dma32_base + start * PAGE_SIZE;
+            }
+        }
+        spin_unlock_irqrestore(&dma32_lock, flags);
+    }
+    uint64_t p = pmm_alloc_pages_below(count, PMM_DMA32_LIMIT);
+    if (!p) LOG_WARNING("cannot allocate %llu page(s) below 4 GiB (pool %llu/%llu free)", (unsigned long long)count,
+                        (unsigned long long)dma32_free, (unsigned long long)dma32_pages);
+    return p;
+}
+
+void pmm_free_dma32_pages(uint64_t phys, uint64_t count) {
+    if (!phys || !count) return;
+    if (dma32_pages && phys >= dma32_base && phys < dma32_base + dma32_pages * PAGE_SIZE) {
+        uint64_t flags = spin_lock_irqsave(&dma32_lock);
+        uint64_t first = (phys - dma32_base) / PAGE_SIZE;
+        for (uint64_t k = first; k < first + count && k < dma32_pages; k++) {
+            if (dma32_bits[k / 64] & (1ULL << (k % 64))) {
+                dma32_bits[k / 64] &= ~(1ULL << (k % 64));
+                dma32_free++;
+            }
+        }
+        spin_unlock_irqrestore(&dma32_lock, flags);
+        return;
+    }
+    pmm_free_pages(phys, count);
+}
+
+uint64_t pmm_dma32_pool_total(void) { return dma32_pages; }
+uint64_t pmm_dma32_pool_free(void) { return dma32_free; }
+
 uint64_t pmm_alloc_pages(uint64_t count) {
     if (!pmm_bitmap || count == 0 || pmm_free < count) {
         LOG_WARNING("cannot allocate %llu page(s), %llu free", (unsigned long long)count, (unsigned long long)pmm_free);

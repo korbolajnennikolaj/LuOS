@@ -80,6 +80,7 @@ OBJECTS = $(NORMAL_OBJECTS) $(MATH_OBJECTS) $(LUA_OBJECTS) $(ASM_OBJECTS)
 
 .PHONY: all clean run-uefi run-uefi-smp run-bios iso-limine help \
 	run-uhci-bios run-ehci-bios run-ohci-bios \
+	run-audio-hda run-audio-ac97 run-audio-usb run-audio-all \
 	run-xhci-bios run-xhci-uefi run-xhci-log \
 	run-uhci-log run-ehci-log run-ohci-log \
 	run-ata-log run-stress-log
@@ -389,6 +390,83 @@ run-ohci-bios: iso-limine $(DISK_IMG)
 		2>$(OHCI_LOG)
 	@echo "[OHCI BIOS] Done. Traces -> $(OHCI_LOG) | QEMU log -> $(OHCI_DBG_LOG)"
 
+AUDIO_BACKEND ?= pa
+AUDIO_LOG = qemu_audio.log
+AUDIO_DEV = -audiodev $(AUDIO_BACKEND),id=snd0
+
+run-audio-hda: iso-limine
+	@echo "[AUDIO] Intel HDA (ICH9) + hda-duplex codec, host backend: $(AUDIO_BACKEND)"
+	@echo "[AUDIO] Try: audio, audio-beep 440 1000, audio-play FILE.wav, audio-info"
+	qemu-system-x86_64 \
+		-machine q35 \
+		-cdrom $(ISO_LIMINE) \
+		-m 512M \
+		-smp 2 \
+		-boot d \
+		-serial stdio \
+		-vga std \
+		$(AUDIO_DEV) \
+		-device ich9-intel-hda \
+		-device hda-duplex,audiodev=snd0 \
+		-d guest_errors,unimp \
+		-D $(AUDIO_LOG) \
+		-no-reboot
+
+run-audio-ac97: iso-limine
+	@echo "[AUDIO] Intel 82801AA AC97 (STAC9700 codec), host backend: $(AUDIO_BACKEND)"
+	qemu-system-x86_64 \
+		-machine pc \
+		-cdrom $(ISO_LIMINE) \
+		-m 512M \
+		-smp 2 \
+		-boot d \
+		-serial stdio \
+		-vga std \
+		$(AUDIO_DEV) \
+		-device AC97,audiodev=snd0 \
+		-d guest_errors,unimp \
+		-D $(AUDIO_LOG) \
+		-no-reboot
+
+run-audio-usb: iso-limine
+	@echo "[AUDIO] USB Audio Class 1 device on xHCI, host backend: $(AUDIO_BACKEND)"
+	qemu-system-x86_64 \
+		-machine q35 \
+		-cdrom $(ISO_LIMINE) \
+		-m 512M \
+		-smp 2 \
+		-boot d \
+		-serial stdio \
+		-vga std \
+		$(AUDIO_DEV) \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-device usb-audio,audiodev=snd0,bus=xhci.0 \
+		-trace "usb_xhci_*" \
+		-d guest_errors,unimp \
+		-D $(AUDIO_LOG) \
+		-no-reboot 2>usb_audio_trace.log
+
+run-audio-all: iso-limine
+	@echo "[AUDIO] HDA + AC97 + USB audio together (audio-default N switches the output)"
+	qemu-system-x86_64 \
+		-machine q35 \
+		-cdrom $(ISO_LIMINE) \
+		-m 512M \
+		-smp 2 \
+		-boot d \
+		-serial stdio \
+		-vga std \
+		$(AUDIO_DEV) \
+		-device ich9-intel-hda \
+		-device hda-duplex,audiodev=snd0 \
+		-device AC97,audiodev=snd0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-audio,audiodev=snd0,bus=xhci.0 \
+		-d guest_errors,unimp \
+		-D $(AUDIO_LOG) \
+		-no-reboot
+
 run-uhci-log: run-uhci-bios
 run-ehci-log: run-ehci-bios
 run-ohci-log: run-ohci-bios
@@ -633,7 +711,9 @@ clean:
 		$(STRESS_LOG) \
 		$(STRESS_DBG_LOG) \
 		$(SMP_LOG) \
-		$(SMP_DBG_LOG)
+		$(SMP_DBG_LOG) \
+		$(AUDIO_LOG) \
+		usb_audio_trace.log
 	@echo "Cleanup complete."
 
 help:
@@ -667,6 +747,12 @@ help:
 	@echo "  make run-uhci-bios       - PIIX4 UHCI (USB 1.1)"
 	@echo "  make run-ehci-bios       - EHCI (USB 2.0) + companion UHCI"
 	@echo "  make run-ohci-bios       - PCI OHCI (USB 1.1)"
+	@echo ""
+	@echo "RUN (AUDIO - host sound via AUDIO_BACKEND=pa|pipewire|alsa|sdl|wav,path=out.wav):"
+	@echo "  make run-audio-hda       - Intel HDA (ICH9) + hda-duplex codec"
+	@echo "  make run-audio-ac97      - Intel ICH AC97 + STAC9700 codec"
+	@echo "  make run-audio-usb       - USB Audio Class 1 device on xHCI"
+	@echo "  make run-audio-all       - all three at once"
 	@echo ""
 	@echo "RUN (SMP TEST - 4 cores):"
 	@echo "  make run-uefi-smp        - Quick SMP test (UEFI, 4 cores, no extra devices)"

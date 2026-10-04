@@ -72,8 +72,16 @@ void netutils_parse_ipv4_addr(mp_obj_t addr_in, uint8_t *out_ip, netutils_endian
     }
     for (mp_uint_t i = 3; ; i--) {
         mp_uint_t val = 0;
+        mp_uint_t digits = 0;
         for (; s < s_top && *s != '.'; s++) {
             val = val * 10 + *s - '0';
+            digits++;
+            if (val > 255) {
+                mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
+            }
+        }
+        if (digits == 0 || digits > 3) {
+            mp_raise_ValueError(MP_ERROR_TEXT("invalid arguments"));
         }
         if (endian == NETUTILS_LITTLE) {
             out_ip[i] = val;

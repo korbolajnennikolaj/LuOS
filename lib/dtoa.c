@@ -37,9 +37,11 @@ static int _uint_to_buf(char *buf, size_t sz, uint64_t val) {
 
 static int _fmt_fixed(double value, int prec, char *buf, size_t sz) {
     int pos = 0;
+    int neg = 0;
 
     if (_is_neg(value) && value != 0.0) {
         if ((size_t)pos < sz) buf[pos++] = '-';
+        neg = 1;
         value = -value;
     }
 
@@ -92,7 +94,7 @@ static int _fmt_fixed(double value, int prec, char *buf, size_t sz) {
             if (carry) {
 
                 if ((size_t)(pos + 1) < sz) {
-                    int start = (_is_neg(-value)) ? 1 : 0;
+                    int start = neg ? 1 : 0;
                     memmove(buf + start + 1, buf + start, pos - start);
                     buf[start] = '1';
                     pos++;

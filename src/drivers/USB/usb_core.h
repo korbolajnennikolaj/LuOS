@@ -26,6 +26,11 @@
 #define USB_DESC_STRING 0x03
 #define USB_DESC_INTERFACE 0x04
 #define USB_DESC_ENDPOINT 0x05
+#define USB_DESC_DEVICE_QUALIFIER 0x06
+#define USB_DESC_IAD 0x0B
+#define USB_DESC_CS_INTERFACE 0x24
+
+#define USB_REQ_SET_INTERFACE 0x0B
 
 #define HID_SET_PROTOCOL 0x0B
 #define HID_SET_IDLE 0x0A
@@ -36,7 +41,19 @@
 #define USB_EP_XFER_INTERRUPT 0x03
 
 #define USB_MAX_BULK_EP 4
-#define USB_MAX_ISO_EP 4
+#define USB_MAX_ISO_EP 8
+
+#define USB_CONFIG_MAX 4096
+#define USB_MAX_INTERFACES 32
+#define USB_MAX_FUNCTIONS 16
+
+#define USB_ISO_MAX_PACKETS 64
+
+#define USB_ISO_OK 0
+#define USB_ISO_ERR -1
+#define USB_ISO_BUSY -2
+#define USB_ISO_CANCELLED -3
+#define USB_ISO_NODEV -4
 
 typedef struct usb_device_descriptor {
     uint8_t bLength;
@@ -69,6 +86,50 @@ typedef struct usb_endpoint_info {
     uint16_t max_packet_size;
     uint8_t interval;
 } usb_endpoint_info;
+
+typedef struct usb_interface_info {
+    uint8_t number;
+    uint8_t alt_count;
+    uint8_t iface_class;
+    uint8_t iface_subclass;
+    uint8_t iface_protocol;
+    uint8_t ep_count;
+    uint8_t max_ep_count;
+    uint8_t has_iso;
+    uint8_t function;
+    uint8_t string_idx;
+} usb_interface_info;
+
+typedef struct usb_function_info {
+    uint8_t first_interface;
+    uint8_t interface_count;
+    uint8_t func_class;
+    uint8_t func_subclass;
+    uint8_t func_protocol;
+    uint8_t from_iad;
+    uint8_t string_idx;
+    uint32_t iface_mask;
+    const char *driver;
+} usb_function_info;
+
+typedef struct usb_iso_request {
+    void *data;
+    uint32_t length;
+    uint16_t n_packets;
+    uint16_t lens[USB_ISO_MAX_PACKETS];
+    uint16_t offsets[USB_ISO_MAX_PACKETS];
+    uint16_t actual[USB_ISO_MAX_PACKETS];
+    uint8_t endpoint;
+    volatile uint8_t done;
+    volatile uint8_t queued;
+    volatile uint16_t completed;
+    uint16_t errors;
+    int16_t status;
+    uint32_t hc_first;
+    uint32_t hc_count;
+    uint32_t start_frame;
+    void *user;
+} usb_iso_request;
 
 typedef struct usb_device {
     uint8_t port;
@@ -114,11 +175,23 @@ typedef struct usb_device {
     uint8_t iso_ep_count;
 
     uint8_t driver_managed;
+    uint32_t generation;
+
+    uint8_t config_value;
+    uint16_t config_len;
+    const uint8_t *config;
+
+    struct usb_interface_info interfaces[USB_MAX_INTERFACES];
+    uint8_t interface_count;
+    struct usb_function_info functions[USB_MAX_FUNCTIONS];
+    uint8_t function_count;
 
     uint8_t valid;
 } usb_device;
 
 uint64_t usb_core_pump_age_ms(void);
+bool usb_core_claim(uint32_t timeout_ms);
+void usb_core_release(void);
 void usb_core_poll_topology(void);
 
 typedef struct usb_core_driver {
@@ -145,16 +218,13 @@ typedef struct usb_core_driver {
                           void *data, uint16_t len,
                           uint8_t direction);
 
-    int (*iso_transfer)(struct usb_device *dev,
-                         uint8_t endpoint,
-                         void *data, uint16_t len,
-                         uint8_t n_frames, const uint16_t *frame_lens,
-                         uint8_t direction);
-
     void (*reset_endpoint_toggle)(struct usb_device *dev, uint8_t endpoint);
-} usb_core_driver;
 
-#define USB_ISO_MAX_FRAMES 8
+    int (*iso_open)(struct usb_device *dev, const struct usb_endpoint_info *ep);
+    int (*iso_submit)(struct usb_device *dev, struct usb_iso_request *req);
+    void (*iso_poll)(struct usb_device *dev);
+    void (*iso_close)(struct usb_device *dev, uint8_t endpoint);
+} usb_core_driver;
 
 struct usb_core_driver *return_usb_core_driver(void);
 struct driver *return_meta_usb_core_driver(void);
@@ -163,5 +233,14 @@ int usb_get_device_count(void);
 struct usb_device *usb_get_device(int idx);
 
 void usb_core_remove_device(struct usb_device *dev);
+
+const char *usb_class_name(uint8_t cls, uint8_t subclass, uint8_t protocol);
+const char *usb_function_name(const struct usb_function_info *f);
+struct usb_function_info *usb_find_function(struct usb_device *dev, uint8_t cls, int *iter);
+struct usb_interface_info *usb_find_interface(struct usb_device *dev, uint8_t number);
+bool usb_function_claim(struct usb_device *dev, struct usb_function_info *fn, const char *driver);
+void usb_function_release(struct usb_device *dev, struct usb_function_info *fn, const char *driver);
+bool usb_device_alive(struct usb_device *dev);
+void usb_iso_request_prepare(struct usb_iso_request *req, void *data, uint8_t endpoint, uint16_t n_packets, const uint16_t *lens);
 
 #endif

@@ -28,6 +28,7 @@ static struct usb_device usb_device_pool[MAX_USB_DEVICES];
 static int usb_device_count = 0;
 
 static uint8_t usb_next_address = 1;
+static uint32_t usb_generation_counter = 0;
 
 #define POLL_BUF_SIZE 8
 static uint8_t s_poll_buf[MAX_USB_DEVICES][POLL_BUF_SIZE]
@@ -39,6 +40,7 @@ static uint8_t s_bulk_poll_buf[MAX_USB_DEVICES][POLL_BULK_BUF_SIZE]
 __attribute__((aligned(64)));
 static bool s_bulk_poll_pending[MAX_USB_DEVICES];
 static bool s_iso_poll_pending[MAX_USB_DEVICES];
+static uint8_t s_config_store[MAX_USB_DEVICES][USB_CONFIG_MAX] __attribute__((aligned(64)));
 
 void usb_scan_all(void);
 
@@ -61,7 +63,10 @@ int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                            uint32_t route_string, uint8_t parent_hub_slot,
                            uint8_t speed_id);
 static int usb_bulk_transfer(struct usb_device *dev, uint8_t endpoint, void *data, uint16_t len, uint8_t direction);
-static int usb_iso_transfer(struct usb_device *dev, uint8_t endpoint, void *data, uint16_t len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction);
+static int usb_iso_open(struct usb_device *dev, const struct usb_endpoint_info *ep);
+static int usb_iso_submit(struct usb_device *dev, struct usb_iso_request *req);
+static void usb_iso_poll(struct usb_device *dev);
+static void usb_iso_close(struct usb_device *dev, uint8_t endpoint);
 
 static spinlock_t usb_core_lock = SPINLOCK_INIT;
 
@@ -440,49 +445,147 @@ static void usb_reset_endpoint_toggle(struct usb_device *dev, uint8_t endpoint)
     }
 }
 
-static int usb_iso_transfer(struct usb_device *dev, uint8_t endpoint, void *data, uint16_t len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
+static int usb_iso_open(struct usb_device *dev, const struct usb_endpoint_info *ep)
 {
-    if (!dev || !dev->ctrl) return -1;
+    if (!dev || !dev->ctrl || !ep) return USB_ISO_ERR;
 
     switch (dev->ctrl->type) {
         case USB_TYPE_XHCI: {
             struct xhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
-            if (drv && drv->iso_transfer)
-                return drv->iso_transfer(
-                    (struct xhci_controller *)dev->ctrl,
-                                         dev->address, endpoint, data, len,
-                                         n_frames, frame_lens, direction);
-                break;
+            if (drv && drv->iso_open) return drv->iso_open(dev, ep);
+            break;
         }
         case USB_TYPE_EHCI: {
             struct ehci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_EHCI);
-            if (drv && drv->iso_transfer)
-                return drv->iso_transfer(
-                    (struct ehci_controller *)dev->ctrl,
-                                         dev->address, endpoint, data, len,
-                                         n_frames, frame_lens, direction);
-                break;
+            if (drv && drv->iso_open) return drv->iso_open(dev, ep);
+            break;
         }
         case USB_TYPE_OHCI: {
             struct ohci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_OHCI);
-            if (drv && drv->iso_transfer)
-                return drv->iso_transfer(
-                    (struct ohci_controller *)dev->ctrl,
-                                         dev->address, endpoint, data, len,
-                                         n_frames, frame_lens, direction);
-                break;
+            if (drv && drv->iso_open) return drv->iso_open(dev, ep);
+            break;
         }
         case USB_TYPE_UHCI: {
             struct uhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
-            if (drv && drv->iso_transfer)
-                return drv->iso_transfer(
-                    (struct uhci_controller *)dev->ctrl,
-                                         dev->address, endpoint, data, len,
-                                         n_frames, frame_lens, direction);
-                break;
+            if (drv && drv->iso_open) return drv->iso_open(dev, ep);
+            break;
         }
     }
-    return -1;
+    return USB_ISO_ERR;
+}
+
+static int usb_iso_submit(struct usb_device *dev, struct usb_iso_request *req)
+{
+    if (!dev || !dev->ctrl || !req || !req->n_packets || req->n_packets > USB_ISO_MAX_PACKETS) return USB_ISO_ERR;
+    if (!dev->valid) return USB_ISO_NODEV;
+
+    req->done = 0;
+    req->completed = 0;
+    req->errors = 0;
+    req->status = USB_ISO_OK;
+    for (uint16_t i = 0; i < req->n_packets; i++) req->actual[i] = 0;
+
+    switch (dev->ctrl->type) {
+        case USB_TYPE_XHCI: {
+            struct xhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
+            if (drv && drv->iso_submit) return drv->iso_submit(dev, req);
+            break;
+        }
+        case USB_TYPE_EHCI: {
+            struct ehci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_EHCI);
+            if (drv && drv->iso_submit) return drv->iso_submit(dev, req);
+            break;
+        }
+        case USB_TYPE_OHCI: {
+            struct ohci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_OHCI);
+            if (drv && drv->iso_submit) return drv->iso_submit(dev, req);
+            break;
+        }
+        case USB_TYPE_UHCI: {
+            struct uhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
+            if (drv && drv->iso_submit) return drv->iso_submit(dev, req);
+            break;
+        }
+    }
+    return USB_ISO_ERR;
+}
+
+static void usb_iso_poll(struct usb_device *dev)
+{
+    if (!dev || !dev->ctrl) return;
+
+    switch (dev->ctrl->type) {
+        case USB_TYPE_XHCI: {
+            struct xhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
+            if (drv && drv->iso_poll) drv->iso_poll(dev);
+            break;
+        }
+        case USB_TYPE_EHCI: {
+            struct ehci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_EHCI);
+            if (drv && drv->iso_poll) drv->iso_poll(dev);
+            break;
+        }
+        case USB_TYPE_OHCI: {
+            struct ohci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_OHCI);
+            if (drv && drv->iso_poll) drv->iso_poll(dev);
+            break;
+        }
+        case USB_TYPE_UHCI: {
+            struct uhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
+            if (drv && drv->iso_poll) drv->iso_poll(dev);
+            break;
+        }
+    }
+}
+
+static void usb_iso_close(struct usb_device *dev, uint8_t endpoint)
+{
+    if (!dev || !dev->ctrl) return;
+
+    switch (dev->ctrl->type) {
+        case USB_TYPE_XHCI: {
+            struct xhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_XHCI);
+            if (drv && drv->iso_close) drv->iso_close(dev, endpoint);
+            break;
+        }
+        case USB_TYPE_EHCI: {
+            struct ehci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_EHCI);
+            if (drv && drv->iso_close) drv->iso_close(dev, endpoint);
+            break;
+        }
+        case USB_TYPE_OHCI: {
+            struct ohci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_OHCI);
+            if (drv && drv->iso_close) drv->iso_close(dev, endpoint);
+            break;
+        }
+        case USB_TYPE_UHCI: {
+            struct uhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
+            if (drv && drv->iso_close) drv->iso_close(dev, endpoint);
+            break;
+        }
+    }
+}
+
+void usb_iso_request_prepare(struct usb_iso_request *req, void *data, uint8_t endpoint, uint16_t n_packets, const uint16_t *lens)
+{
+    if (!req) return;
+    if (n_packets > USB_ISO_MAX_PACKETS) n_packets = USB_ISO_MAX_PACKETS;
+    req->data = data;
+    req->endpoint = endpoint;
+    req->n_packets = n_packets;
+    uint32_t off = 0;
+    for (uint16_t i = 0; i < n_packets; i++) {
+        req->lens[i] = lens ? lens[i] : 0;
+        req->offsets[i] = (uint16_t)off;
+        req->actual[i] = 0;
+        off += req->lens[i];
+    }
+    req->length = off;
+    req->done = 0;
+    req->queued = 0;
+    req->completed = 0;
+    req->errors = 0;
+    req->status = USB_ISO_OK;
 }
 
 #define USB_ROOT_MAX_CTRL 8
@@ -829,27 +932,6 @@ static void usb_core_poll_transfers_locked(void) {
         }
             }
 
-            if (dev->iso_ep_count > 0 && !is_xhci) {
-                switch (dev->ctrl ? dev->ctrl->type : -1) {
-                    case USB_TYPE_EHCI: {
-                        struct ehci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_EHCI);
-                        if (drv) { extern void ehci_poll_iso(void *e); ehci_poll_iso((void *)dev->ctrl); }
-                        break;
-                    }
-                    case USB_TYPE_OHCI: {
-                        struct ohci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_OHCI);
-                        if (drv) ohci_poll_iso((struct ohci_controller *)dev->ctrl);
-                        break;
-                    }
-                    case USB_TYPE_UHCI: {
-                        struct uhci_driver *drv = get_self_driver(USB_DRIVER, USB_TYPE_UHCI);
-                        if (drv) uhci_poll_iso((struct uhci_controller *)dev->ctrl);
-                        break;
-                    }
-                    default: break;
-                }
-            }
-
             asm volatile("pause");
     }
 
@@ -868,6 +950,18 @@ static void usb_core_poll_topology_locked(void) {
 static uint64_t usb_pump_now_ms(void) {
     struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
     return tsc ? tsc->get_tsc_uptime_ms() : 0;
+}
+
+bool usb_core_claim(uint32_t timeout_ms) {
+    for (uint32_t waited = 0;; waited++) {
+        if (usb_pump_enter()) return true;
+        if (waited >= timeout_ms) return false;
+        delay_ms(1);
+    }
+}
+
+void usb_core_release(void) {
+    usb_pump_leave();
 }
 
 uint64_t usb_core_pump_age_ms(void) {
@@ -900,6 +994,301 @@ static int usb_validate_device_descriptor(struct usb_device_descriptor *desc) {
     if (mps != 8 && mps != 9 && mps != 16 && mps != 32 && mps != 64) return -1;
     if (desc->bcdUSB == 0) return -1;
     return 0;
+}
+
+static const char *usb_audio_sub_name(uint8_t sub) {
+    switch (sub) {
+        case 0x01: return "Audio Control";
+        case 0x02: return "Audio Streaming";
+        case 0x03: return "MIDI Streaming";
+        default: return "Audio";
+    }
+}
+
+const char *usb_class_name(uint8_t cls, uint8_t subclass, uint8_t protocol) {
+    switch (cls) {
+        case 0x00: return "Per-interface";
+        case 0x01: return usb_audio_sub_name(subclass);
+        case 0x02:
+            if (subclass == 0x02) return "CDC ACM";
+            if (subclass == 0x06) return "CDC Ethernet";
+            if (subclass == 0x0D) return "CDC NCM";
+            if (subclass == 0x0E) return "CDC MBIM";
+            return "CDC Control";
+        case 0x03:
+            if (subclass == 0x01 && protocol == 0x01) return "HID Keyboard";
+            if (subclass == 0x01 && protocol == 0x02) return "HID Mouse";
+            return "HID";
+        case 0x05: return "Physical";
+        case 0x06: return "Still Image";
+        case 0x07: return "Printer";
+        case 0x08:
+            if (protocol == 0x62) return "Mass Storage (UAS)";
+            return "Mass Storage";
+        case 0x09: return "Hub";
+        case 0x0A: return "CDC Data";
+        case 0x0B: return "Smart Card";
+        case 0x0D: return "Content Security";
+        case 0x0E:
+            if (subclass == 0x01) return "Video Control";
+            if (subclass == 0x02) return "Video Streaming";
+            return "Video";
+        case 0x0F: return "Personal Healthcare";
+        case 0x10: return "Audio/Video";
+        case 0x11: return "Billboard";
+        case 0x12: return "Type-C Bridge";
+        case 0xDC: return "Diagnostic";
+        case 0xE0:
+            if (subclass == 0x01 && protocol == 0x01) return "Bluetooth";
+            if (subclass == 0x01 && protocol == 0x03) return "RNDIS";
+            return "Wireless";
+        case 0xEF:
+            if (subclass == 0x02 && protocol == 0x01) return "Composite (IAD)";
+            return "Miscellaneous";
+        case 0xFE:
+            if (subclass == 0x01) return "DFU";
+            if (subclass == 0x02) return "IrDA Bridge";
+            if (subclass == 0x03) return "Test & Measurement";
+            return "Application Specific";
+        case 0xFF: return "Vendor Specific";
+        default: return "Unknown";
+    }
+}
+
+static const char *usb_function_class_name(const struct usb_function_info *f) {
+    if (f->func_class == 0x01) return f->func_subclass == 0x03 ? "MIDI" : "Audio";
+    if (f->func_class == 0x0E) return "Video";
+    if (f->func_class == 0x02 && f->interface_count > 1) return usb_class_name(0x02, f->func_subclass, f->func_protocol);
+    return usb_class_name(f->func_class, f->func_subclass, f->func_protocol);
+}
+
+struct usb_interface_info *usb_find_interface(struct usb_device *dev, uint8_t number) {
+    if (!dev) return NULL;
+    for (uint8_t i = 0; i < dev->interface_count; i++)
+        if (dev->interfaces[i].number == number) return &dev->interfaces[i];
+    return NULL;
+}
+
+struct usb_function_info *usb_find_function(struct usb_device *dev, uint8_t cls, int *iter) {
+    if (!dev) return NULL;
+    int start = iter ? *iter : 0;
+    for (int i = start; i < dev->function_count; i++) {
+        struct usb_function_info *f = &dev->functions[i];
+        bool match = (f->func_class == cls);
+        if (!match && !f->from_iad) {
+            for (uint8_t k = 0; k < dev->interface_count && !match; k++)
+                if (dev->interfaces[k].function == i && dev->interfaces[k].iface_class == cls) match = true;
+        }
+        if (match) {
+            if (iter) *iter = i + 1;
+            return f;
+        }
+    }
+    if (iter) *iter = dev->function_count;
+    return NULL;
+}
+
+static spinlock_t usb_claim_lock = SPINLOCK_INIT;
+
+bool usb_function_claim(struct usb_device *dev, struct usb_function_info *fn, const char *driver) {
+    if (!dev || !fn) return false;
+    uint64_t flags = spin_lock_irqsave(&usb_claim_lock);
+    bool ok = (fn->driver == NULL || fn->driver == driver);
+    if (ok) fn->driver = driver;
+    spin_unlock_irqrestore(&usb_claim_lock, flags);
+    return ok;
+}
+
+void usb_function_release(struct usb_device *dev, struct usb_function_info *fn, const char *driver) {
+    if (!dev || !fn) return;
+    uint64_t flags = spin_lock_irqsave(&usb_claim_lock);
+    if (fn->driver == driver) fn->driver = NULL;
+    spin_unlock_irqrestore(&usb_claim_lock, flags);
+}
+
+bool usb_device_alive(struct usb_device *dev) {
+    if (!dev || !dev->valid) return false;
+    for (int i = 0; i < MAX_USB_DEVICES; i++)
+        if (device_table[USB_DEVICE][i] == (void *)dev) return true;
+    return false;
+}
+
+static struct usb_interface_info *usb_iface_slot(struct usb_device *dev, uint8_t number) {
+    struct usb_interface_info *it = usb_find_interface(dev, number);
+    if (it) return it;
+    if (dev->interface_count >= USB_MAX_INTERFACES) return NULL;
+    it = &dev->interfaces[dev->interface_count++];
+    memset(it, 0, sizeof(*it));
+    it->number = number;
+    it->function = 0xFF;
+    return it;
+}
+
+static int usb_new_function(struct usb_device *dev, uint8_t cls, uint8_t sub, uint8_t proto, uint8_t iad, uint8_t str) {
+    if (dev->function_count >= USB_MAX_FUNCTIONS) return -1;
+    struct usb_function_info *f = &dev->functions[dev->function_count];
+    memset(f, 0, sizeof(*f));
+    f->first_interface = 0xFF;
+    f->func_class = cls;
+    f->func_subclass = sub;
+    f->func_protocol = proto;
+    f->from_iad = iad;
+    f->string_idx = str;
+    return dev->function_count++;
+}
+
+static void usb_function_add_iface(struct usb_device *dev, int fi, struct usb_interface_info *it) {
+    if (fi < 0 || !it || it->function != 0xFF) return;
+    struct usb_function_info *f = &dev->functions[fi];
+    it->function = (uint8_t)fi;
+    if (it->number < 32) f->iface_mask |= (1u << it->number);
+    if (f->first_interface == 0xFF || it->number < f->first_interface) f->first_interface = it->number;
+    f->interface_count++;
+}
+
+static void usb_parse_functions(struct usb_device *dev, const uint8_t *cfg, uint16_t total_len)
+{
+    const uint8_t *p = cfg;
+    const uint8_t *end = cfg + total_len;
+    struct usb_interface_info *cur = NULL;
+    uint8_t cur_alt = 0;
+    uint8_t order[USB_MAX_INTERFACES];
+    uint8_t order_count = 0;
+    uint8_t groups[USB_MAX_INTERFACES][2];
+    uint32_t group_mask[USB_MAX_INTERFACES];
+    uint8_t group_count = 0;
+
+    dev->interface_count = 0;
+    dev->function_count = 0;
+
+    while (p + 2 <= end) {
+        uint8_t dl = p[0];
+        uint8_t dt = p[1];
+        if (dl < 2 || p + dl > end) break;
+
+        if (dt == USB_DESC_IAD && dl >= 8) {
+            int fi = usb_new_function(dev, p[4], p[5], p[6], 1, p[7]);
+            if (fi >= 0) {
+                struct usb_function_info *f = &dev->functions[fi];
+                f->first_interface = p[2];
+                for (uint8_t k = 0; k < p[3] && p[2] + k < 32; k++) f->iface_mask |= (1u << (p[2] + k));
+            }
+        } else if (dt == USB_DESC_INTERFACE && dl >= 9) {
+            cur = usb_iface_slot(dev, p[2]);
+            cur_alt = p[3];
+            if (cur) {
+                if (cur->alt_count == 0 && order_count < USB_MAX_INTERFACES) order[order_count++] = p[2];
+                cur->alt_count++;
+                if (cur_alt == 0 || cur->alt_count == 1) {
+                    cur->iface_class = p[5];
+                    cur->iface_subclass = p[6];
+                    cur->iface_protocol = p[7];
+                    cur->ep_count = p[4];
+                    cur->string_idx = p[8];
+                }
+                if (p[4] > cur->max_ep_count) cur->max_ep_count = p[4];
+            }
+        } else if (dt == USB_DESC_ENDPOINT && dl >= 7 && cur) {
+            if ((p[3] & 0x03u) == USB_EP_XFER_ISO) cur->has_iso = 1;
+        } else if (dt == USB_DESC_CS_INTERFACE && dl >= 3 && cur && group_count < USB_MAX_INTERFACES) {
+            uint32_t mask = 0;
+            if (cur->iface_class == 0x01 && cur->iface_subclass == 0x01 && p[2] == 0x01 &&
+                cur->iface_protocol != 0x20 && dl >= 8) {
+                uint8_t n = p[7];
+                for (uint8_t k = 0; k < n && 8 + k < dl; k++)
+                    if (p[8 + k] < 32) mask |= (1u << p[8 + k]);
+            } else if (cur->iface_class == 0x02 && p[2] == 0x06 && dl >= 5) {
+                for (uint8_t k = 4; k < dl; k++)
+                    if (p[k] < 32) mask |= (1u << p[k]);
+            }
+            if (mask) {
+                groups[group_count][0] = cur->number;
+                groups[group_count][1] = 0;
+                group_mask[group_count] = mask;
+                group_count++;
+            }
+        }
+        p += dl;
+    }
+
+    for (int fi = 0; fi < dev->function_count; fi++) {
+        struct usb_function_info *f = &dev->functions[fi];
+        uint32_t want = f->iface_mask;
+        f->iface_mask = 0;
+        f->first_interface = 0xFF;
+        f->interface_count = 0;
+        for (uint8_t k = 0; k < order_count; k++) {
+            uint8_t n = order[k];
+            if (n < 32 && (want & (1u << n))) usb_function_add_iface(dev, fi, usb_find_interface(dev, n));
+        }
+    }
+
+    int last_audio = -1;
+    for (uint8_t k = 0; k < order_count; k++) {
+        struct usb_interface_info *it = usb_find_interface(dev, order[k]);
+        if (!it) continue;
+        if (it->function != 0xFF) {
+            last_audio = (dev->functions[it->function].func_class == 0x01) ? it->function : -1;
+            continue;
+        }
+
+        int g = -1;
+        for (uint8_t gi = 0; gi < group_count; gi++)
+            if (groups[gi][0] == it->number) g = gi;
+
+        if (g >= 0) {
+            int fi = usb_new_function(dev, it->iface_class, it->iface_subclass, it->iface_protocol, 0, it->string_idx);
+            usb_function_add_iface(dev, fi, it);
+            for (uint8_t j = 0; j < order_count; j++) {
+                uint8_t n = order[j];
+                if (n < 32 && (group_mask[g] & (1u << n))) usb_function_add_iface(dev, fi, usb_find_interface(dev, n));
+            }
+            last_audio = (it->iface_class == 0x01) ? fi : -1;
+            continue;
+        }
+
+        if (it->iface_class == 0x01 && it->iface_subclass != 0x01 && last_audio >= 0) {
+            usb_function_add_iface(dev, last_audio, it);
+            continue;
+        }
+
+        int fi = usb_new_function(dev, it->iface_class, it->iface_subclass, it->iface_protocol, 0, it->string_idx);
+        usb_function_add_iface(dev, fi, it);
+        last_audio = (it->iface_class == 0x01 && it->iface_subclass == 0x01) ? fi : -1;
+    }
+
+    for (int fi = 0; fi < dev->function_count; fi++) {
+        struct usb_function_info *f = &dev->functions[fi];
+        if (!f->from_iad && f->interface_count > 0) {
+            struct usb_interface_info *first = usb_find_interface(dev, f->first_interface);
+            if (first && first->iface_class == 0x01) f->func_subclass = 0x00;
+        }
+        if (f->first_interface == 0xFF) f->first_interface = 0;
+    }
+}
+
+static void usb_log_functions(struct usb_device *dev) {
+    for (int fi = 0; fi < dev->function_count; fi++) {
+        struct usb_function_info *f = &dev->functions[fi];
+        char ifs[64];
+        size_t pos = 0;
+        ifs[0] = 0;
+        for (uint8_t k = 0; k < dev->interface_count && pos + 4 < sizeof(ifs); k++) {
+            if (dev->interfaces[k].function != fi) continue;
+            uint8_t n = dev->interfaces[k].number;
+            if (pos) ifs[pos++] = ',';
+            if (n >= 10) ifs[pos++] = (char)('0' + n / 10);
+            ifs[pos++] = (char)('0' + n % 10);
+            ifs[pos] = 0;
+        }
+        LOG_INFO("addr %u function %d: %s (class 0x%02x/0x%02x/0x%02x%s) interfaces %s",
+                 (unsigned)dev->address, fi, usb_function_class_name(f), (unsigned)f->func_class,
+                 (unsigned)f->func_subclass, (unsigned)f->func_protocol, f->from_iad ? ", IAD" : "", ifs);
+    }
+}
+
+const char *usb_function_name(const struct usb_function_info *f) {
+    return f ? usb_function_class_name(f) : "";
 }
 
 static void usb_parse_config(struct usb_device *dev, const uint8_t *cfg, uint16_t total_len)
@@ -979,15 +1368,21 @@ static void usb_parse_config(struct usb_device *dev, const uint8_t *cfg, uint16_
             bep->interval = (ptr + 6 < end) ? ptr[6] : 0;
                 }
 
-                if (ep_xfer == USB_EP_XFER_ISO &&
-                    dev->iso_ep_count < USB_MAX_ISO_EP) {
-                    struct usb_endpoint_info *iep =
-                    &dev->iso_ep[dev->iso_ep_count++];
-                iep->address = ep_addr;
-                iep->attributes = ep_attr;
-                iep->max_packet_size = mps ? mps : 1023u;
-                iep->interval = (ptr + 6 < end) ? ptr[6] : 1;
+                if (ep_xfer == USB_EP_XFER_ISO) {
+                    struct usb_endpoint_info *iep = NULL;
+                    for (uint8_t k = 0; k < dev->iso_ep_count; k++)
+                        if (dev->iso_ep[k].address == ep_addr) iep = &dev->iso_ep[k];
+                    if (!iep && dev->iso_ep_count < USB_MAX_ISO_EP) {
+                        iep = &dev->iso_ep[dev->iso_ep_count++];
+                        iep->address = ep_addr;
+                        iep->max_packet_size = 0;
                     }
+                    if (iep && (mps & 0x7FFu) >= (iep->max_packet_size & 0x7FFu)) {
+                        iep->attributes = ep_attr;
+                        iep->max_packet_size = mps ? mps : 1023u;
+                        iep->interval = (ptr + 6 < end) ? ptr[6] : 1;
+                    }
+                }
         }
         ptr += dlen;
     }
@@ -1034,6 +1429,7 @@ int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     for (size_t i = 0; i < sizeof(struct usb_device); i++) p[i] = 0;
     dev->valid = 1;
     dev->parent_slot = -1;
+    dev->generation = ++usb_generation_counter;
 
     dev->port = port;
     dev->ctrl = (struct usb_controller *)ctrl_ptr;
@@ -1320,8 +1716,8 @@ int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
                                  }
     }
 
-    static uint8_t cfg_desc[256] __attribute__((aligned(64)));
-    for (int i = 0; i < 256; i++) cfg_desc[i] = 0;
+    static uint8_t cfg_desc[USB_CONFIG_MAX] __attribute__((aligned(4096)));
+    for (int i = 0; i < 9; i++) cfg_desc[i] = 0;
 
     int cfg9_ret = -1;
     for (int _r = 0; _r < 3 && cfg9_ret != 0; _r++) {
@@ -1331,20 +1727,40 @@ int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
     }
     if (cfg9_ret != 0)
         LOG_WARNING("addr %u: GET_DESCRIPTOR(config, 9) failed (%d)", (unsigned)dev->address, cfg9_ret);
+    uint8_t cfg_value_hdr = cfg_desc[5];
     if (cfg9_ret == 0) {
         uint16_t total_len = cfg_desc[2] | ((uint16_t)cfg_desc[3] << 8);
         LOG_DEBUG("addr %u: configuration total length %u", (unsigned)dev->address, (unsigned)total_len);
-        if (total_len > 256) total_len = 256;
+        if (total_len > USB_CONFIG_MAX) {
+            LOG_WARNING("addr %u: configuration descriptor is %u bytes, only %u used",
+                        (unsigned)dev->address, (unsigned)total_len, (unsigned)USB_CONFIG_MAX);
+            total_len = USB_CONFIG_MAX;
+        }
+        if (total_len < 9) total_len = 9;
 
         delay_ms(5);
+        for (uint32_t i = 0; i < total_len; i++) cfg_desc[i] = 0;
         int cfgN_ret = usb_control_transfer(dev, 0x80, 0x06,
                                             (0x02 << 8), 0, total_len, cfg_desc);
+        if (cfgN_ret != 0 && total_len > 256) {
+            LOG_WARNING("addr %u: GET_DESCRIPTOR(config, %u) failed (%d), retrying with 256 bytes",
+                        (unsigned)dev->address, (unsigned)total_len, cfgN_ret);
+            total_len = 256;
+            delay_ms(5);
+            cfgN_ret = usb_control_transfer(dev, 0x80, 0x06, (0x02 << 8), 0, total_len, cfg_desc);
+        }
         if (cfgN_ret == 0) {
+            memcpy(s_config_store[slot], cfg_desc, total_len);
+            dev->config = s_config_store[slot];
+            dev->config_len = total_len;
+            dev->config_value = cfg_desc[5];
             usb_parse_config(dev, cfg_desc, total_len);
-            LOG_DEBUG("addr %u: class=0x%02x sub=0x%02x proto=0x%02x int_ep=0x%02x bulk_eps=%u iso_eps=%u",
+            usb_parse_functions(dev, cfg_desc, total_len);
+            LOG_DEBUG("addr %u: class=0x%02x sub=0x%02x proto=0x%02x int_ep=0x%02x bulk_eps=%u iso_eps=%u interfaces=%u functions=%u",
                       (unsigned)dev->address, (unsigned)dev->device_class, (unsigned)dev->device_subclass,
                       (unsigned)dev->device_protocol, (unsigned)dev->endpoint_address,
-                      (unsigned)dev->bulk_ep_count, (unsigned)dev->iso_ep_count);
+                      (unsigned)dev->bulk_ep_count, (unsigned)dev->iso_ep_count,
+                      (unsigned)dev->interface_count, (unsigned)dev->function_count);
         } else {
             LOG_WARNING("addr %u: GET_DESCRIPTOR(config, %u) failed (%d)",
                         (unsigned)dev->address, (unsigned)total_len, cfgN_ret);
@@ -1353,7 +1769,8 @@ int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
 
     {
 
-        uint8_t config_value = (cfg9_ret == 0 && cfg_desc[5] != 0) ? cfg_desc[5] : 1;
+        uint8_t config_value = (cfg9_ret == 0 && cfg_value_hdr != 0) ? cfg_value_hdr : 1;
+        dev->config_value = config_value;
 
         delay_ms(5);
 
@@ -1395,6 +1812,7 @@ int usb_init_device_topo(void *ctrl_ptr, uint8_t port, bool is_xhci,
              (unsigned)dev->desc.idVendor, (unsigned)dev->desc.idProduct, (unsigned)port,
              (unsigned)dev->address, (unsigned)dev->device_class, (unsigned)dev->device_subclass,
              (unsigned)dev->device_protocol, dev->vendor_str, dev->product_str);
+    if (dev->function_count > 1) usb_log_functions(dev);
 
     if (dev->device_class == 0x09) {
         LOG_INFO("hub detected at addr %u, enumerating downstream ports", (unsigned)dev->address);
@@ -1616,7 +2034,10 @@ static struct usb_core_driver core = {
     .poll_transfers = usb_core_poll_transfers,
     .poll_topology = usb_core_poll_topology,
     .bulk_transfer = usb_bulk_transfer,
-    .iso_transfer = usb_iso_transfer,
+    .iso_open = usb_iso_open,
+    .iso_submit = usb_iso_submit,
+    .iso_poll = usb_iso_poll,
+    .iso_close = usb_iso_close,
     .reset_endpoint_toggle = usb_reset_endpoint_toggle,
 };
 

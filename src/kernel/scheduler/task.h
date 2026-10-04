@@ -51,6 +51,8 @@ struct task {
     int core;
     int affinity;
 
+    int err_no;
+
     volatile uint8_t on_rq;
     volatile uint8_t on_cpu;
     uint8_t is_idle;

@@ -1,0 +1,163 @@
+#include "drivers/Audio/audio_core.h"
+#include "drivers/Audio/audio_quirks.h"
+
+#define AC97C_NAME(_v, _d, _model) \
+    { .model = (_model), .match = { .pci_id = AUDIO_ID((_v), (_d)) } }
+#define AC97C_QUIRK(_v, _d, _model, _set) \
+    { .name = (_model), .model = (_model), .match = { .pci_id = AUDIO_ID((_v), (_d)) }, .set = (_set) }
+#define AC97_CODEC(_id, _mask, _model) \
+    { .model = (_model), .match = { .codec_id = (_id), .codec_mask = (_mask) } }
+
+#define AC97_STEP7 0xFFFFFFF8u
+#define AC97_STEP15 0xFFFFFFF0u
+#define AC97_STEP255 0xFFFFFF00u
+#define AC97_EXACT 0xFFFFFFFFu
+
+static int ad198x_hp_line_select(const struct audio_quirk *q, struct audio_quirk_ctx *ctx) {
+    (void)q;
+    if (ctx->stage != AUDIO_QUIRK_STAGE_INIT || !ctx->reg_read || !ctx->reg_write) return 0;
+    if (ctx->dev && ctx->dev->subsystem_id == AUDIO_ID(0x1043, 0x1193)) return 0;
+    ctx->reg_write(ctx->backend, 0x76, (uint16_t)(ctx->reg_read(ctx->backend, 0x76) | 0x0420));
+    return 1;
+}
+
+static const struct audio_quirk ac97_controller_quirks[] = {
+    AC97C_NAME(0x8086, 0x2415, "Intel 82801AA (ICH)"),
+    AC97C_NAME(0x8086, 0x2425, "Intel 82801AB (ICH0)"),
+    AC97C_NAME(0x8086, 0x2445, "Intel 82801BA (ICH2)"),
+    AC97C_NAME(0x8086, 0x2485, "Intel 82801CA (ICH3)"),
+    AC97C_QUIRK(0x8086, 0x24c5, "Intel 82801DB (ICH4)", AUDIO_AC97C_Q_ICH4_IOSE),
+    AC97C_QUIRK(0x8086, 0x24d5, "Intel 82801EB (ICH5)", AUDIO_AC97C_Q_ICH4_IOSE),
+    AC97C_QUIRK(0x8086, 0x25a6, "Intel 6300ESB", AUDIO_AC97C_Q_ICH4_IOSE),
+    AC97C_QUIRK(0x8086, 0x266e, "Intel 82801FB (ICH6)", AUDIO_AC97C_Q_ICH4_IOSE),
+    AC97C_QUIRK(0x8086, 0x27de, "Intel 82801GB (ICH7)", AUDIO_AC97C_Q_ICH4_IOSE),
+    AC97C_QUIRK(0x8086, 0x2698, "Intel 631xESB/632xESB", AUDIO_AC97C_Q_ICH4_IOSE),
+    AC97C_NAME(0x8086, 0x7195, "Intel 440MX"),
+    AC97C_QUIRK(0x1039, 0x7012, "SiS 7012", AUDIO_AC97C_Q_SIS_REGS),
+    AC97C_NAME(0x10de, 0x01b1, "NVIDIA nForce"),
+    AC97C_NAME(0x10de, 0x006a, "NVIDIA nForce2"),
+    AC97C_NAME(0x10de, 0x008a, "NVIDIA nForce2 400"),
+    AC97C_NAME(0x10de, 0x00da, "NVIDIA nForce3"),
+    AC97C_NAME(0x10de, 0x00ea, "NVIDIA nForce3 250"),
+    AC97C_NAME(0x10de, 0x0059, "NVIDIA CK804"),
+    AC97C_NAME(0x10de, 0x003a, "NVIDIA MCP04"),
+    AC97C_NAME(0x10de, 0x026b, "NVIDIA MCP51"),
+    AC97C_NAME(0x1022, 0x746d, "AMD-8111"),
+    AC97C_NAME(0x1022, 0x7445, "AMD-768"),
+};
+
+static const struct audio_quirk ac97_codec_quirks[] = {
+    AC97_CODEC(0x41445303, AC97_EXACT, "Analog Devices AD1819"),
+    AC97_CODEC(0x41445340, AC97_EXACT, "Analog Devices AD1881"),
+    AC97_CODEC(0x41445348, AC97_EXACT, "Analog Devices AD1881A"),
+    AC97_CODEC(0x41445360, AC97_EXACT, "Analog Devices AD1885"),
+    AC97_CODEC(0x41445361, AC97_EXACT, "Analog Devices AD1886"),
+    AC97_CODEC(0x41445362, AC97_EXACT, "Analog Devices AD1887"),
+    AC97_CODEC(0x41445363, AC97_EXACT, "Analog Devices AD1886A"),
+    AC97_CODEC(0x41445368, AC97_EXACT, "Analog Devices AD1888"),
+    AC97_CODEC(0x41445370, AC97_EXACT, "Analog Devices AD1980"),
+    AC97_CODEC(0x41445372, AC97_EXACT, "Analog Devices AD1981A"),
+    AC97_CODEC(0x41445374, AC97_EXACT, "Analog Devices AD1981B"),
+    AC97_CODEC(0x41445375, AC97_EXACT, "Analog Devices AD1985"),
+    AC97_CODEC(0x41445378, AC97_EXACT, "Analog Devices AD1986"),
+    AC97_CODEC(0x414b4d00, AC97_EXACT, "Asahi Kasei AK4540"),
+    AC97_CODEC(0x414b4d01, AC97_EXACT, "Asahi Kasei AK4542"),
+    AC97_CODEC(0x414b4d02, AC97_EXACT, "Asahi Kasei AK4543"),
+    AC97_CODEC(0x414b4d06, AC97_EXACT, "Asahi Kasei AK4544A"),
+    AC97_CODEC(0x414b4d07, AC97_EXACT, "Asahi Kasei AK4545"),
+    AC97_CODEC(0x414c4300, AC97_STEP255, "Realtek ALC100/100P"),
+    AC97_CODEC(0x414c4710, AC97_STEP15, "Realtek ALC200/200P"),
+    AC97_CODEC(0x414c4721, AC97_EXACT, "Realtek ALC650D"),
+    AC97_CODEC(0x414c4722, AC97_EXACT, "Realtek ALC650E"),
+    AC97_CODEC(0x414c4723, AC97_EXACT, "Realtek ALC650F"),
+    AC97_CODEC(0x414c4720, AC97_STEP15, "Realtek ALC650"),
+    AC97_CODEC(0x414c4730, AC97_EXACT, "Realtek ALC101"),
+    AC97_CODEC(0x414c4740, AC97_STEP15, "Realtek ALC202"),
+    AC97_CODEC(0x414c4750, AC97_STEP15, "Realtek ALC250"),
+    AC97_CODEC(0x414c4760, AC97_STEP15, "Realtek ALC655"),
+    AC97_CODEC(0x414c4770, AC97_STEP15, "Realtek ALC203"),
+    AC97_CODEC(0x414c4780, AC97_STEP15, "Realtek ALC658"),
+    AC97_CODEC(0x414c4790, AC97_STEP15, "Realtek ALC850"),
+    AC97_CODEC(0x415a5401, AC97_EXACT, "Aztech AZF3328"),
+    AC97_CODEC(0x434d4941, AC97_EXACT, "C-Media CMI9738"),
+    AC97_CODEC(0x434d4961, AC97_EXACT, "C-Media CMI9739"),
+    AC97_CODEC(0x434d4969, AC97_EXACT, "C-Media CMI9780"),
+    AC97_CODEC(0x434d4978, AC97_EXACT, "C-Media CMI9761A"),
+    AC97_CODEC(0x434d4982, AC97_EXACT, "C-Media CMI9761B"),
+    AC97_CODEC(0x434d4983, AC97_EXACT, "C-Media CMI9761A+"),
+    AC97_CODEC(0x43525900, AC97_STEP7, "Cirrus CS4297"),
+    AC97_CODEC(0x43525910, AC97_STEP7, "Cirrus CS4297A"),
+    AC97_CODEC(0x43525920, AC97_STEP7, "Cirrus CS4298"),
+    AC97_CODEC(0x43525928, AC97_STEP7, "Cirrus CS4294"),
+    AC97_CODEC(0x43525930, AC97_STEP7, "Cirrus CS4299"),
+    AC97_CODEC(0x43525948, AC97_STEP7, "Cirrus CS4201"),
+    AC97_CODEC(0x43525958, AC97_STEP7, "Cirrus CS4205"),
+    AC97_CODEC(0x43525960, AC97_STEP7, "Cirrus CS4291"),
+    AC97_CODEC(0x43525970, AC97_STEP7, "Cirrus CS4202"),
+    AC97_CODEC(0x43585421, AC97_EXACT, "Conexant HSD11246"),
+    AC97_CODEC(0x43585428, AC97_STEP7, "Conexant Cx20468"),
+    AC97_CODEC(0x43585430, AC97_EXACT, "Conexant Cx20468-31"),
+    AC97_CODEC(0x43585431, AC97_EXACT, "Conexant Cx20551"),
+    AC97_CODEC(0x44543031, AC97_STEP15, "Diamond DT0398"),
+    AC97_CODEC(0x454d4328, AC97_EXACT, "eMicro EM28028"),
+    AC97_CODEC(0x45838308, AC97_EXACT, "ESS ESS1988"),
+    AC97_CODEC(0x48525300, AC97_STEP255, "Intersil HMP9701"),
+    AC97_CODEC(0x49434501, AC97_EXACT, "ICEnsemble ICE1230"),
+    AC97_CODEC(0x49434511, AC97_EXACT, "ICEnsemble ICE1232"),
+    AC97_CODEC(0x49434514, AC97_EXACT, "ICEnsemble ICE1232A"),
+    AC97_CODEC(0x49434551, AC97_EXACT, "VIA VT1616"),
+    AC97_CODEC(0x49434552, AC97_EXACT, "VIA VT1616i"),
+    AC97_CODEC(0x49544520, AC97_EXACT, "ITE IT2226E"),
+    AC97_CODEC(0x49544561, AC97_EXACT, "ITE IT2646E"),
+    AC97_CODEC(0x4e534300, AC97_EXACT, "National LM4540/43/45/46/48"),
+    AC97_CODEC(0x4e534331, AC97_EXACT, "National LM4549"),
+    AC97_CODEC(0x4e534350, AC97_EXACT, "National LM4550"),
+    AC97_CODEC(0x50534304, AC97_EXACT, "Philips UCB1400"),
+    AC97_CODEC(0x53544d02, AC97_EXACT, "ST ST7597"),
+    AC97_CODEC(0x54524102, AC97_EXACT, "TriTech TR28022"),
+    AC97_CODEC(0x54524103, AC97_EXACT, "TriTech TR28023"),
+    AC97_CODEC(0x54524106, AC97_EXACT, "TriTech TR28026"),
+    AC97_CODEC(0x54524108, AC97_EXACT, "TriTech TR28028"),
+    AC97_CODEC(0x54524123, AC97_EXACT, "TriTech TR28602"),
+    AC97_CODEC(0x54584e03, AC97_EXACT, "TI TLV320AIC27"),
+    AC97_CODEC(0x54584e20, AC97_EXACT, "TI TLC320AD9xC"),
+    AC97_CODEC(0x56494120, AC97_STEP15, "VIA VIA1613"),
+    AC97_CODEC(0x56494161, AC97_EXACT, "VIA VIA1612A"),
+    AC97_CODEC(0x56494170, AC97_EXACT, "VIA VIA1617A"),
+    AC97_CODEC(0x56494182, AC97_EXACT, "VIA VIA1618"),
+    AC97_CODEC(0x57454301, AC97_EXACT, "Winbond W83971D"),
+    AC97_CODEC(0x574d4c00, AC97_EXACT, "Wolfson WM9701/WM9701A"),
+    AC97_CODEC(0x574d4c03, AC97_EXACT, "Wolfson WM9703/WM9707/WM9708/WM9717"),
+    AC97_CODEC(0x574d4c04, AC97_EXACT, "Wolfson WM9704M/WM9704Q"),
+    AC97_CODEC(0x574d4c05, AC97_EXACT, "Wolfson WM9705/WM9710"),
+    AC97_CODEC(0x574d4c09, AC97_EXACT, "Wolfson WM9709"),
+    AC97_CODEC(0x574d4c12, AC97_EXACT, "Wolfson WM9711/WM9712/WM9715"),
+    AC97_CODEC(0x574d4c13, AC97_EXACT, "Wolfson WM9713/WM9714"),
+    AC97_CODEC(0x594d4800, AC97_EXACT, "Yamaha YMF743"),
+    AC97_CODEC(0x594d4802, AC97_EXACT, "Yamaha YMF752"),
+    AC97_CODEC(0x594d4803, AC97_EXACT, "Yamaha YMF753"),
+    AC97_CODEC(0x83847600, AC97_EXACT, "SigmaTel STAC9700/83/84"),
+    AC97_CODEC(0x83847604, AC97_EXACT, "SigmaTel STAC9701/03/04/05"),
+    AC97_CODEC(0x83847605, AC97_EXACT, "SigmaTel STAC9704"),
+    AC97_CODEC(0x83847608, AC97_EXACT, "SigmaTel STAC9708/11"),
+    AC97_CODEC(0x83847609, AC97_EXACT, "SigmaTel STAC9721/23"),
+    AC97_CODEC(0x83847644, AC97_EXACT, "SigmaTel STAC9744/45"),
+    AC97_CODEC(0x83847650, AC97_EXACT, "SigmaTel STAC9750/51"),
+    AC97_CODEC(0x83847652, AC97_EXACT, "SigmaTel STAC9752/53"),
+    AC97_CODEC(0x83847656, AC97_EXACT, "SigmaTel STAC9756/57"),
+    AC97_CODEC(0x83847658, AC97_EXACT, "SigmaTel STAC9758/59"),
+    AC97_CODEC(0x83847666, AC97_EXACT, "SigmaTel STAC9766/67"),
+
+    { .name = "freebsd:ad198x-hp-line-select", .match = { .codec_id = 0x41445370, .codec_mask = AC97_EXACT },
+      .hook = ad198x_hp_line_select },
+    { .name = "freebsd:ad198x-hp-line-select", .match = { .codec_id = 0x41445375, .codec_mask = AC97_EXACT },
+      .hook = ad198x_hp_line_select },
+    { .name = "freebsd:ad198x-hp-line-select", .match = { .codec_id = 0x41445378, .codec_mask = AC97_EXACT },
+      .hook = ad198x_hp_line_select },
+};
+
+const struct audio_quirk_table audio_quirks_ac97_controllers =
+    AUDIO_QUIRK_TABLE("ac97-controllers", AUDIO_QUIRK_AC97_CONTROLLER, ac97_controller_quirks);
+
+const struct audio_quirk_table audio_quirks_ac97_codecs =
+    AUDIO_QUIRK_TABLE("ac97-codecs", AUDIO_QUIRK_AC97_CODEC, ac97_codec_quirks);

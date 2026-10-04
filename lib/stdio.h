@@ -30,19 +30,19 @@ void stdio_register_video_stream(void);
 
 void stdio_unregister_stream(int index);
 
-int printf(const char *fmt, ...);
+int printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-int fprintf_stream(int stream_idx, uint32_t color, const char *fmt, ...);
+int fprintf_stream(int stream_idx, uint32_t color, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 
-int vprintf_stream(int stream_idx, uint32_t color, const char *fmt, va_list ap);
+int vprintf_stream(int stream_idx, uint32_t color, const char *fmt, va_list ap) __attribute__((format(printf, 3, 0)));
 
 int puts(const char *s);
 int putchar(int c);
 
-int sprintf(char *buf, const char *fmt, ...);
-int snprintf(char *buf, size_t n, const char *fmt, ...);
-int vsprintf(char *buf, const char *fmt, va_list ap);
-int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
+int sprintf(char *buf, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+int snprintf(char *buf, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+int vsprintf(char *buf, const char *fmt, va_list ap) __attribute__((format(printf, 2, 0)));
+int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) __attribute__((format(printf, 3, 0)));
 
 #define printf_color(color, fmt, ...) \
     fprintf_stream(STDIO_STREAM_STDOUT, (color), (fmt), ##__VA_ARGS__)

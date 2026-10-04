@@ -8,6 +8,8 @@
 
 struct tsc_driver;
 struct usb_device;
+struct usb_endpoint_info;
+struct usb_iso_request;
 
 #define MAX_OHCI_CONTROLLERS 8
 #define MAX_OHCI_HID_SLOTS 4
@@ -87,11 +89,10 @@ typedef struct ohci_driver {
                          uint8_t dev_addr, uint8_t endpoint,
                          void* data, uint16_t data_len, uint8_t direction);
 
-    int (*iso_transfer)(struct ohci_controller* ohci,
-                        uint8_t dev_addr, uint8_t endpoint,
-                        void* data, uint16_t total_len,
-                        uint8_t n_frames, const uint16_t* frame_lens,
-                        uint8_t direction);
+    int (*iso_open)(struct usb_device* dev, const struct usb_endpoint_info* ep);
+    int (*iso_submit)(struct usb_device* dev, struct usb_iso_request* req);
+    void (*iso_poll)(struct usb_device* dev);
+    void (*iso_close)(struct usb_device* dev, uint8_t endpoint);
 
     int (*reset_port)(struct ohci_controller* ohci, uint8_t port);
     int (*enumerate_device)(struct ohci_controller* ohci, uint8_t port);

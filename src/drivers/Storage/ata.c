@@ -23,6 +23,26 @@ static void (*delay_ms)(uint64_t);
 #define ATA_TRACE(...) do { } while (0)
 #endif
 
+#define ATA_CMD_READ_MULTIPLE 0xC4
+#define ATA_CMD_WRITE_MULTIPLE 0xC5
+#define ATA_CMD_SET_MULTIPLE_MODE 0xC6
+
+#define ATA_MULTIPLE_CHUNK 16
+
+static inline void pio_insw(uint16_t port, void *buf, uint32_t words) {
+    __asm__ volatile("rep insw"
+        : "+D"(buf), "+c"(words)
+        : "d"(port)
+        : "memory", "cc");
+}
+
+static inline void pio_outsw(uint16_t port, const void *buf, uint32_t words) {
+    __asm__ volatile("rep outsw"
+        : "+S"(buf), "+c"(words)
+        : "d"(port)
+        : "memory", "cc");
+}
+
 static void ata_delay_400ns(uint16_t base_port) {
     for (int i = 0; i < 4; i++) {
         inb(base_port + 0x0E);
@@ -84,8 +104,20 @@ static int ata_wait_ready(ata_device_t *dev, bool check_bsy) {
 
 static int ata_wait_data(ata_device_t *dev) {
     uint8_t status;
-    int t = ATA_TIMEOUT_MS;
+    int spin = 0;
 
+    for (; spin < 100; spin++) {
+        status = ata_get_status(dev);
+        if (status & ATA_SR_DRQ) return BLOCK_OK;
+        if (status & (ATA_SR_ERR | ATA_SR_BSY)) {
+            if (status & ATA_SR_ERR) break;
+            asm volatile("pause");
+            continue;
+        }
+        asm volatile("pause");
+    }
+
+    int t = ATA_TIMEOUT_MS;
     while (t-- > 0) {
         status = ata_get_status(dev);
         if (status & ATA_SR_DRQ) return BLOCK_OK;
@@ -98,6 +130,9 @@ static int ata_wait_data(ata_device_t *dev) {
         if (status & ATA_SR_DF) {
             LOG_ERROR("hd%c: device fault, status=0x%02x", 'a' + dev->channel * 2 + dev->drive, (unsigned)status);
             return BLOCK_ERR_IO;
+        }
+        if (!(status & ATA_SR_BSY)) {
+            if (spin++ > 4) return BLOCK_ERR_TIMEOUT;
         }
         delay_ms(1);
     }
@@ -300,6 +335,26 @@ static bool ata_identify_device(ata_device_t *dev) {
     return true;
 }
 
+static int ata_set_multiple_mode(ata_device_t *dev, uint8_t sectors) {
+    ata_select_drive(dev);
+
+    if (ata_wait_ready(dev, true) < 0) return BLOCK_ERR_TIMEOUT;
+
+    outb(dev->base_port + 1, 0);
+    outb(dev->base_port + 2, sectors);
+    outb(dev->base_port + 3, 0);
+    outb(dev->base_port + 4, 0);
+    outb(dev->base_port + 5, 0);
+    outb(dev->base_port + 7, ATA_CMD_SET_MULTIPLE_MODE);
+
+    if (ata_wait_ready(dev, true) < 0) {
+        LOG_WARNING("hd%c: SET MULTIPLE MODE %u failed, using single-sector PIO",
+                    'a' + dev->channel * 2 + dev->drive, (unsigned)sectors);
+        return BLOCK_ERR_IO;
+    }
+    return BLOCK_OK;
+}
+
 static int ata_issue_cmd(ata_device_t *dev, bool write,
                          uint64_t lba, uint32_t sectors, void *buf) {
     if (!dev->present) {
@@ -311,93 +366,102 @@ static int ata_issue_cmd(ata_device_t *dev, bool write,
         LOG_ERROR("%s: %u sectors exceeds LBA48 limit of 65536", dev->blkdev.name, sectors);
         return BLOCK_ERR_PARAM;
     }
+    if (!dev->lba48_supported && sectors > 256) {
+        LOG_ERROR("%s: %u sectors exceeds LBA28 limit of 256", dev->blkdev.name, sectors);
+        return BLOCK_ERR_PARAM;
+    }
 
     ATA_TRACE("%s: %c lba=0x%llx n=%u", dev->blkdev.name, write ? 'W' : 'R', (unsigned long long)lba, sectors);
 
-    ata_select_drive(dev);
+    uint32_t chunk_size = dev->multi_sectors >= 2 ? dev->multi_sectors : 1;
 
-    if (ata_wait_ready(dev, true) < 0) {
-        LOG_ERROR("%s: %s lba=%llu n=%u, drive not ready", dev->blkdev.name, write ? "write" : "read",
-                  (unsigned long long)lba, sectors);
-        return BLOCK_ERR_TIMEOUT;
-    }
-
-    uint8_t drive_bit = (dev->drive == ATA_DRIVE_SLAVE) ? 0x10 : 0x00;
-    if (dev->lba48_supported) {
-        outb(dev->base_port + 6, 0x40 | drive_bit);
-    } else {
-        outb(dev->base_port + 6, 0xE0 | drive_bit | ((lba >> 24) & 0x0F));
-    }
-
-    if (dev->lba48_supported) {
-
-        outb(dev->base_port + 1, 0);
-        outb(dev->base_port + 2, (sectors >> 8) & 0xFF);
-        outb(dev->base_port + 3, (lba >> 24) & 0xFF);
-        outb(dev->base_port + 4, (lba >> 32) & 0xFF);
-        outb(dev->base_port + 5, (lba >> 40) & 0xFF);
-
-        outb(dev->base_port + 1, 0);
-        outb(dev->base_port + 2, sectors & 0xFF);
-        outb(dev->base_port + 3, lba & 0xFF);
-        outb(dev->base_port + 4, (lba >> 8) & 0xFF);
-        outb(dev->base_port + 5, (lba >> 16) & 0xFF);
-
-    } else {
-
-        outb(dev->base_port + 1, 0);
-        outb(dev->base_port + 2, sectors & 0xFF);
-        outb(dev->base_port + 3, lba & 0xFF);
-        outb(dev->base_port + 4, (lba >> 8) & 0xFF);
-        outb(dev->base_port + 5, (lba >> 16) & 0xFF);
-    }
-
-    if (dev->lba48_supported) {
-        if (write) {
-            outb(dev->base_port + 7, ATA_CMD_WRITE_SECTORS_EXT);
-        } else {
-            outb(dev->base_port + 7, ATA_CMD_READ_SECTORS_EXT);
-        }
-    } else {
-        if (write) {
-            outb(dev->base_port + 7, ATA_CMD_WRITE_SECTORS);
-        } else {
-            outb(dev->base_port + 7, ATA_CMD_READ_SECTORS);
-        }
-    }
-
+    uint32_t words_per_sector = dev->logical_sector_size / 2;
     uint8_t *buf_bytes = (uint8_t *)buf;
+    uint32_t done = 0;
 
-    for (uint32_t i = 0; i < sectors; i++) {
-        if (write) {
-            if (ata_wait_data(dev) < 0) {
-                LOG_ERROR("%s: write lba=%llu sector %u/%u, no DRQ", dev->blkdev.name,
-                          (unsigned long long)lba, i + 1, sectors);
-                return BLOCK_ERR_IO;
-            }
+    while (done < sectors) {
+        uint32_t n = sectors - done;
+        if (chunk_size > 1 && n > chunk_size) n = chunk_size;
+        if (chunk_size == 1 && n > 256) n = 256;
 
-            for (int j = 0; j < (int)(dev->logical_sector_size / 2); j++) {
-                uint16_t data = buf_bytes[i * dev->logical_sector_size + j * 2]
-                | (buf_bytes[i * dev->logical_sector_size + j * 2 + 1] << 8);
-                outw(dev->base_port, data);
-            }
+        ata_select_drive(dev);
 
-            ata_delay_400ns(dev->base_port);
-        } else {
-            if (ata_wait_data(dev) < 0) {
-                LOG_ERROR("%s: read lba=%llu sector %u/%u, no DRQ", dev->blkdev.name,
-                          (unsigned long long)lba, i + 1, sectors);
-                return BLOCK_ERR_IO;
-            }
-
-            for (int j = 0; j < (int)(dev->logical_sector_size / 2); j++) {
-                uint16_t data = inw(dev->base_port);
-                buf_bytes[i * dev->logical_sector_size + j * 2] = data & 0xFF;
-                buf_bytes[i * dev->logical_sector_size + j * 2 + 1] = (data >> 8) & 0xFF;
-            }
-
-            ata_delay_400ns(dev->base_port);
+        if (ata_wait_ready(dev, true) < 0) {
+            LOG_ERROR("%s: %s lba=%llu n=%u, drive not ready", dev->blkdev.name, write ? "write" : "read",
+                      (unsigned long long)(lba + done), n);
+            return BLOCK_ERR_TIMEOUT;
         }
+
+        uint64_t clba = lba + done;
+        uint8_t drive_bit = (dev->drive == ATA_DRIVE_SLAVE) ? 0x10 : 0x00;
+        if (dev->lba48_supported) {
+            outb(dev->base_port + 6, 0x40 | drive_bit);
+        } else {
+            outb(dev->base_port + 6, 0xE0 | drive_bit | ((clba >> 24) & 0x0F));
+        }
+
+        if (dev->lba48_supported) {
+            outb(dev->base_port + 1, 0);
+            outb(dev->base_port + 2, (n >> 8) & 0xFF);
+            outb(dev->base_port + 3, (clba >> 24) & 0xFF);
+            outb(dev->base_port + 4, (clba >> 32) & 0xFF);
+            outb(dev->base_port + 5, (clba >> 40) & 0xFF);
+
+            outb(dev->base_port + 1, 0);
+            outb(dev->base_port + 2, n & 0xFF);
+            outb(dev->base_port + 3, clba & 0xFF);
+            outb(dev->base_port + 4, (clba >> 8) & 0xFF);
+            outb(dev->base_port + 5, (clba >> 16) & 0xFF);
+        } else {
+            outb(dev->base_port + 1, 0);
+            outb(dev->base_port + 2, n & 0xFF);
+            outb(dev->base_port + 3, clba & 0xFF);
+            outb(dev->base_port + 4, (clba >> 8) & 0xFF);
+            outb(dev->base_port + 5, (clba >> 16) & 0xFF);
+        }
+
+        uint8_t cmd;
+        if (chunk_size > 1) {
+            cmd = write ? ATA_CMD_WRITE_MULTIPLE : ATA_CMD_READ_MULTIPLE;
+        } else {
+            if (dev->lba48_supported) {
+                cmd = write ? ATA_CMD_WRITE_SECTORS_EXT : ATA_CMD_READ_SECTORS_EXT;
+            } else {
+                cmd = write ? ATA_CMD_WRITE_SECTORS : ATA_CMD_READ_SECTORS;
+            }
+        }
+        outb(dev->base_port + 7, cmd);
+
+        uint32_t per_drq = (chunk_size > 1) ? chunk_size : 1;
+
+        for (uint32_t i = 0; i < n; i += per_drq) {
+            if (ata_wait_data(dev) < 0) {
+                LOG_ERROR("%s: %s lba=%llu chunk %u/%u, no DRQ", dev->blkdev.name, write ? "write" : "read",
+                          (unsigned long long)clba, i + 1, n);
+                return BLOCK_ERR_IO;
+            }
+
+            uint32_t xfer = n - i;
+            if (xfer > per_drq) xfer = per_drq;
+            uint32_t words = xfer * words_per_sector;
+            uint8_t *cur = buf_bytes + (size_t)(done + i) * dev->logical_sector_size;
+
+            if (write) {
+                pio_outsw(dev->base_port, cur, words);
+            } else {
+                pio_insw(dev->base_port, cur, words);
+            }
+        }
+
+        if (write) {
+            if (ata_wait_ready(dev, true) < 0) {
+                LOG_ERROR("%s: write lba=%llu n=%u did not complete", dev->blkdev.name,
+                          (unsigned long long)clba, n);
+                return BLOCK_ERR_TIMEOUT;
+            }
+        }
+
+        done += n;
     }
 
     return BLOCK_OK;
@@ -516,6 +580,23 @@ static bool ata_init_drive(ata_device_t *dev, uint8_t channel, uint8_t drive) {
 
     dev->present = true;
 
+    dev->multi_sectors = 1;
+    uint16_t word59 = dev->identify_words[59];
+    if (word59 != 0 && word59 != 0xFFFF && (word59 & 0x0100)) {
+        uint16_t cur = word59 & 0xFF;
+        if (cur >= 2 && cur <= dev->max_sectors_per_transfer) {
+            dev->multi_sectors = (uint8_t)cur;
+        }
+    }
+    if (dev->multi_sectors < 2) {
+        uint32_t want = ATA_MULTIPLE_CHUNK;
+        if (dev->max_sectors_per_transfer && want > dev->max_sectors_per_transfer)
+            want = dev->max_sectors_per_transfer;
+        if (want >= 2 && ata_set_multiple_mode(dev, (uint8_t)want) == BLOCK_OK) {
+            dev->multi_sectors = (uint8_t)want;
+        }
+    }
+
     struct block_device *bd = &dev->blkdev;
     bd->name[0] = 'h';
     bd->name[1] = 'd';
@@ -528,10 +609,11 @@ static bool ata_init_drive(ata_device_t *dev, uint8_t channel, uint8_t drive) {
     bd->write_sectors = ata_blk_write;
     bd->flush = ata_blk_flush;
 
-    LOG_INFO("%s: \"%s\" %llu sectors x %u bytes (%llu MB)%s", bd->name, dev->model,
+    LOG_INFO("%s: \"%s\" %llu sectors x %u bytes (%llu MB)%s%s", bd->name, dev->model,
              (unsigned long long)dev->total_sectors, (unsigned)dev->logical_sector_size,
              (unsigned long long)((dev->total_sectors * dev->logical_sector_size) >> 20),
-             dev->lba48_supported ? ", LBA48" : "");
+             dev->lba48_supported ? ", LBA48" : "",
+             dev->multi_sectors >= 2 ? ", multi-sector PIO" : "");
 
     block_device_register(bd);
     return true;

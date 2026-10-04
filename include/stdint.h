@@ -11,7 +11,18 @@ typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
-typedef uint64_t size_t;
+#ifdef __SIZE_TYPE__
+typedef __SIZE_TYPE__ size_t;
+#else
+#if defined(__LP64__) || defined(_WIN64) || defined(__x86_64__)
+typedef unsigned long size_t;
+#else
+typedef unsigned int size_t;
+#endif
+#endif
+#ifndef _SIZE_T_DEFINED
+#define _SIZE_T_DEFINED
+#endif
 
 #if defined(__LP64__) || defined(_WIN64) || defined(__x86_64__)
     typedef int64_t intptr_t;

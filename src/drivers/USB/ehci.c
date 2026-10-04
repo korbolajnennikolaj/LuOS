@@ -876,185 +876,456 @@ static int ehci_bulk_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8
     return ret;
 }
 
-#define EHCI_ISO_MAX_FRAMES 8
-#define EHCI_ITD_POOL_SIZE 32
+#define EHCI_ISO_STREAMS 4
+#define EHCI_ISO_ITDS 128
+#define EHCI_ISO_SITDS 128
+#define EHCI_ISO_LEAD_FRAMES 4
+#define EHCI_FRINDEX 0x0C
 
-struct ehci_iso_slot {
-    struct ehci_itd itd_pool[EHCI_ITD_POOL_SIZE] __attribute__((aligned(32)));
-    uint8_t itd_used[EHCI_ITD_POOL_SIZE];
+typedef struct ehci_sitd {
+    uint32_t next_link;
+    uint32_t ep_chars;
+    uint32_t uframe_ctrl;
+    uint32_t state;
+    uint32_t buffer[2];
+    uint32_t back_link;
+    uint32_t ext_buffer[2];
+} __attribute__((packed, aligned(32))) ehci_sitd;
 
-    struct {
-        uint8_t active;
-        uint8_t n_frames;
-        uint8_t frames_done;
-        uint8_t endpoint;
-        uint8_t direction;
-        void *data;
-        uint16_t total_len;
-        uint16_t frame_offsets[EHCI_ISO_MAX_FRAMES];
-        uint16_t frame_lens [EHCI_ISO_MAX_FRAMES];
-        uint16_t frame_slots [EHCI_ISO_MAX_FRAMES];
-        void *cookie;
-    } pending;
+typedef struct ehci_iso_desc_meta {
+    struct usb_iso_request *req;
+    uint16_t first_pkt;
+    uint16_t frame;
+    uint8_t count;
+    uint8_t used;
+    uint8_t linked;
+    uint8_t slot_of[8];
+} ehci_iso_desc_meta;
+
+typedef struct ehci_iso_stream {
+    uint8_t in_use;
+    uint8_t addr;
+    uint8_t endpoint;
+    uint8_t hs;
+    uint8_t started;
+    uint8_t mult;
+    uint8_t interval_uf;
+    uint8_t per_frame;
+    uint16_t mps;
+    uint16_t frame_step;
+    uint16_t next_frame;
+    uint16_t q_head;
+    uint16_t q_tail;
+    uint8_t q_kind[EHCI_ISO_SITDS];
+    uint8_t queue[EHCI_ISO_SITDS];
+} ehci_iso_stream;
+
+static struct ehci_iso_state {
+    struct ehci_itd itd[EHCI_ISO_ITDS] __attribute__((aligned(32)));
+    struct ehci_sitd sitd[EHCI_ISO_SITDS] __attribute__((aligned(32)));
+    ehci_iso_desc_meta itd_meta[EHCI_ISO_ITDS];
+    ehci_iso_desc_meta sitd_meta[EHCI_ISO_SITDS];
+    ehci_iso_stream st[EHCI_ISO_STREAMS];
+    spinlock_t lock;
 } s_ehci_iso[MAX_EHCI_CONTROLLERS];
 
-static struct ehci_itd *alloc_itd(int ri) {
-    for (int i = 0; i < EHCI_ITD_POOL_SIZE; i++) {
-        if (!s_ehci_iso[ri].itd_used[i]) {
-            s_ehci_iso[ri].itd_used[i] = 1;
-            struct ehci_itd *itd = &s_ehci_iso[ri].itd_pool[i];
-            for (int j = 0; j < 8; j++) { itd->transaction[j] = 0; itd->buffer_page[j % 7] = 0; }
-            itd->next_link = 1;
-            return itd;
+static int ehci_res_of(struct usb_device *dev) {
+    if (!dev || !dev->ctrl || dev->ctrl->type != USB_TYPE_EHCI) return -1;
+    int ri = ehci_controller_index((struct ehci_controller *)dev->ctrl);
+    if (ri < 0 || !ehci_resources[ri].ctrl.initialized) return -1;
+    return ri;
+}
+
+static inline uint16_t ehci_cur_frame(int ri) {
+    return (uint16_t)((ehci_read(&ehci_resources[ri].ctrl, EHCI_FRINDEX) >> 3) & 0x7FFu);
+}
+
+static void ehci_iso_flush(const void *buf, uint32_t len) {
+    if (!buf || !len) return;
+    for (uint64_t a = (uint64_t)buf & ~63ull; a < (uint64_t)buf + len; a += 64)
+        asm volatile("clflush (%0)" :: "r"(a) : "memory");
+    asm volatile("mfence" ::: "memory");
+}
+
+static void ehci_iso_unlink(int ri, uint8_t kind, int di) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    ehci_iso_desc_meta *m = kind ? &is->sitd_meta[di] : &is->itd_meta[di];
+    if (!m->linked) return;
+    uint32_t target = kind ? (uint32_t)mm_ptr_to_phys(&is->sitd[di]) : (uint32_t)mm_ptr_to_phys(&is->itd[di]);
+    uint32_t itd_lo = (uint32_t)mm_ptr_to_phys(&is->itd[0]);
+    uint32_t itd_hi = itd_lo + (uint32_t)sizeof(struct ehci_itd) * EHCI_ISO_ITDS;
+    uint32_t sitd_lo = (uint32_t)mm_ptr_to_phys(&is->sitd[0]);
+    uint32_t sitd_hi = sitd_lo + (uint32_t)sizeof(struct ehci_sitd) * EHCI_ISO_SITDS;
+    uint32_t next = kind ? is->sitd[di].next_link : is->itd[di].next_link;
+    uint16_t slot = m->frame & (EHCI_FRAME_LIST_SIZE - 1u);
+
+    int prev_kind = -1;
+    int prev = -1;
+    for (int guard = 0; guard < EHCI_ISO_ITDS + EHCI_ISO_SITDS; guard++) {
+        uint32_t v = (prev_kind < 0) ? ehci_resources[ri].frame_list[slot]
+                   : (prev_kind ? is->sitd[prev].next_link : is->itd[prev].next_link);
+        if (v & 1u) break;
+        uint32_t type = (v >> 1) & 3u;
+        uint32_t ph = v & ~0x1Fu;
+        if (ph == target) {
+            if (prev_kind < 0) ehci_resources[ri].frame_list[slot] = next;
+            else if (prev_kind) is->sitd[prev].next_link = next;
+            else is->itd[prev].next_link = next;
+            asm volatile("mfence" ::: "memory");
+            break;
+        }
+        if (type == 0 && ph >= itd_lo && ph < itd_hi) {
+            prev_kind = 0;
+            prev = (int)((ph - itd_lo) / sizeof(struct ehci_itd));
+        } else if (type == 2 && ph >= sitd_lo && ph < sitd_hi) {
+            prev_kind = 1;
+            prev = (int)((ph - sitd_lo) / sizeof(struct ehci_sitd));
+        } else {
+            break;
         }
     }
-    return NULL;
+    m->linked = 0;
 }
 
-static void free_itd(int ri, struct ehci_itd *itd) {
-    uintptr_t start = (uintptr_t)s_ehci_iso[ri].itd_pool;
-    int idx = (int)(((uintptr_t)itd - start) / sizeof(struct ehci_itd));
-    if (idx >= 0 && idx < EHCI_ITD_POOL_SIZE)
-        s_ehci_iso[ri].itd_used[idx] = 0;
+static void ehci_iso_link(int ri, uint8_t kind, int di, uint16_t frame) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    uint16_t slot = frame & (EHCI_FRAME_LIST_SIZE - 1u);
+    uint32_t phys = kind ? ((uint32_t)mm_ptr_to_phys(&is->sitd[di]) | (2u << 1)) : (uint32_t)mm_ptr_to_phys(&is->itd[di]);
+    if (kind) is->sitd[di].next_link = ehci_resources[ri].frame_list[slot];
+    else is->itd[di].next_link = ehci_resources[ri].frame_list[slot];
+    asm volatile("mfence" ::: "memory");
+    ehci_resources[ri].frame_list[slot] = phys;
+    asm volatile("mfence" ::: "memory");
+    if (kind) is->sitd_meta[di].linked = 1;
+    else is->itd_meta[di].linked = 1;
 }
 
-static int ehci_iso_transfer_impl(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!e || !e->initialized) return -1;
-    if (!n_frames || n_frames > EHCI_ISO_MAX_FRAMES) return -1;
+static bool ehci_iso_desc_active(int ri, uint8_t kind, int di) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    if (kind) return (is->sitd[di].state & 0x80u) != 0;
+    ehci_iso_desc_meta *m = &is->itd_meta[di];
+    for (uint8_t k = 0; k < 8; k++)
+        if (m->slot_of[k] != 0xFF && (is->itd[di].transaction[k] & (1u << 31))) return true;
+    return false;
+}
 
-    int ri = -1;
-    for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++) {
-        if (&ehci_resources[i].ctrl == e) { ri = i; break; }
-    }
-    if (ri == -1) return -1;
-
-    if (s_ehci_iso[ri].pending.active) return -2;
-
-    uint8_t ep_num = endpoint & 0x0Fu;
-    uint8_t is_in = (endpoint & 0x80u) ? 1u : 0u;
-    (void)direction;
-
-    uint16_t flen[EHCI_ISO_MAX_FRAMES];
-    uint16_t offset = 0;
-    uint16_t per_frame = (n_frames > 0) ? (total_len / n_frames) : total_len;
-    for (uint8_t i = 0; i < n_frames; i++) {
-        flen[i] = frame_lens ? frame_lens[i] : per_frame;
-        s_ehci_iso[ri].pending.frame_offsets[i] = offset;
-        s_ehci_iso[ri].pending.frame_lens[i] = flen[i];
-        offset = (uint16_t)(offset + flen[i]);
-    }
-
-    uint32_t cur_frame = ehci_read(e, 0x0C) & 0x3FFu;
-
-    for (uint8_t i = 0; i < n_frames; i++) {
-        struct ehci_itd *itd = alloc_itd(ri);
-        if (!itd) {
-
-            for (uint8_t j = 0; j < i; j++) {
-                uint16_t si = s_ehci_iso[ri].pending.frame_slots[j];
-                ehci_resources[ri].frame_list[(cur_frame + 1 + j) % EHCI_FRAME_LIST_SIZE] = 1;
-                free_itd(ri, &s_ehci_iso[ri].itd_pool[si]);
-                s_ehci_iso[ri].itd_used[si] = 0;
+static void ehci_iso_complete(int ri, uint8_t kind, int di, bool cancelled) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    ehci_iso_desc_meta *m = kind ? &is->sitd_meta[di] : &is->itd_meta[di];
+    ehci_iso_unlink(ri, kind, di);
+    struct usb_iso_request *req = m->req;
+    if (req && !req->done) {
+        bool in = (req->endpoint & 0x80u) != 0;
+        if (kind) {
+            uint32_t st = is->sitd[di].state;
+            uint16_t pi = m->first_pkt;
+            if (pi < req->n_packets) {
+                bool ok = !cancelled && !(st & 0xFCu);
+                uint16_t remain = (uint16_t)((st >> 16) & 0x3FFu);
+                uint16_t actual = ok ? (in ? (uint16_t)(remain >= req->lens[pi] ? 0 : req->lens[pi] - remain) : req->lens[pi]) : 0;
+                req->actual[pi] = actual;
+                if (!ok) req->errors++;
+                req->completed++;
             }
-            return -1;
+            is->sitd[di].state = 0;
+        } else {
+            for (uint8_t k = 0; k < 8; k++) {
+                uint8_t rel = m->slot_of[k];
+                if (rel == 0xFF) continue;
+                uint16_t pi = (uint16_t)(m->first_pkt + rel);
+                if (pi >= req->n_packets) continue;
+                uint32_t t = is->itd[di].transaction[k];
+                bool ok = !cancelled && !(t & (0xFu << 28));
+                uint16_t actual = 0;
+                if (ok) actual = in ? (uint16_t)((t >> 16) & 0xFFFu) : req->lens[pi];
+                if (actual > req->lens[pi]) actual = req->lens[pi];
+                req->actual[pi] = actual;
+                if (!ok) req->errors++;
+                req->completed++;
+                is->itd[di].transaction[k] = 0;
+            }
         }
-
-        int itd_idx = (int)((uintptr_t)(itd - s_ehci_iso[ri].itd_pool));
-        s_ehci_iso[ri].pending.frame_slots[i] = (uint16_t)itd_idx;
-
-        uint8_t *frame_buf = (uint8_t *)data + s_ehci_iso[ri].pending.frame_offsets[i];
-        uint32_t buf_phys = (uint32_t)mm_ptr_to_phys(frame_buf);
-
-        itd->buffer_page[0] = (buf_phys & ~0xFFFu)
-                            | ((uint32_t)(dev_addr & 0x7Fu))
-                            | ((uint32_t)(ep_num & 0xFu) << 8);
-        itd->buffer_page[1] = ((buf_phys + 0x1000u) & ~0xFFFu)
-                            | ((uint32_t)(flen[i] & 0xFFFu) << 0)
-                            | ((uint32_t)is_in << 11);
-
-        itd->transaction[0] = (buf_phys & 0xFFFu)
-                            | ((uint32_t)flen[i] << 12)
-                            | (1u << 25)
-                            | (1u << 31);
-
-        uint32_t frame_idx = (cur_frame + 1u + i) % EHCI_FRAME_LIST_SIZE;
-        uint32_t itd_phys = (uint32_t)mm_ptr_to_phys(itd);
-
-        itd->next_link = ehci_resources[ri].frame_list[frame_idx];
-        asm volatile("mfence" ::: "memory");
-        ehci_resources[ri].frame_list[frame_idx] = itd_phys;
-        asm volatile("mfence" ::: "memory");
+        if (cancelled) req->status = USB_ISO_CANCELLED;
+        if (cancelled || req->completed >= req->n_packets) {
+            if (in) ehci_iso_flush(req->data, req->length);
+            req->queued = 0;
+            req->done = 1;
+        }
     }
-
-    s_ehci_iso[ri].pending.active = 1;
-    s_ehci_iso[ri].pending.n_frames = n_frames;
-    s_ehci_iso[ri].pending.frames_done = 0;
-    s_ehci_iso[ri].pending.endpoint = endpoint;
-    s_ehci_iso[ri].pending.direction = is_in;
-    s_ehci_iso[ri].pending.data = data;
-    s_ehci_iso[ri].pending.total_len = total_len;
-    s_ehci_iso[ri].pending.cookie = NULL;
-
-    return 0;
+    m->req = NULL;
 }
 
-static int ehci_iso_transfer(struct ehci_controller *e, uint8_t dev_addr, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!e) return -1;
-    spin_lock(&e->lock);
-    int ret = ehci_iso_transfer_impl(e, dev_addr, endpoint, data, total_len, n_frames, frame_lens, direction);
-    spin_unlock(&e->lock);
-    return ret;
+static void ehci_iso_reap(int ri, int si, bool force) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    ehci_iso_stream *st = &is->st[si];
+    uint16_t cur = ehci_cur_frame(ri);
+    while (st->q_tail != st->q_head) {
+        uint8_t kind = st->q_kind[st->q_tail % EHCI_ISO_SITDS];
+        int di = st->queue[st->q_tail % EHCI_ISO_SITDS];
+        ehci_iso_desc_meta *m = kind ? &is->sitd_meta[di] : &is->itd_meta[di];
+        uint16_t behind = (uint16_t)((cur - m->frame) & 0x7FFu);
+        bool passed = behind != 0 && behind < 1024u;
+        if (!force) {
+            if (!passed) break;
+            if (ehci_iso_desc_active(ri, kind, di) && behind <= 2u) break;
+        }
+        st->q_tail++;
+        ehci_iso_complete(ri, kind, di, force);
+        m->used = (behind >= 2u && behind < 1024u) ? 0 : 2;
+    }
+    for (int i = 0; i < EHCI_ISO_ITDS; i++) {
+        ehci_iso_desc_meta *m = &is->itd_meta[i];
+        uint16_t behind = (uint16_t)((cur - m->frame) & 0x7FFu);
+        if (m->used == 2 && behind >= 2u && behind < 1024u) m->used = 0;
+    }
+    for (int i = 0; i < EHCI_ISO_SITDS; i++) {
+        ehci_iso_desc_meta *m = &is->sitd_meta[i];
+        uint16_t behind = (uint16_t)((cur - m->frame) & 0x7FFu);
+        if (m->used == 2 && behind >= 2u && behind < 1024u) m->used = 0;
+    }
 }
 
-void ehci_poll_iso(struct ehci_controller *e) {
-    if (!e || !e->initialized) return;
-    int ri = -1;
-    for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++) {
-        if (&ehci_resources[i].ctrl == e) { ri = i; break; }
+static int ehci_iso_find_stream(int ri, uint8_t addr, uint8_t ep) {
+    for (int i = 0; i < EHCI_ISO_STREAMS; i++) {
+        ehci_iso_stream *st = &s_ehci_iso[ri].st[i];
+        if (st->in_use && st->addr == addr && st->endpoint == ep) return i;
     }
-    if (ri == -1 || !s_ehci_iso[ri].pending.active) return;
+    return -1;
+}
 
-    for (uint8_t fi = 0; fi < s_ehci_iso[ri].pending.n_frames; fi++) {
-        uint16_t itd_idx = s_ehci_iso[ri].pending.frame_slots[fi];
-        struct ehci_itd *itd = &s_ehci_iso[ri].itd_pool[itd_idx];
+static int ehci_iso_open(struct usb_device *dev, const struct usb_endpoint_info *ep) {
+    int ri = ehci_res_of(dev);
+    if (ri < 0 || !ep) return USB_ISO_ERR;
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    uint8_t a = dev->address & 0x7Fu;
+    uint8_t spd = ehci_dev_speed[ri][a];
+    if (spd == 2) return USB_ISO_ERR;
 
-        volatile uint32_t trans = itd->transaction[0];
-        if (trans & (1u << 31)) continue;
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    int si = ehci_iso_find_stream(ri, a, ep->address);
+    if (si >= 0) ehci_iso_reap(ri, si, true);
+    else {
+        for (int i = 0; i < EHCI_ISO_STREAMS; i++)
+            if (!is->st[i].in_use) { si = i; break; }
+    }
+    if (si < 0) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_BUSY; }
 
-        uint8_t active_bit = (trans & (1u << 31)) ? 1u : 0u;
-        uint8_t err = (trans >> 28) & 0x3u;
-        int ok = !active_bit && !(err & 0x3u);
-        (void)active_bit;
+    ehci_iso_stream *st = &is->st[si];
+    st->in_use = 1;
+    st->addr = a;
+    st->endpoint = ep->address;
+    st->hs = (spd != 1);
+    st->mps = ep->max_packet_size & 0x7FFu;
+    st->mult = (uint8_t)(((ep->max_packet_size >> 11) & 3u) + 1u);
+    st->started = 0;
+    st->q_head = st->q_tail = 0;
+    if (st->hs) {
+        uint8_t bi = ep->interval ? ep->interval : 1u;
+        if (bi > 16) bi = 16;
+        uint32_t uf = 1u << (bi - 1u);
+        st->interval_uf = (uint8_t)(uf > 8u ? 8u : uf);
+        st->per_frame = (uint8_t)(8u / st->interval_uf);
+        st->frame_step = (uint16_t)(uf > 8u ? uf / 8u : 1u);
+    } else {
+        st->interval_uf = 8;
+        st->per_frame = 1;
+        st->frame_step = 1;
+    }
+    spin_unlock_irqrestore(&is->lock, fl);
+    return USB_ISO_OK;
+}
 
-        usb_event_t evt = {
-            .type = ok ? USB_EVENT_ISO_DONE : USB_EVENT_ISO_ERR,
-            .src = USB_SRC_EHCI,
-            .slot_id = (uint8_t)ri,
-            .endpoint = s_ehci_iso[ri].pending.endpoint,
-            .completion_code = ok ? 0 : (uint8_t)err,
-            .data = ok ? ((uint8_t *)s_ehci_iso[ri].pending.data
-                                      + s_ehci_iso[ri].pending.frame_offsets[fi])
-                                   : NULL,
-            .data_len = ok ? s_ehci_iso[ri].pending.frame_lens[fi] : 0,
-            .iso_frame_index = fi,
-            .iso_expected_len = s_ehci_iso[ri].pending.frame_lens[fi],
-            .cookie = s_ehci_iso[ri].pending.cookie,
-        };
-        usb_push_iso_event(&evt);
+static int ehci_iso_alloc_desc(int ri, uint8_t kind) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    int n = kind ? EHCI_ISO_SITDS : EHCI_ISO_ITDS;
+    ehci_iso_desc_meta *meta = kind ? is->sitd_meta : is->itd_meta;
+    for (int i = 0; i < n; i++) {
+        if (meta[i].used) continue;
+        meta[i].used = 1;
+        meta[i].linked = 0;
+        meta[i].req = NULL;
+        for (int k = 0; k < 8; k++) meta[i].slot_of[k] = 0xFF;
+        return i;
+    }
+    return -1;
+}
 
-        itd->transaction[0] = 0;
-        s_ehci_iso[ri].pending.frames_done++;
+static int ehci_iso_free_count(int ri, uint8_t kind) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    int n = kind ? EHCI_ISO_SITDS : EHCI_ISO_ITDS;
+    ehci_iso_desc_meta *meta = kind ? is->sitd_meta : is->itd_meta;
+    int c = 0;
+    for (int i = 0; i < n; i++) if (!meta[i].used) c++;
+    return c;
+}
+
+static void ehci_iso_fill_itd(int ri, ehci_iso_stream *st, int di, struct usb_iso_request *req, uint16_t first, uint8_t count) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    struct ehci_itd *itd = &is->itd[di];
+    ehci_iso_desc_meta *m = &is->itd_meta[di];
+    bool in = (req->endpoint & 0x80u) != 0;
+    uint32_t base = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[first]) & ~0xFFFu;
+
+    for (int k = 0; k < 8; k++) itd->transaction[k] = 0;
+    for (int j = 0; j < 7; j++) {
+        itd->buffer_page[j] = base + (uint32_t)j * 0x1000u;
+        itd->ext_buffer[j] = 0;
+    }
+    itd->buffer_page[0] |= (uint32_t)(st->addr & 0x7Fu) | ((uint32_t)(st->endpoint & 0x0Fu) << 8);
+    itd->buffer_page[1] |= (in ? (1u << 11) : 0u) | (uint32_t)(st->mps & 0x7FFu);
+    itd->buffer_page[2] |= (uint32_t)(st->mult & 3u);
+
+    for (uint8_t i = 0; i < count; i++) {
+        uint16_t pi = (uint16_t)(first + i);
+        uint8_t uf = (uint8_t)(i * st->interval_uf);
+        if (uf > 7) break;
+        uint32_t ph = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[pi]);
+        uint32_t pg = (ph - base) >> 12;
+        bool last = (pi == req->n_packets - 1u);
+        itd->transaction[uf] = (1u << 31)
+                             | ((uint32_t)(req->lens[pi] & 0xFFFu) << 16)
+                             | (last ? (1u << 15) : 0u)
+                             | ((pg & 7u) << 12)
+                             | (ph & 0xFFFu);
+        m->slot_of[uf] = i;
+    }
+    m->req = req;
+    m->first_pkt = first;
+    m->count = count;
+}
+
+static void ehci_iso_fill_sitd(int ri, ehci_iso_stream *st, int di, struct usb_iso_request *req, uint16_t pi) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    struct ehci_sitd *sd = &is->sitd[di];
+    ehci_iso_desc_meta *m = &is->sitd_meta[di];
+    bool in = (req->endpoint & 0x80u) != 0;
+    uint16_t len = req->lens[pi];
+    uint32_t ph = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[pi]);
+    uint32_t end = ph + (len ? len - 1u : 0u);
+
+    sd->ep_chars = (in ? (1u << 31) : 0u)
+                 | ((uint32_t)(ehci_dev_tt_port[ri][st->addr] & 0x7Fu) << 24)
+                 | ((uint32_t)(ehci_dev_tt_hub[ri][st->addr] & 0x7Fu) << 16)
+                 | ((uint32_t)(st->endpoint & 0x0Fu) << 8)
+                 | (uint32_t)(st->addr & 0x7Fu);
+
+    uint32_t tcount = 1;
+    uint32_t smask, cmask;
+    if (in) {
+        smask = 0x01u;
+        cmask = 0xFCu;
+    } else {
+        tcount = (len + 187u) / 188u;
+        if (tcount == 0) tcount = 1;
+        if (tcount > 6) tcount = 6;
+        smask = (1u << tcount) - 1u;
+        cmask = 0;
+    }
+    sd->uframe_ctrl = (cmask << 8) | smask;
+    bool last = (pi == req->n_packets - 1u);
+    sd->buffer[0] = ph;
+    sd->buffer[1] = (end & ~0xFFFu) | (in ? 0u : (((tcount > 1) ? 1u : 0u) << 3) | tcount);
+    sd->ext_buffer[0] = 0;
+    sd->ext_buffer[1] = 0;
+    sd->back_link = 1u;
+    asm volatile("mfence" ::: "memory");
+    sd->state = (last ? (1u << 31) : 0u) | ((uint32_t)(len & 0x3FFu) << 16) | 0x80u;
+
+    m->req = req;
+    m->first_pkt = pi;
+    m->count = 1;
+}
+
+static int ehci_iso_submit(struct usb_device *dev, struct usb_iso_request *req) {
+    int ri = ehci_res_of(dev);
+    if (ri < 0 || !req) return USB_ISO_ERR;
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    int si = ehci_iso_find_stream(ri, dev->address & 0x7Fu, req->endpoint);
+    if (si < 0) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_ERR; }
+    ehci_iso_stream *st = &is->st[si];
+    ehci_iso_reap(ri, si, false);
+
+    uint8_t kind = st->hs ? 0 : 1;
+    uint16_t frames = st->hs ? (uint16_t)((req->n_packets + st->per_frame - 1u) / st->per_frame) : req->n_packets;
+    if (ehci_iso_free_count(ri, kind) < frames) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_BUSY; }
+    if ((uint16_t)(st->q_head - st->q_tail) + frames >= EHCI_ISO_SITDS) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_BUSY; }
+
+    uint16_t cur = ehci_cur_frame(ri);
+    uint16_t ahead = (uint16_t)((st->next_frame - cur) & 0x7FFu);
+    if (!st->started || ahead < EHCI_ISO_LEAD_FRAMES || ahead > 900u) {
+        st->next_frame = (uint16_t)((cur + EHCI_ISO_LEAD_FRAMES + (st->started ? 1u : 4u)) & 0x7FFu);
+        st->started = 1;
+    } else if (ahead + (uint32_t)frames * st->frame_step > 1000u) {
+        spin_unlock_irqrestore(&is->lock, fl);
+        return USB_ISO_BUSY;
     }
 
-    if (s_ehci_iso[ri].pending.frames_done >= s_ehci_iso[ri].pending.n_frames) {
-        for (uint8_t fi = 0; fi < s_ehci_iso[ri].pending.n_frames; fi++) {
-            uint16_t idx = s_ehci_iso[ri].pending.frame_slots[fi];
-            free_itd(ri, &s_ehci_iso[ri].itd_pool[idx]);
+    ehci_iso_flush(req->data, req->length);
+    req->queued = 1;
+    req->start_frame = st->next_frame;
+
+    uint16_t pi = 0;
+    while (pi < req->n_packets) {
+        int di = ehci_iso_alloc_desc(ri, kind);
+        if (di < 0) break;
+        uint8_t count = 1;
+        if (kind == 0) {
+            count = st->per_frame;
+            if (pi + count > req->n_packets) count = (uint8_t)(req->n_packets - pi);
+            ehci_iso_fill_itd(ri, st, di, req, pi, count);
+        } else {
+            ehci_iso_fill_sitd(ri, st, di, req, pi);
         }
-        s_ehci_iso[ri].pending.active = 0;
+        ehci_iso_desc_meta *m = kind ? &is->sitd_meta[di] : &is->itd_meta[di];
+        m->frame = st->next_frame;
+        ehci_iso_link(ri, kind, di, st->next_frame);
+        st->q_kind[st->q_head % EHCI_ISO_SITDS] = kind;
+        st->queue[st->q_head % EHCI_ISO_SITDS] = (uint8_t)di;
+        st->q_head++;
+        st->next_frame = (uint16_t)((st->next_frame + st->frame_step) & 0x7FFu);
+        pi = (uint16_t)(pi + count);
     }
+    spin_unlock_irqrestore(&is->lock, fl);
+    return USB_ISO_OK;
+}
+
+static void ehci_iso_poll_ri(int ri) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    for (int si = 0; si < EHCI_ISO_STREAMS; si++)
+        if (is->st[si].in_use) ehci_iso_reap(ri, si, false);
+    spin_unlock_irqrestore(&is->lock, fl);
+}
+
+static void ehci_iso_poll(struct usb_device *dev) {
+    int ri = ehci_res_of(dev);
+    if (ri >= 0) ehci_iso_poll_ri(ri);
+}
+
+static void ehci_iso_close(struct usb_device *dev, uint8_t endpoint) {
+    int ri = ehci_res_of(dev);
+    if (ri < 0) return;
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    int si = ehci_iso_find_stream(ri, dev->address & 0x7Fu, endpoint);
+    if (si >= 0) {
+        ehci_iso_reap(ri, si, true);
+        is->st[si].in_use = 0;
+    }
+    spin_unlock_irqrestore(&is->lock, fl);
+}
+
+static void ehci_iso_drop_device(int ri, uint8_t addr) {
+    struct ehci_iso_state *is = &s_ehci_iso[ri];
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    for (int si = 0; si < EHCI_ISO_STREAMS; si++) {
+        if (!is->st[si].in_use || is->st[si].addr != addr) continue;
+        ehci_iso_reap(ri, si, true);
+        is->st[si].in_use = 0;
+    }
+    spin_unlock_irqrestore(&is->lock, fl);
 }
 
 void ehci_reset_endpoint_toggle(struct usb_device *dev, uint8_t dev_addr, uint8_t endpoint){
@@ -1128,6 +1399,11 @@ void ehci_notify_disconnect(struct usb_device *dev) {
 
         if (ri < ehci_controller_count &&
             dev->ctrl == (struct usb_controller *)&ehci_resources[ri].ctrl) {
+            ehci_iso_drop_device(ri, dev->address & 0x7Fu);
+        }
+
+        if (ri < ehci_controller_count &&
+            dev->ctrl == (struct usb_controller *)&ehci_resources[ri].ctrl) {
             uint8_t a = dev->address & 0x7Fu;
             ehci_dev_speed[ri][a] = 0;
             ehci_dev_tt_hub[ri][a] = 0;
@@ -1144,7 +1420,10 @@ struct ehci_driver ehci_driver_loaded = {
     .control_transfer = ehci_control_transfer,
     .interrupt_transfer = ehci_interrupt_transfer,
     .bulk_transfer = ehci_bulk_transfer,
-    .iso_transfer = ehci_iso_transfer,
+    .iso_open = ehci_iso_open,
+    .iso_submit = ehci_iso_submit,
+    .iso_poll = ehci_iso_poll,
+    .iso_close = ehci_iso_close,
     .reset_port = ehci_reset_port,
     .reset_endpoint_toggle = ehci_reset_endpoint_toggle,
     .notify_disconnect = ehci_notify_disconnect,
@@ -1165,7 +1444,7 @@ struct ehci_driver *return_ehci_driver(void) {
     for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++)
         for (int j = 0; j < MAX_EHCI_HID_SLOTS; j++) s_ehci_pending[i][j].active = 0;
 
-    for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++) { s_ehci_bulk_pending[i].active = 0; s_ehci_iso[i].pending.active = 0; }
+    for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++) { s_ehci_bulk_pending[i].active = 0; }
 
     struct usb_controller *u = pci_get_usb_controllers();
     for (int i = 0; i < MAX_EHCI_CONTROLLERS; i++) {

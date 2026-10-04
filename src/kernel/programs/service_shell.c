@@ -1,5 +1,7 @@
 #include "service_shell.h"
 
+#include "audio_player.h"
+#include "shell_audio.h"
 #include "service_root_fs.h"
 #include "service_keyboard_updater.h"
 #include "service_mouse_updater.h"
@@ -1482,9 +1484,27 @@ static void cmd_usb_list(struct limine_video_driver* video) {
         else if (cls == 0x09) video->printf("HUB", LIMINE_COLOR_LIGHT_MAGENTA);
         else if (cls == 0x08) video->printf("Storage", LIMINE_COLOR_LIGHT_BLUE);
         else if (cls == 0x00) video->printf("Defined in Interface", LIMINE_COLOR_LIGHT_GRAY);
-        else video->printf("Other", LIMINE_COLOR_DARK_GRAY);
+        else video->printf(usb_class_name(cls, dev->desc.bDeviceSubClass, dev->desc.bDeviceProtocol), LIMINE_COLOR_DARK_GRAY);
+        if (dev->function_count > 1) video->printf(" (composite)", LIMINE_COLOR_LIGHT_MAGENTA);
 
         video->printf("\n", 0);
+
+        for (int fi = 0; fi < dev->function_count; fi++) {
+            struct usb_function_info *f = &dev->functions[fi];
+            char ifs[96];
+            size_t pos = 0;
+            ifs[0] = 0;
+            for (uint8_t k = 0; k < dev->interface_count && pos + 32 < sizeof(ifs); k++) {
+                struct usb_interface_info *it = &dev->interfaces[k];
+                if (it->function != fi) continue;
+                pos += (size_t)snprintf(ifs + pos, sizeof(ifs) - pos, "%s%u:%s", pos ? " " : "", (unsigned)it->number,
+                                        usb_class_name(it->iface_class, it->iface_subclass, it->iface_protocol));
+            }
+            printf_color(0xFF88CCFF, "    fn %d: %-14s ", fi, usb_function_name(f));
+            printf_color(0xFFAAAAAA, "[%s]", ifs);
+            if (f->driver) printf_color(0xFF88FF88, " -> %s", f->driver);
+            printf("\n");
+        }
     }
 
     if (found_count == 0)
@@ -2368,6 +2388,11 @@ static void cmd_fs_umount(limine_video_driver *video, const char *arg) {
         device[0] = '\0';
     }
 
+    if (m && audio_player_uses_path(m->path)) {
+        audio_player_stop();
+        printf_color(0xFFFFB000, "Background playback from '%s' stopped.\n", m->path);
+    }
+
     int r = rootfs_unmount_point(point);
     if (r == ROOTFS_ERR_NOENT) {
         printf_color(0xFFFF5555, "Nothing is mounted at '%s'.\n", point);
@@ -2419,7 +2444,7 @@ static void cmd_fs_mkfs(limine_video_driver *video, const char *args) {
 
     enum fs_type type;
     if (fs_format_type_from_name(type_name, dev, &type) != FS_OK) {
-        printf_color(0xFFFF5555, "mkfs: '%s' is not supported, use fat, fat12, fat16, fat32 or exfat.\n", type_name);
+        printf_color(0xFFFF5555, "mkfs: '%s' is not supported, use fat, fat12, fat16, fat32, exfat, ext2 or ext3.\n", type_name);
         return;
     }
 
@@ -3136,6 +3161,8 @@ static void shell_entry(void *arg) {
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log-dump [FILE] - save kernel log to FILE.txt", "log-clear     - clear the log buffer");
             printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log-level [buffer|uart|video] LEVEL", "panic [MSG]   - trigger a kernel panic");
 
+            shell_audio_help();
+
             printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Services --\n");
             printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "services      - service table", "service-start NAME - start service");
             printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "service-stop NAME  - stop service", "service-restart NAME - restart service");
@@ -3374,6 +3401,7 @@ static void shell_entry(void *arg) {
             struct panic_info info = { PANIC_CODE_GENERAL, msg, &shell_regs };
             panic(&info);
         }
+        else if (shell_audio_command(cmd_buffer)) { }
         else if (cmd_buffer[0] != '\0') {
             video->printf("Unknown command. Type 'help' for list.\n", LIMINE_COLOR_LIGHT_RED);
         }

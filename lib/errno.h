@@ -74,6 +74,10 @@ extern int errno;
 #define EINPROGRESS 115
 #define ESTALE 116
 
+int *__errno_location(void);
+
+#define errno (*__errno_location())
+
 const char *strerror(int errnum);
 
 int strerror_r(int errnum, char *buf, size_t buflen);

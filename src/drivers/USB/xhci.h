@@ -4,6 +4,10 @@
 
 #include <stdint.h>
 
+struct usb_device;
+struct usb_endpoint_info;
+struct usb_iso_request;
+
 struct usb_setup_packet;
 struct tsc_driver;
 
@@ -112,14 +116,10 @@ typedef struct xhci_driver {
                          uint16_t data_len,
                          uint8_t direction);
 
-    int (*iso_transfer)(struct xhci_controller* x,
-                        uint8_t slot_id,
-                        uint8_t endpoint,
-                        void* data,
-                        uint16_t total_len,
-                        uint8_t n_frames,
-                        const uint16_t* frame_lens,
-                        uint8_t direction);
+    int (*iso_open)(struct usb_device* dev, const struct usb_endpoint_info* ep);
+    int (*iso_submit)(struct usb_device* dev, struct usb_iso_request* req);
+    void (*iso_poll)(struct usb_device* dev);
+    void (*iso_close)(struct usb_device* dev, uint8_t endpoint);
 
     int (*reset_port)(struct xhci_controller* x, uint8_t port);
     void (*poll_event_ring)(struct xhci_controller* x);

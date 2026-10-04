@@ -35,6 +35,7 @@ void _start(void){
 
     pmm_init();
     vmm_init();
+    pmm_dma32_pool_init(PMM_DMA32_POOL_PAGES);
 
     uint64_t free_pages = pmm_free_page_count();
     uint64_t heap_pages_count = (free_pages * 75) / 100;

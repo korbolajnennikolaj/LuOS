@@ -335,6 +335,9 @@ static uint8_t mbr_type_for(enum fs_type type, struct block_device *dev) {
             return dev->sector_count * (dev->sector_size ? dev->sector_size : 512) < 32ull * 1024 * 1024 ? 0x04 : 0x0E;
         case FS_TYPE_FAT32: return 0x0C;
         case FS_TYPE_EXFAT: return 0x07;
+        case FS_TYPE_EXT2: return 0x83;
+        case FS_TYPE_EXT3: return 0x83;
+        case FS_TYPE_EXT4: return 0x83;
         default: return 0;
     }
 }

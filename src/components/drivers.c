@@ -8,6 +8,10 @@
 #include "components/logger.h"
 #include "components/pci.h"
 #include "components/ACPI/madt.h"
+#include "drivers/Audio/ac97.h"
+#include "drivers/Audio/audio_core.h"
+#include "drivers/Audio/hda.h"
+#include "drivers/Audio/usb_audio.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Input/mouse_driver.h"
 #include "drivers/Serial/uart_driver.h"
@@ -144,6 +148,11 @@ void init_drivers() {
     register_driver(return_meta_nvme_driver());
     register_driver(return_meta_usb_msc_driver());
     register_driver(return_meta_ata_driver());
+
+    register_driver(return_meta_audio_core_driver());
+    register_driver(return_meta_hda_driver());
+    register_driver(return_meta_ac97_driver());
+    register_driver(return_meta_usb_audio_driver());
 
     {
         uint32_t disk_count = get_device_count();

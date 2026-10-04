@@ -32,7 +32,9 @@
 #define TD_PID_IN 0x69
 #define TD_PID_OUT 0xE1
 
-#define UHCI_ISO_MAX_FRAMES 8
+#define UHCI_ISO_TDS 256
+#define UHCI_ISO_STREAMS 4
+#define UHCI_ISO_START_LEAD 8u
 #define UHCI_CTRL_TIMEOUT_MS 500
 #define UHCI_MAX_IRQ_VECTORS 4
 
@@ -124,7 +126,7 @@ static struct {
     struct uhci_td ctrl_ring[UHCI_QH_TD_RING] __attribute__((aligned(16)));
     uhci_qh_hw_t ctrl_qh;
 
-    struct uhci_td iso_td_pool[UHCI_ISO_MAX_FRAMES];
+    struct uhci_td iso_td_pool[UHCI_ISO_TDS] __attribute__((aligned(16)));
 } uhci_resources[MAX_UHCI_CONTROLLERS] __attribute__((aligned(4096)));
 
 static int uhci_controller_count = 0;
@@ -863,176 +865,144 @@ static int uhci_control_transfer(struct uhci_controller *u, uint8_t dev_addr, ui
     return ret;
 }
 
-typedef struct {
-    uint8_t active;
-    uint8_t n_frames;
-    uint8_t frames_done;
-    uint8_t endpoint;
-    uint8_t direction;
-    void *data;
-    uint16_t total_len;
-    uint16_t frame_offsets[UHCI_ISO_MAX_FRAMES];
-    uint16_t frame_lens [UHCI_ISO_MAX_FRAMES];
-    uint16_t frame_slots [UHCI_ISO_MAX_FRAMES];
-    uint8_t td_indices [UHCI_ISO_MAX_FRAMES];
-    uint8_t frame_reaped[UHCI_ISO_MAX_FRAMES];
-    uint32_t saved_frame [UHCI_ISO_MAX_FRAMES];
-    void *cookie;
-} uhci_iso_pending;
+typedef struct uhci_iso_td_meta {
+    struct usb_iso_request *req;
+    uint16_t pkt;
+    uint16_t frame;
+    uint8_t used;
+    uint8_t linked;
+} uhci_iso_td_meta;
 
-static struct uhci_iso_pending_holder { uhci_iso_pending v; } s_uhci_iso_holder[MAX_UHCI_CONTROLLERS];
-#define s_uhci_iso(idx) (s_uhci_iso_holder[(idx)].v)
+typedef struct uhci_iso_stream {
+    uint8_t in_use;
+    uint8_t addr;
+    uint8_t endpoint;
+    uint8_t started;
+    uint16_t next_frame;
+    uint16_t q_head;
+    uint16_t q_tail;
+    uint16_t queue[UHCI_ISO_TDS];
+} uhci_iso_stream;
+
+typedef struct uhci_iso_state {
+    uhci_iso_td_meta meta[UHCI_ISO_TDS];
+    uhci_iso_stream st[UHCI_ISO_STREAMS];
+} uhci_iso_state;
+
+static uhci_iso_state s_uhci_iso[MAX_UHCI_CONTROLLERS];
 
 static void uhci_iso_pool_init(int res_idx) {
-    for (int i = 0; i < UHCI_ISO_MAX_FRAMES; i++) {
+    for (int i = 0; i < UHCI_ISO_TDS; i++) {
         uhci_resources[res_idx].iso_td_pool[i].control_status = 0;
         uhci_resources[res_idx].iso_td_pool[i].token = 0;
         uhci_resources[res_idx].iso_td_pool[i].buffer_ptr = 0;
         uhci_resources[res_idx].iso_td_pool[i].link_ptr = LP_TERMINATE;
+        s_uhci_iso[res_idx].meta[i].used = 0;
+        s_uhci_iso[res_idx].meta[i].linked = 0;
+        s_uhci_iso[res_idx].meta[i].req = NULL;
     }
-    s_uhci_iso(res_idx).active = 0;
+    for (int i = 0; i < UHCI_ISO_STREAMS; i++) s_uhci_iso[res_idx].st[i].in_use = 0;
     asm volatile("mfence" ::: "memory");
 }
 
-static int uhci_iso_transfer_impl(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
-                             void *data, uint16_t total_len, uint8_t n_frames,
-                             const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!u || !u->initialized || !data) return -1;
-    if (!n_frames || n_frames > UHCI_ISO_MAX_FRAMES) return -1;
-
-    int res_idx = uhci_res_index(u);
-    if (res_idx < 0) return -1;
-    if (s_uhci_iso(res_idx).active) return -2;
-
-    uint8_t ep_num = endpoint & 0x0Fu;
-    uint8_t pid = direction ? TD_PID_IN : TD_PID_OUT;
-
-    uint16_t cur = uhci_readw(u, UHCI_FRNUM) & 0x3FFu;
-    uint16_t start = (uint16_t)((cur + 2u) & 0x3FFu);
-
-    uint16_t per_frame = (uint16_t)(total_len / n_frames);
-    uint16_t offset = 0;
-
-    for (uint8_t i = 0; i < n_frames; i++) {
-        uint16_t flen = frame_lens ? frame_lens[i] : per_frame;
-        if (offset + flen > total_len) flen = (uint16_t)(total_len - offset);
-        s_uhci_iso(res_idx).frame_offsets[i] = offset;
-        s_uhci_iso(res_idx).frame_lens[i] = flen;
-        s_uhci_iso(res_idx).frame_reaped[i] = 0;
-        offset = (uint16_t)(offset + flen);
+static void uhci_iso_unlink(struct uhci_controller *u, int res_idx, int ti) {
+    uhci_iso_td_meta *m = &s_uhci_iso[res_idx].meta[ti];
+    if (!m->linked) return;
+    struct uhci_td *pool = uhci_resources[res_idx].iso_td_pool;
+    uint32_t target = (uint32_t)mm_ptr_to_phys(&pool[ti]);
+    uint32_t pool_lo = (uint32_t)mm_ptr_to_phys(&pool[0]);
+    uint32_t pool_hi = pool_lo + (uint32_t)sizeof(struct uhci_td) * UHCI_ISO_TDS;
+    int prev = -1;
+    for (int guard = 0; guard < UHCI_ISO_TDS; guard++) {
+        uint32_t v = (prev < 0) ? u->frame_list[m->frame & 0x3FFu] : pool[prev].link_ptr;
+        if (v & (LP_TERMINATE | LP_QH)) break;
+        uint32_t ph = v & ~0xFu;
+        if (ph < pool_lo || ph >= pool_hi) break;
+        if (ph == target) {
+            if (prev < 0) u->frame_list[m->frame & 0x3FFu] = pool[ti].link_ptr;
+            else pool[prev].link_ptr = pool[ti].link_ptr;
+            asm volatile("mfence" ::: "memory");
+            break;
+        }
+        prev = (int)((ph - pool_lo) / sizeof(struct uhci_td));
     }
-
-    int td_free_list[UHCI_ISO_MAX_FRAMES];
-    int found = 0;
-    for (int ti = 0; ti < UHCI_ISO_MAX_FRAMES && found < (int)n_frames; ti++) {
-        if (!(uhci_resources[res_idx].iso_td_pool[ti].control_status & TD_CS_ACTIVE))
-            td_free_list[found++] = ti;
-    }
-    if (found < (int)n_frames) return -1;
-
-    for (uint8_t i = 0; i < n_frames; i++) {
-        struct uhci_td *td = &uhci_resources[res_idx].iso_td_pool[td_free_list[i]];
-        uint8_t *frame_buf = (uint8_t *)data + s_uhci_iso(res_idx).frame_offsets[i];
-        uint16_t flen = s_uhci_iso(res_idx).frame_lens[i];
-        uint16_t fslot = (uint16_t)((start + i) & 0x3FFu);
-
-        uint32_t continue_link = (uint32_t)mm_ptr_to_phys(&uhci_resources[res_idx].async_anchor) | LP_QH;
-
-        td->token = (uint32_t)pid
-        | ((uint32_t)(dev_addr & 0x7Fu) << 8)
-        | ((uint32_t)(ep_num & 0xFu) << 15)
-        | ((uint32_t)((flen > 0 ? (uint32_t)(flen - 1) : 0x7FFu) & 0x7FFu) << 21);
-        td->buffer_ptr = (uint32_t)mm_ptr_to_phys(frame_buf);
-        td->link_ptr = continue_link;
-        asm volatile("mfence" ::: "memory");
-        td->control_status = TD_CS_ACTIVE | TD_CS_IOS | TD_CS_IOC;
-
-        s_uhci_iso(res_idx).frame_slots[i] = fslot;
-        s_uhci_iso(res_idx).td_indices[i] = (uint8_t)td_free_list[i];
-        s_uhci_iso(res_idx).saved_frame[i] = u->frame_list[fslot];
-        u->frame_list[fslot] = (uint32_t)mm_ptr_to_phys(td);
-    }
-    asm volatile("mfence" ::: "memory");
-
-    s_uhci_iso(res_idx).active = 1;
-    s_uhci_iso(res_idx).n_frames = n_frames;
-    s_uhci_iso(res_idx).frames_done = 0;
-    s_uhci_iso(res_idx).endpoint = endpoint;
-    s_uhci_iso(res_idx).direction = direction;
-    s_uhci_iso(res_idx).data = data;
-    s_uhci_iso(res_idx).total_len = total_len;
-    s_uhci_iso(res_idx).cookie = NULL;
-
-    return 0;
+    m->linked = 0;
 }
 
-static int uhci_iso_transfer(struct uhci_controller *u, uint8_t dev_addr, uint8_t endpoint,
-                             void *data, uint16_t total_len, uint8_t n_frames,
-                             const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!u) return -1;
-    int r = uhci_res_index(u);
-    if (r < 0) return -1;
-    uint64_t fl = uhci_qh_lock_acquire(r);
-    int ret = uhci_iso_transfer_impl(u, dev_addr, endpoint, data, total_len, n_frames, frame_lens, direction);
-    uhci_qh_lock_release(r, fl);
-    return ret;
+static void uhci_iso_link_tail(struct uhci_controller *u, int res_idx, int ti, uint16_t frame) {
+    struct uhci_td *pool = uhci_resources[res_idx].iso_td_pool;
+    uint32_t pool_lo = (uint32_t)mm_ptr_to_phys(&pool[0]);
+    uint32_t pool_hi = pool_lo + (uint32_t)sizeof(struct uhci_td) * UHCI_ISO_TDS;
+    uint16_t slot = frame & 0x3FFu;
+    int last = -1;
+    for (int guard = 0; guard < UHCI_ISO_TDS; guard++) {
+        uint32_t v = (last < 0) ? u->frame_list[slot] : pool[last].link_ptr;
+        if (v & (LP_TERMINATE | LP_QH)) break;
+        uint32_t ph = v & ~0xFu;
+        if (ph < pool_lo || ph >= pool_hi) break;
+        last = (int)((ph - pool_lo) / sizeof(struct uhci_td));
+    }
+    pool[ti].link_ptr = (last < 0) ? u->frame_list[slot] : pool[last].link_ptr;
+    asm volatile("mfence" ::: "memory");
+    uint32_t phys = (uint32_t)mm_ptr_to_phys(&pool[ti]);
+    if (last < 0) u->frame_list[slot] = phys;
+    else pool[last].link_ptr = phys;
+    asm volatile("mfence" ::: "memory");
+}
+
+static void uhci_iso_complete_td(struct uhci_controller *u, int res_idx, int ti, bool cancelled) {
+    uhci_iso_td_meta *m = &s_uhci_iso[res_idx].meta[ti];
+    struct uhci_td *td = &uhci_resources[res_idx].iso_td_pool[ti];
+    uint32_t cs = td->control_status;
+    uhci_iso_unlink(u, res_idx, ti);
+    td->control_status = 0;
+
+    struct usb_iso_request *req = m->req;
+    if (req && !req->done && m->pkt < req->n_packets) {
+        bool in = (req->endpoint & 0x80u) != 0;
+        bool ok = !cancelled && !(cs & (TD_CS_ACTIVE | TD_CS_ERROR_MASK));
+        uint16_t actual = 0;
+        if (ok) actual = in ? uhci_td_actual_len(cs) : req->lens[m->pkt];
+        if (actual > req->lens[m->pkt]) actual = req->lens[m->pkt];
+        req->actual[m->pkt] = actual;
+        if (!ok) req->errors++;
+        req->completed++;
+        if (cancelled) req->status = USB_ISO_CANCELLED;
+        if (cancelled || req->completed >= req->n_packets) {
+            if (in) uhci_flush_range(req->data, req->length);
+            req->queued = 0;
+            req->done = 1;
+        }
+    }
+    m->req = NULL;
+}
+
+static void uhci_iso_reap(struct uhci_controller *u, int res_idx, int si, bool force) {
+    uhci_iso_stream *st = &s_uhci_iso[res_idx].st[si];
+    uint16_t cur = uhci_readw(u, UHCI_FRNUM) & 0x7FFu;
+    while (st->q_tail != st->q_head) {
+        int ti = st->queue[st->q_tail % UHCI_ISO_TDS];
+        uhci_iso_td_meta *m = &s_uhci_iso[res_idx].meta[ti];
+        uint32_t cs = uhci_resources[res_idx].iso_td_pool[ti].control_status;
+        uint16_t behind = (uint16_t)((cur - m->frame) & 0x7FFu);
+        bool passed = behind != 0 && behind < 1024u;
+        if (!force) {
+            if (!passed) break;
+            if ((cs & TD_CS_ACTIVE) && behind <= 2u) break;
+        }
+        st->q_tail++;
+        uhci_iso_complete_td(u, res_idx, ti, force);
+        m->used = ((cur & 0x3FFu) != (m->frame & 0x3FFu)) ? 0 : 2;
+    }
+    for (int i = 0; i < UHCI_ISO_TDS; i++) {
+        uhci_iso_td_meta *m = &s_uhci_iso[res_idx].meta[i];
+        if (m->used == 2 && (cur & 0x3FFu) != (m->frame & 0x3FFu)) m->used = 0;
+    }
 }
 
 static void uhci_poll_iso_locked(struct uhci_controller *u, int res_idx) {
-    if (!s_uhci_iso(res_idx).active) return;
-
-    for (uint8_t fi = 0; fi < s_uhci_iso(res_idx).n_frames; fi++) {
-        if (s_uhci_iso(res_idx).frame_reaped[fi]) continue;
-
-        uint8_t td_idx = s_uhci_iso(res_idx).td_indices[fi];
-        uint32_t cs = uhci_resources[res_idx].iso_td_pool[td_idx].control_status;
-
-        if (cs & TD_CS_ACTIVE) continue;
-
-        uint16_t fslot = s_uhci_iso(res_idx).frame_slots[fi];
-        u->frame_list[fslot] = s_uhci_iso(res_idx).saved_frame[fi];
-        uhci_resources[res_idx].iso_td_pool[td_idx].link_ptr = LP_TERMINATE;
-        s_uhci_iso(res_idx).frame_reaped[fi] = 1;
-
-        int ok = !(cs & TD_CS_ERROR_MASK);
-        uint16_t got = ok ? uhci_td_actual_len(cs) : 0;
-        if (got > s_uhci_iso(res_idx).frame_lens[fi])
-            got = s_uhci_iso(res_idx).frame_lens[fi];
-
-        if (ok && s_uhci_iso(res_idx).direction)
-            uhci_flush_range((uint8_t *)s_uhci_iso(res_idx).data +
-                             s_uhci_iso(res_idx).frame_offsets[fi], got);
-
-        usb_event_t evt = {
-            .type = ok ? USB_EVENT_ISO_DONE : USB_EVENT_ISO_ERR,
-            .src = USB_SRC_UHCI,
-            .transfer_type = USB_XFER_ISO,
-            .slot_id = (uint8_t)res_idx,
-            .endpoint = s_uhci_iso(res_idx).endpoint,
-            .completion_code = ok ? 0 : 0xFF,
-            .data = ok ? ((uint8_t *)s_uhci_iso(res_idx).data + s_uhci_iso(res_idx).frame_offsets[fi]) : NULL,
-            .data_len = got,
-            .iso_frame_index = fi,
-            .iso_expected_len = s_uhci_iso(res_idx).frame_lens[fi],
-            .cookie = s_uhci_iso(res_idx).cookie,
-        };
-        usb_push_iso_event(&evt);
-        s_uhci_iso(res_idx).frames_done++;
-    }
-
-    if (s_uhci_iso(res_idx).frames_done >= s_uhci_iso(res_idx).n_frames) {
-        for (uint8_t fi = 0; fi < s_uhci_iso(res_idx).n_frames; fi++) {
-            uint8_t ti = s_uhci_iso(res_idx).td_indices[fi];
-            uhci_resources[res_idx].iso_td_pool[ti].control_status = 0;
-            uhci_resources[res_idx].iso_td_pool[ti].token = 0;
-            uhci_resources[res_idx].iso_td_pool[ti].buffer_ptr = 0;
-            uhci_resources[res_idx].iso_td_pool[ti].link_ptr = LP_TERMINATE;
-        }
-        asm volatile("mfence" ::: "memory");
-        s_uhci_iso(res_idx).active = 0;
-    }
+    for (int si = 0; si < UHCI_ISO_STREAMS; si++)
+        if (s_uhci_iso[res_idx].st[si].in_use) uhci_iso_reap(u, res_idx, si, false);
 }
 
 void uhci_poll_iso(struct uhci_controller *u) {
@@ -1042,6 +1012,121 @@ void uhci_poll_iso(struct uhci_controller *u) {
     uint64_t fl = uhci_qh_lock_acquire(res_idx);
     uhci_poll_iso_locked(u, res_idx);
     uhci_qh_lock_release(res_idx, fl);
+}
+
+static int uhci_iso_find_stream(int res_idx, uint8_t addr, uint8_t ep) {
+    for (int i = 0; i < UHCI_ISO_STREAMS; i++) {
+        uhci_iso_stream *st = &s_uhci_iso[res_idx].st[i];
+        if (st->in_use && st->addr == addr && st->endpoint == ep) return i;
+    }
+    return -1;
+}
+
+static int uhci_iso_open(struct usb_device *dev, const struct usb_endpoint_info *ep) {
+    if (!dev || !dev->ctrl || !ep) return USB_ISO_ERR;
+    struct uhci_controller *u = (struct uhci_controller *)dev->ctrl;
+    int ri = uhci_res_index(u);
+    if (ri < 0 || !u->initialized) return USB_ISO_ERR;
+    uint64_t fl = uhci_qh_lock_acquire(ri);
+    int si = uhci_iso_find_stream(ri, (uint8_t)dev->address, ep->address);
+    if (si >= 0) uhci_iso_reap(u, ri, si, true);
+    else {
+        for (int i = 0; i < UHCI_ISO_STREAMS; i++)
+            if (!s_uhci_iso[ri].st[i].in_use) { si = i; break; }
+    }
+    if (si < 0) { uhci_qh_lock_release(ri, fl); return USB_ISO_BUSY; }
+    uhci_iso_stream *st = &s_uhci_iso[ri].st[si];
+    st->in_use = 1;
+    st->addr = (uint8_t)dev->address;
+    st->endpoint = ep->address;
+    st->started = 0;
+    st->q_head = st->q_tail = 0;
+    uhci_qh_lock_release(ri, fl);
+    return USB_ISO_OK;
+}
+
+static int uhci_iso_submit(struct usb_device *dev, struct usb_iso_request *req) {
+    if (!dev || !dev->ctrl || !req) return USB_ISO_ERR;
+    struct uhci_controller *u = (struct uhci_controller *)dev->ctrl;
+    int ri = uhci_res_index(u);
+    if (ri < 0 || !u->initialized) return USB_ISO_ERR;
+
+    uint64_t fl = uhci_qh_lock_acquire(ri);
+    int si = uhci_iso_find_stream(ri, (uint8_t)dev->address, req->endpoint);
+    if (si < 0) { uhci_qh_lock_release(ri, fl); return USB_ISO_ERR; }
+    uhci_iso_stream *st = &s_uhci_iso[ri].st[si];
+    uhci_iso_reap(u, ri, si, false);
+
+    int free_list[USB_ISO_MAX_PACKETS];
+    int found = 0;
+    for (int i = 0; i < UHCI_ISO_TDS && found < (int)req->n_packets; i++)
+        if (!s_uhci_iso[ri].meta[i].used) free_list[found++] = i;
+    if (found < (int)req->n_packets) { uhci_qh_lock_release(ri, fl); return USB_ISO_BUSY; }
+
+    uint16_t cur = uhci_readw(u, UHCI_FRNUM) & 0x7FFu;
+    uint16_t ahead = (uint16_t)((st->next_frame - cur) & 0x7FFu);
+    if (!st->started || ahead < 2u || ahead > 900u) {
+        st->next_frame = (uint16_t)((cur + (st->started ? 3u : UHCI_ISO_START_LEAD)) & 0x7FFu);
+        st->started = 1;
+    } else if (ahead + req->n_packets > 1000u) {
+        uhci_qh_lock_release(ri, fl);
+        return USB_ISO_BUSY;
+    }
+
+    bool in = (req->endpoint & 0x80u) != 0;
+    uint8_t pid = in ? TD_PID_IN : TD_PID_OUT;
+    uint8_t ep_num = req->endpoint & 0x0Fu;
+    uhci_flush_range(req->data, req->length);
+    req->queued = 1;
+    req->start_frame = st->next_frame;
+
+    for (uint16_t i = 0; i < req->n_packets; i++) {
+        int ti = free_list[i];
+        struct uhci_td *td = &uhci_resources[ri].iso_td_pool[ti];
+        uhci_iso_td_meta *m = &s_uhci_iso[ri].meta[ti];
+        uint16_t flen = req->lens[i];
+        uint16_t frame = st->next_frame;
+
+        m->used = 1;
+        m->req = req;
+        m->pkt = i;
+        m->frame = frame;
+
+        td->token = (uint32_t)pid
+                  | ((uint32_t)(dev->address & 0x7Fu) << 8)
+                  | ((uint32_t)(ep_num & 0xFu) << 15)
+                  | ((uint32_t)((flen > 0 ? (uint32_t)(flen - 1) : 0x7FFu) & 0x7FFu) << 21);
+        td->buffer_ptr = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[i]);
+        td->control_status = TD_CS_ACTIVE | TD_CS_IOS | ((i == req->n_packets - 1u) ? TD_CS_IOC : 0u);
+        uhci_iso_link_tail(u, ri, ti, frame);
+        m->linked = 1;
+        asm volatile("mfence" ::: "memory");
+
+        st->queue[st->q_head % UHCI_ISO_TDS] = (uint16_t)ti;
+        st->q_head++;
+        st->next_frame = (uint16_t)((st->next_frame + 1u) & 0x7FFu);
+    }
+    uhci_qh_lock_release(ri, fl);
+    return USB_ISO_OK;
+}
+
+static void uhci_iso_poll_dev(struct usb_device *dev) {
+    if (!dev || !dev->ctrl) return;
+    uhci_poll_iso((struct uhci_controller *)dev->ctrl);
+}
+
+static void uhci_iso_close(struct usb_device *dev, uint8_t endpoint) {
+    if (!dev || !dev->ctrl) return;
+    struct uhci_controller *u = (struct uhci_controller *)dev->ctrl;
+    int ri = uhci_res_index(u);
+    if (ri < 0) return;
+    uint64_t fl = uhci_qh_lock_acquire(ri);
+    int si = uhci_iso_find_stream(ri, (uint8_t)dev->address, endpoint);
+    if (si >= 0) {
+        uhci_iso_reap(u, ri, si, true);
+        s_uhci_iso[ri].st[si].in_use = 0;
+    }
+    uhci_qh_lock_release(ri, fl);
 }
 
 static void uhci_hc_start(struct uhci_controller *u) {
@@ -1335,6 +1420,13 @@ void uhci_notify_disconnect(struct usb_device *dev) {
             meta[i].cursor = NULL;
             meta[i].remaining = 0;
         }
+        if (ri < uhci_controller_count && dev->ctrl == (struct usb_controller *)&uhci_resources[ri].ctrl) {
+            for (int si = 0; si < UHCI_ISO_STREAMS; si++) {
+                if (!s_uhci_iso[ri].st[si].in_use || s_uhci_iso[ri].st[si].addr != dev->address) continue;
+                uhci_iso_reap(&uhci_resources[ri].ctrl, ri, si, true);
+                s_uhci_iso[ri].st[si].in_use = 0;
+            }
+        }
         uhci_qh_lock_release(ri, qfl);
 
         if (ri < uhci_controller_count &&
@@ -1351,7 +1443,10 @@ struct uhci_driver uhci_driver_loaded = {
     .control_transfer = uhci_control_transfer,
     .interrupt_transfer = uhci_interrupt_transfer,
     .bulk_transfer = uhci_bulk_transfer,
-    .iso_transfer = uhci_iso_transfer,
+    .iso_open = uhci_iso_open,
+    .iso_submit = uhci_iso_submit,
+    .iso_poll = uhci_iso_poll_dev,
+    .iso_close = uhci_iso_close,
     .reset_port = uhci_reset_port,
     .enumerate_device = uhci_enumerate,
     .start = uhci_start,

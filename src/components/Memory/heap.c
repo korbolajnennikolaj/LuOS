@@ -436,6 +436,55 @@ static void* kmalloc_impl(size_t size)
     return BLOCK_DATA(b);
 }
 
+static void* kmalloc_aligned_impl(size_t size, size_t align)
+{
+    if (size == 0) return NULL;
+    if (align <= ALIGN) return kmalloc_impl(size);
+    if (align & (align - 1)) return NULL;
+
+    size = ALIGN_UP(size);
+
+    size_t need = size + align + 2 * BLOCK_SIZE + 2 * MIN_SPLIT;
+    block_t *b = size_find_best(need);
+    if (!b) return NULL;
+
+    size_erase(b);
+
+    size_t span = b->size;
+    uintptr_t data = (uintptr_t)BLOCK_DATA(b);
+    uintptr_t target = (data + align - 1) & ~((uintptr_t)align - 1);
+    uintptr_t hdr = target - BLOCK_SIZE;
+
+    while (hdr > (uintptr_t)b && (size_t)(hdr - (uintptr_t)b) < BLOCK_SIZE + MIN_SPLIT) {
+        target += align;
+        hdr = target - BLOCK_SIZE;
+    }
+
+    if (hdr == (uintptr_t)b) {
+        b->is_free = 0;
+        if (b->size >= size + BLOCK_SIZE + MIN_SPLIT)
+            block_split(b, size);
+        heap_used += b->size;
+        return BLOCK_DATA(b);
+    }
+
+    b->size = (size_t)(hdr - (uintptr_t)b) - BLOCK_SIZE;
+    b->is_free = 1;
+    size_insert(b);
+
+    block_t *nb = (block_t *)hdr;
+    nb->size = span - (size_t)(hdr - (uintptr_t)b) - BLOCK_SIZE;
+    nb->is_free = 0;
+    addr_insert(nb);
+
+    if (nb->size >= size + BLOCK_SIZE + MIN_SPLIT)
+        block_split(nb, size);
+
+    heap_used += nb->size;
+
+    return BLOCK_DATA(nb);
+}
+
 void* kmalloc(size_t size)
 {
     uint64_t flags = spin_lock_irqsave(&heap_lock);
@@ -445,6 +494,14 @@ void* kmalloc(size_t size)
     if (!p && size)
         LOG_WARNING("kmalloc(%llu) failed, %llu of %llu bytes in use",
                     (unsigned long long)size, (unsigned long long)used, (unsigned long long)heap_total);
+    return p;
+}
+
+void* kmalloc_aligned(size_t size, size_t align)
+{
+    uint64_t flags = spin_lock_irqsave(&heap_lock);
+    void *p = kmalloc_aligned_impl(size, align);
+    spin_unlock_irqrestore(&heap_lock, flags);
     return p;
 }
 

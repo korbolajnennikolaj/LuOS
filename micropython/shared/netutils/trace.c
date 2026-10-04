@@ -57,6 +57,12 @@ static const char *ethertype_str(uint16_t type) {
 
 void netutils_ethernet_trace(const mp_print_t *print, size_t len, const uint8_t *buf, unsigned int flags) {
     mp_printf(print, "[% 8u] ETH%cX len=%u", (unsigned)mp_hal_ticks_ms(), flags & NETUTILS_TRACE_IS_TX ? 'T' : 'R', len);
+    if (len < 14) {
+        if (flags & NETUTILS_TRACE_NEWLINE) {
+            mp_printf(print, "\n");
+        }
+        return;
+    }
     mp_printf(print, " dst=%02x:%02x:%02x:%02x:%02x:%02x", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
     mp_printf(print, " src=%02x:%02x:%02x:%02x:%02x:%02x", buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
 
@@ -66,56 +72,77 @@ void netutils_ethernet_trace(const mp_print_t *print, size_t len, const uint8_t 
     } else {
         mp_printf(print, " type=0x%04x", buf[12] << 8 | buf[13]);
     }
-    if (len > 14) {
-        len -= 14;
-        buf += 14;
-        if (buf[-2] == 0x08 && buf[-1] == 0x00 && buf[0] == 0x45) {
-            // IPv4 packet
-            len = get_be16(buf + 2);
-            mp_printf(print, " srcip=%u.%u.%u.%u dstip=%u.%u.%u.%u",
-                buf[12], buf[13], buf[14], buf[15],
-                buf[16], buf[17], buf[18], buf[19]);
-            uint8_t prot = buf[9];
+    len -= 14;
+    buf += 14;
+    if (buf[-2] == 0x08 && buf[-1] == 0x00 && (buf[0] >> 4) == 4) {
+        // IPv4 packet
+        if (len < 20) goto payload;
+        size_t ip_hdr = 4 * (buf[0] & 0x0f);
+        if (ip_hdr < 20) ip_hdr = 20;
+        if (ip_hdr > len) ip_hdr = len;
+        uint32_t ip_len = get_be16(buf + 2);
+        if (ip_len < ip_hdr) ip_len = ip_hdr;
+        if (ip_len > len) ip_len = len;
+        mp_printf(print, " srcip=%u.%u.%u.%u dstip=%u.%u.%u.%u",
+            buf[12], buf[13], buf[14], buf[15],
+            buf[16], buf[17], buf[18], buf[19]);
+        uint8_t prot = buf[9];
+        size_t rem = ip_len - ip_hdr;
+        buf += ip_hdr;
+        len -= ip_hdr;
+        if (rem > len) rem = len;
+        if (prot == 6) {
+            // TCP packet
+            if (rem < 20) { len = rem; goto payload; }
+            len = rem;
+            uint16_t srcport = get_be16(buf);
+            uint16_t dstport = get_be16(buf + 2);
+            uint32_t seqnum = get_be32(buf + 4);
+            uint32_t acknum = get_be32(buf + 8);
+            uint16_t dataoff_flags = get_be16(buf + 12);
+            uint16_t winsz = get_be16(buf + 14);
+            mp_printf(print, " TCP srcport=%u dstport=%u seqnum=%u acknum=%u dataoff=%u flags=%x winsz=%u",
+                srcport, dstport, (unsigned)seqnum, (unsigned)acknum, dataoff_flags >> 12, dataoff_flags & 0x1ff, winsz);
             buf += 20;
             len -= 20;
-            if (prot == 6) {
-                // TCP packet
-                uint16_t srcport = get_be16(buf);
-                uint16_t dstport = get_be16(buf + 2);
-                uint32_t seqnum = get_be32(buf + 4);
-                uint32_t acknum = get_be32(buf + 8);
-                uint16_t dataoff_flags = get_be16(buf + 12);
-                uint16_t winsz = get_be16(buf + 14);
-                mp_printf(print, " TCP srcport=%u dstport=%u seqnum=%u acknum=%u dataoff=%u flags=%x winsz=%u",
-                    srcport, dstport, (unsigned)seqnum, (unsigned)acknum, dataoff_flags >> 12, dataoff_flags & 0x1ff, winsz);
-                buf += 20;
-                len -= 20;
-                if (dataoff_flags >> 12 > 5) {
-                    mp_printf(print, " opts=");
-                    size_t opts_len = ((dataoff_flags >> 12) - 5) * 4;
-                    dump_hex_bytes(print, opts_len, buf);
-                    buf += opts_len;
-                    len -= opts_len;
+            if (dataoff_flags >> 12 > 5) {
+                mp_printf(print, " opts=");
+                size_t opts_len = ((dataoff_flags >> 12) - 5) * 4;
+                if (opts_len > len) opts_len = len;
+                dump_hex_bytes(print, opts_len, buf);
+                buf += opts_len;
+                len -= opts_len;
+            }
+        } else if (prot == 17) {
+            // UDP packet
+            if (rem < 8) { len = rem; goto payload; }
+            len = rem;
+            uint16_t srcport = get_be16(buf);
+            uint16_t dstport = get_be16(buf + 2);
+            mp_printf(print, " UDP srcport=%u dstport=%u", srcport, dstport);
+            uint32_t udp_len = get_be16(buf + 4);
+            if (udp_len < 8) udp_len = 8;
+            if (udp_len > len) udp_len = len;
+            len = udp_len - 8;
+            buf += 8;
+            if ((srcport == 67 && dstport == 68) || (srcport == 68 && dstport == 67)) {
+                // DHCP
+                if (srcport == 67) {
+                    mp_printf(print, " DHCPS");
+                } else {
+                    mp_printf(print, " DHCPC");
                 }
-            } else if (prot == 17) {
-                // UDP packet
-                uint16_t srcport = get_be16(buf);
-                uint16_t dstport = get_be16(buf + 2);
-                mp_printf(print, " UDP srcport=%u dstport=%u", srcport, dstport);
-                len = get_be16(buf + 4);
-                buf += 8;
-                if ((srcport == 67 && dstport == 68) || (srcport == 68 && dstport == 67)) {
-                    // DHCP
-                    if (srcport == 67) {
-                        mp_printf(print, " DHCPS");
-                    } else {
-                        mp_printf(print, " DHCPC");
-                    }
-                    dump_hex_bytes(print, 12 + 16 + 16 + 64, buf);
-                    size_t n = 12 + 16 + 16 + 64 + 128;
-                    len -= n;
-                    buf += n;
-                    mp_printf(print, " opts:");
+                size_t n = 12 + 16 + 16 + 64;
+                if (n > len) n = len;
+                dump_hex_bytes(print, n, buf);
+                buf += n;
+                len -= n;
+                size_t m = 128;
+                if (m > len) m = len;
+                buf += m;
+                len -= m;
+                mp_printf(print, " opts:");
+                if (len >= 7) {
                     switch (buf[6]) {
                         case 1:
                             mp_printf(print, " DISCOVER");
@@ -143,26 +170,29 @@ void netutils_ethernet_trace(const mp_print_t *print, size_t len, const uint8_t 
                             break;
                     }
                 }
-            } else {
-                // Non-UDP packet
-                mp_printf(print, " prot=%u", prot);
             }
-        } else if (buf[-2] == 0x86 && buf[-1] == 0xdd && (buf[0] >> 4) == 6) {
-            // IPv6 packet
-            uint32_t h = get_be32(buf);
-            uint16_t l = get_be16(buf + 4);
-            mp_printf(print, " tclass=%u flow=%u len=%u nexthdr=%u hoplimit=%u", (unsigned)((h >> 20) & 0xff), (unsigned)(h & 0xfffff), l, buf[6], buf[7]);
-            mp_printf(print, " srcip=");
-            dump_hex_bytes(print, 16, buf + 8);
-            mp_printf(print, " dstip=");
-            dump_hex_bytes(print, 16, buf + 24);
-            buf += 40;
-            len -= 40;
+        } else {
+            // Non-UDP packet
+            len = rem;
+            mp_printf(print, " prot=%u", prot);
         }
-        if (flags & NETUTILS_TRACE_PAYLOAD) {
-            mp_printf(print, " data=");
-            dump_hex_bytes(print, len, buf);
-        }
+    } else if (buf[-2] == 0x86 && buf[-1] == 0xdd && (buf[0] >> 4) == 6) {
+        // IPv6 packet
+        if (len < 40) goto payload;
+        uint32_t h = get_be32(buf);
+        uint16_t l = get_be16(buf + 4);
+        mp_printf(print, " tclass=%u flow=%u len=%u nexthdr=%u hoplimit=%u", (unsigned)((h >> 20) & 0xff), (unsigned)(h & 0xfffff), l, buf[6], buf[7]);
+        mp_printf(print, " srcip=");
+        dump_hex_bytes(print, 16, buf + 8);
+        mp_printf(print, " dstip=");
+        dump_hex_bytes(print, 16, buf + 24);
+        buf += 40;
+        len -= 40;
+    }
+payload:
+    if (flags & NETUTILS_TRACE_PAYLOAD) {
+        mp_printf(print, " data=");
+        dump_hex_bytes(print, len, buf);
     }
     if (flags & NETUTILS_TRACE_NEWLINE) {
         mp_printf(print, "\n");

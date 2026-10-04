@@ -346,6 +346,7 @@ int ramfs_mount(fs_t *out) {
     out->priv = fs;
     strncpy(out->label, "ramfs", sizeof(out->label) - 1);
     out->label[sizeof(out->label) - 1] = '\0';
+    fs_volume_lock_init(out);
 
     LOG_DEBUG("ramfs instance created");
     return FS_OK;

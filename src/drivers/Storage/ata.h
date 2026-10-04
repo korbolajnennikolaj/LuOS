@@ -98,6 +98,7 @@ typedef struct {
     uint32_t logical_sector_size;
     uint32_t physical_sector_size;
     uint16_t max_sectors_per_transfer;
+    uint8_t multi_sectors;
     uint8_t lba48_supported;
     uint8_t dma_supported;
     uint8_t ultra_dma_supported;

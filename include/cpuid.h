@@ -113,9 +113,25 @@ static inline struct cpuid_result cpuid_get_extended_features(void) {
 }
 
 static inline uint32_t cpuid_get_tsc_frequency_khz(void) {
-    if (cpuid_get_max_ext_leaf() >= 0x8000000A) {
-        struct cpuid_result result = cpuid(0x8000000A, 0);
-        return result.eax;
+    struct cpuid_result r;
+    uint32_t max_leaf = cpuid(0, 0).eax;
+    if (max_leaf >= 0x15) {
+        r = cpuid(0x15, 0);
+        if (r.eax != 0 && r.ebx != 0 && r.ecx != 0) {
+            uint64_t numerator = r.ebx;
+            uint64_t denominator = r.eax;
+            uint64_t crystal_hz = r.ecx;
+            uint64_t tsc_hz = crystal_hz * numerator / denominator;
+            if (tsc_hz != 0 && tsc_hz < 0x8000000000000000ull) {
+                return (uint32_t)(tsc_hz / 1000u);
+            }
+        }
+    }
+    if (max_leaf >= 0x16) {
+        r = cpuid(0x16, 0);
+        if (r.eax != 0) {
+            return r.eax * 1000u;
+        }
     }
     return 0;
 }

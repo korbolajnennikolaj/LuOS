@@ -1,5 +1,6 @@
 #include "programs.h"
 
+#include "service_audio.h"
 #include "service_keyboard_updater.h"
 #include "service_mouse_updater.h"
 #include "service_root_fs.h"
@@ -367,11 +368,13 @@ void start_service_manager(void) {
     service_t *root_fs = get_root_fs_service();
     service_t *usb_hotplug = get_usb_hotplug_service();
     service_t *shell = get_shell_service();
+    service_t *audio = get_audio_service();
 
     register_service(keyboard_updater);
     register_service(mouse_updater);
     register_service(root_fs);
     register_service(usb_hotplug);
+    register_service(audio);
 
     shell->dependency_count = 0;
     add_service_dependency(shell, keyboard_updater);

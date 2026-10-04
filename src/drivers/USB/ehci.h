@@ -24,6 +24,8 @@
 #define EHCI_PID_SETUP 2
 
 struct usb_device;
+struct usb_endpoint_info;
+struct usb_iso_request;
 
 typedef struct ehci_qh {
     uint32_t horiz_link;
@@ -76,10 +78,10 @@ typedef struct ehci_driver {
     int (*bulk_transfer)(struct ehci_controller* ehci, uint8_t dev_addr, uint8_t endpoint,
                          void* data, uint16_t data_len, uint8_t direction);
 
-    int (*iso_transfer)(struct ehci_controller* ehci, uint8_t dev_addr, uint8_t endpoint,
-                        void* data, uint16_t total_len,
-                        uint8_t n_frames, const uint16_t* frame_lens,
-                        uint8_t direction);
+    int (*iso_open)(struct usb_device* dev, const struct usb_endpoint_info* ep);
+    int (*iso_submit)(struct usb_device* dev, struct usb_iso_request* req);
+    void (*iso_poll)(struct usb_device* dev);
+    void (*iso_close)(struct usb_device* dev, uint8_t endpoint);
 
     void (*reset_endpoint_toggle)(struct usb_device *dev, uint8_t dev_addr, uint8_t endpoint);
 

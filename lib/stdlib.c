@@ -6,6 +6,7 @@
 #include <limits.h>
 
 #include "components/Memory/heap.h"
+#include "kernel/scheduler/spinlock.h"
 
 void *malloc(size_t size)
 {
@@ -48,37 +49,65 @@ void free(void *ptr)
 
 void *aligned_alloc(size_t alignment, size_t size)
 {
-
     if (alignment == 0 || (alignment & (alignment - 1)) != 0)
         return (void*)0;
 
-    if (alignment <= 8)
-        return kmalloc(size);
-
-    size_t overhead = alignment - 1 + sizeof(void*);
-    void *raw = kmalloc(size + overhead);
-    if (!raw) { errno = ENOMEM; return (void*)0; }
-
-    uintptr_t addr = (uintptr_t)raw + sizeof(void*);
-    addr = (addr + alignment - 1) & ~(uintptr_t)(alignment - 1);
-    ((void**)addr)[-1] = raw;
-    return (void*)addr;
+    void *p = kmalloc_aligned(size, alignment);
+    if (!p) { errno = ENOMEM; return (void*)0; }
+    return p;
 }
 
-static uint64_t _rand_state = 0x123456789ABCDEFULL;
+static spinlock_t _rand_lock = SPINLOCK_INIT;
+static uint64_t _rand_state = 0;
+
+static void _rand_seed_once(void)
+{
+    if (_rand_state != 0) return;
+
+    uint64_t s = 0;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    s = ((uint64_t)hi << 32) | lo;
+
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(1));
+    if (edx & (1u << 30)) {
+        for (int i = 0; i < 8; i++) {
+            uint32_t r = 0;
+            unsigned char ok = 0;
+            __asm__ volatile("rdrand %0\n\tsetc %1" : "=r"(r), "=q"(ok) : : "cc");
+            if (ok) { s ^= ((uint64_t)r << (i * 4)) + 0x9E3779B97F4A7C15ULL; break; }
+        }
+    }
+
+    s ^= (uint64_t)(uintptr_t)&_rand_state;
+    s *= 0xBF58476D1CE4E5B9ULL;
+    s ^= s >> 31;
+
+    if (s == 0) s = 0x9E3779B97F4A7C15ULL;
+    _rand_state = s;
+}
 
 int rand(void)
 {
+    uint64_t flags = spin_lock_irqsave(&_rand_lock);
+    _rand_seed_once();
     _rand_state ^= _rand_state << 13;
     _rand_state ^= _rand_state >> 7;
     _rand_state ^= _rand_state << 17;
-    return (int)(_rand_state & (uint64_t)RAND_MAX);
+    int v = (int)(_rand_state & (uint64_t)RAND_MAX);
+    spin_unlock_irqrestore(&_rand_lock, flags);
+    return v;
 }
 
 void srand(unsigned int seed)
 {
+    uint64_t flags = spin_lock_irqsave(&_rand_lock);
     _rand_state = (uint64_t)seed | ((uint64_t)seed << 32);
     if (_rand_state == 0) _rand_state = 1ULL;
+    spin_unlock_irqrestore(&_rand_lock, flags);
 }
 
 __attribute__((noreturn)) void abort(void)
@@ -115,6 +144,7 @@ int atexit(void (*func)(void))
 static unsigned long long
 _parse_ull(const char *s, char **endptr, int base, int *neg_out)
 {
+    const char *nptr_orig = s;
     *neg_out = 0;
 
     while (*s == ' ' || *s == '\t' || *s == '\n' ||
@@ -124,16 +154,20 @@ _parse_ull(const char *s, char **endptr, int base, int *neg_out)
     if (*s == '-') { *neg_out = 1; s++; }
     else if (*s == '+') s++;
 
+    int hex_prefix = 0;
+    int octal_zero = 0;
+
     if (base == 0) {
         if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
-            { base = 16; s += 2; }
+            { base = 16; s += 2; hex_prefix = 1; }
         else if (s[0] == '0')
-            { base = 8; s++; }
+            { base = 8; s++; octal_zero = 1; }
         else
             base = 10;
     } else if (base == 16 &&
                s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
         s += 2;
+        hex_prefix = 1;
     }
 
     const char *start = s;
@@ -162,7 +196,15 @@ _parse_ull(const char *s, char **endptr, int base, int *neg_out)
 
     if (s == start) {
 
-        if (endptr) *endptr = (char*)(s - (*neg_out ? 1 : 0));
+        if (hex_prefix) {
+            if (endptr) *endptr = (char*)(start - 1);
+            return 0ULL;
+        }
+        if (octal_zero) {
+            if (endptr) *endptr = (char*)start;
+            return 0ULL;
+        }
+        if (endptr) *endptr = (char*)nptr_orig;
         return 0ULL;
     }
 
@@ -369,7 +411,7 @@ double strtod(const char *nptr, char **endptr)
 
     if (endptr) *endptr = (char*)s;
 
-    if (result > HUGE_VAL) {
+    if (isinf(result)) {
         errno = ERANGE;
         return negative ? -HUGE_VAL : HUGE_VAL;
     }
@@ -397,25 +439,29 @@ static void _swap(unsigned char *a, unsigned char *b, size_t sz)
 static void _insertion_sort(unsigned char *base, size_t n, size_t sz, int (*cmp)(const void*, const void*))
 {
 
-    unsigned char tmp[512];
-    if (sz > sizeof(tmp)) {
+    if (sz <= 512) {
+        unsigned char tmp[512];
+        for (size_t i = 1; i < n; i++) {
+            unsigned char *cur = base + i * sz;
+            for (size_t k = 0; k < sz; k++) tmp[k] = cur[k];
 
+            size_t j = i;
+            while (j > 0 && cmp(base + (j-1)*sz, tmp) > 0) {
+                unsigned char *dst = base + j*sz;
+                unsigned char *src = base + (j-1)*sz;
+                for (size_t k = 0; k < sz; k++) dst[k] = src[k];
+                j--;
+            }
+            unsigned char *dst = base + j*sz;
+            for (size_t k = 0; k < sz; k++) dst[k] = tmp[k];
+        }
         return;
     }
 
     for (size_t i = 1; i < n; i++) {
-        unsigned char *cur = base + i * sz;
-        for (size_t k = 0; k < sz; k++) tmp[k] = cur[k];
-
-        size_t j = i;
-        while (j > 0 && cmp(base + (j-1)*sz, tmp) > 0) {
-            unsigned char *dst = base + j*sz;
-            unsigned char *src = base + (j-1)*sz;
-            for (size_t k = 0; k < sz; k++) dst[k] = src[k];
-            j--;
+        for (size_t j = i; j > 0 && cmp(base + (j-1)*sz, base + j*sz) > 0; j--) {
+            _swap(base + (j-1)*sz, base + j*sz, sz);
         }
-        unsigned char *dst = base + j*sz;
-        for (size_t k = 0; k < sz; k++) dst[k] = tmp[k];
     }
 }
 

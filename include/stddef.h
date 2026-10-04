@@ -13,7 +13,7 @@ typedef long long max_align_t;
 #endif
 
 #ifndef offsetof
-#define offsetof(type, member) ((size_t)&((type*)0)->member)
+#define offsetof(type, member) __builtin_offsetof(type, member)
 #endif
 
 #endif

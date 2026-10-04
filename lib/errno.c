@@ -1,7 +1,17 @@
 #include <errno.h>
 #include <stddef.h>
+#include <string.h>
 
-int errno = 0;
+#include "kernel/scheduler/scheduler.h"
+
+static int _boot_errno = 0;
+
+int *__errno_location(void)
+{
+    struct task *t = current_task();
+    if (t) return &t->err_no;
+    return &_boot_errno;
+}
 
 static const char * const _err_table[] = {
     "Success",
@@ -103,11 +113,13 @@ int strerror_r(int errnum, char *buf, size_t buflen)
     if (!buf || buflen == 0) return EINVAL;
 
     const char *msg = strerror(errnum);
+    size_t len = strlen(msg);
     size_t i = 0;
     while (i < buflen - 1 && msg[i]) {
         buf[i] = msg[i];
         i++;
     }
     buf[i] = '\0';
+    if (len >= buflen) return ERANGE;
     return 0;
 }

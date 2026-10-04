@@ -6,6 +6,33 @@
 #include "memzip.h"
 
 extern uint8_t memzip_data[];
+extern uint8_t memzip_data_end[] __attribute__((weak));
+
+#define MEMZIP_FALLBACK_BLOB_LIMIT (8u * 1024u * 1024u)
+
+static const uint8_t *memzip_blob_end(void) {
+    if ((uintptr_t)memzip_data_end != 0) return memzip_data_end;
+    return memzip_data + MEMZIP_FALLBACK_BLOB_LIMIT;
+}
+
+static int memzip_advance(const MEMZIP_FILE_HDR **file_hdr) {
+    const uint8_t *p = (const uint8_t *)*file_hdr;
+    const uint8_t *end = memzip_blob_end();
+    if (p + sizeof(MEMZIP_FILE_HDR) > end) return 0;
+    if ((*file_hdr)->signature != MEMZIP_FILE_HEADER_SIGNATURE) return 0;
+    const uint8_t *q = p + sizeof(MEMZIP_FILE_HDR);
+    uint32_t name_len = (*file_hdr)->filename_len;
+    uint32_t extra_len = (*file_hdr)->extra_len;
+    uint32_t data_len = (*file_hdr)->uncompressed_size;
+    if (name_len > (uint32_t)(end - q)) return 0;
+    q += name_len;
+    if (extra_len > (uint32_t)(end - q)) return 0;
+    q += extra_len;
+    if (data_len > (uint32_t)(end - q)) return 0;
+    q += data_len;
+    *file_hdr = (const MEMZIP_FILE_HDR *)q;
+    return 1;
+}
 
 const MEMZIP_FILE_HDR *memzip_find_file_header(const char *filename) {
 
@@ -26,8 +53,7 @@ const MEMZIP_FILE_HDR *memzip_find_file_header(const char *filename) {
             /* We found a match */
             return file_hdr;
         }
-        mem_data += file_hdr->uncompressed_size;
-        file_hdr = (const MEMZIP_FILE_HDR *)mem_data;
+        if (!memzip_advance(&file_hdr)) break;
     }
     return NULL;
 }
@@ -55,13 +81,9 @@ bool memzip_is_dir(const char *filename) {
             return true;
         }
 
-        mem_data = (uint8_t *)file_hdr_filename;
-        mem_data += file_hdr->filename_len;
-        mem_data += file_hdr->extra_len;
-        mem_data += file_hdr->uncompressed_size;
-        file_hdr = (const MEMZIP_FILE_HDR *)mem_data;
+        if (!memzip_advance(&file_hdr)) break;
     }
-    return NULL;
+    return false;
 
 }
 

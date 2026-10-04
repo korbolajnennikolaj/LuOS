@@ -28,4 +28,14 @@ uint64_t pmm_virt_to_phys(uint64_t virt);
 
 uint64_t pmm_get_free_memory(void);
 
+#define PMM_DMA32_LIMIT 0x100000000ULL
+#define PMM_DMA32_POOL_PAGES 4096
+
+uint64_t pmm_alloc_pages_below(uint64_t count, uint64_t limit);
+void pmm_dma32_pool_init(uint64_t pages);
+uint64_t pmm_alloc_dma32_pages(uint64_t count);
+void pmm_free_dma32_pages(uint64_t phys, uint64_t count);
+uint64_t pmm_dma32_pool_total(void);
+uint64_t pmm_dma32_pool_free(void);
+
 #endif

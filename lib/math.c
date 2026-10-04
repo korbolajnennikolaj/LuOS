@@ -103,14 +103,33 @@ double frexp(double x, int *exp_out) {
 }
 
 double ldexp(double x, int n) {
-    _db v; v.d = x;
     int cls = fpclassify(x);
     if (cls == FP_ZERO || cls == FP_NAN || cls == FP_INFINITE) return x;
-    int e = (int)((v.u >> 52) & 0x7FF) + n;
-    if (e >= 0x7FF) return copysign(HUGE_VAL, x);
-    if (e <= 0) return copysign(0.0, x);
-    v.u = (v.u & ~_D_EXP) | ((unsigned long long)e << 52);
-    return v.d;
+
+    double y = x;
+
+    if (n > 1023) {
+        y *= 0x1p1023;
+        n -= 1023;
+        if (n > 1023) {
+            y *= 0x1p1023;
+            n -= 1023;
+            if (n > 1023) n = 1023;
+        }
+    } else if (n < -1022) {
+        y *= 0x1p-1022 * 0x1p53;
+        n += 1022 - 53;
+        if (n < -1022) {
+            y *= 0x1p-1022 * 0x1p53;
+            n += 1022 - 53;
+            if (n < -1022) n = -1022;
+        }
+    }
+
+    _db w;
+    w.u = 0x3FF0000000000000ULL + ((uint64_t)n << 52);
+    y *= w.d;
+    return y;
 }
 double scalbn(double x, int n) { return ldexp(x, n); }
 
@@ -360,7 +379,7 @@ double pow(double x, double y) {
         double yi = trunc(y);
         if (y != yi) return NAN;
         double mag = exp2(y * _log2r(-x));
-        return ((long long)yi & 1LL) ? -mag : mag;
+        return (fmod(yi, 2.0) != 0.0) ? -mag : mag;
     }
     if (x == 0.0) return (y < 0.0) ? HUGE_VAL : 0.0;
     if (_ISINF(x)) return (y < 0.0) ? 0.0 : HUGE_VAL;

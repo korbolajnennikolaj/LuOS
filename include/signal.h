@@ -18,8 +18,10 @@ typedef void (*sighandler_t)(int);
 
 static inline sighandler_t signal(int sig, sighandler_t handler) {
     (void)sig;
-    (void)handler;
-    return SIG_DFL;
+    if (handler == SIG_DFL || handler == SIG_IGN) {
+        return handler;
+    }
+    return SIG_ERR;
 }
 
 static inline int raise(int sig) {

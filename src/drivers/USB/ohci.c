@@ -127,22 +127,39 @@ typedef struct ohci_iso_td_hw {
     volatile uint16_t psw[8];
 } __attribute__((packed, aligned(32))) ohci_iso_td_hw;
 
-#define OHCI_ISO_MAX_FRAMES 8
+#define OHCI_ISO_STREAMS 4
+#define OHCI_ISO_TDS 64
+#define OHCI_ISO_TD_FRAMES 8
+#define OHCI_ISO_START_LEAD 8u
 
-typedef struct ohci_iso_pending {
-    uint8_t active;
-    uint8_t n_frames;
+typedef struct ohci_iso_td_meta {
+    struct usb_iso_request *req;
+    uint16_t first_pkt;
+    uint8_t count;
+    uint8_t queued;
+} ohci_iso_td_meta;
+
+typedef struct ohci_iso_stream {
+    uint8_t in_use;
+    uint8_t addr;
     uint8_t endpoint;
-    uint8_t direction;
-    void *data;
-    uint16_t total_len;
-    uint16_t frame_offsets[OHCI_ISO_MAX_FRAMES];
-    uint16_t frame_lens [OHCI_ISO_MAX_FRAMES];
-    uint8_t frame_reaped[OHCI_ISO_MAX_FRAMES];
-    void *cookie;
-    struct ohci_iso_td_hw iso_td __attribute__((aligned(32)));
-    struct ohci_ed_hw iso_ed __attribute__((aligned(16)));
-} ohci_iso_pending;
+    uint8_t started;
+    uint16_t mps;
+    uint16_t next_frame;
+    int16_t dummy;
+    uint16_t q_head;
+    uint16_t q_tail;
+    uint8_t queue[OHCI_ISO_TDS];
+} ohci_iso_stream;
+
+typedef struct ohci_iso_state {
+    struct ohci_iso_td_hw td[OHCI_ISO_TDS] __attribute__((aligned(32)));
+    struct ohci_ed_hw ed[OHCI_ISO_STREAMS] __attribute__((aligned(16)));
+    ohci_iso_td_meta meta[OHCI_ISO_TDS];
+    uint8_t td_used[OHCI_ISO_TDS];
+    ohci_iso_stream st[OHCI_ISO_STREAMS];
+    spinlock_t lock;
+} ohci_iso_state;
 
 static struct {
     struct ohci_controller ctrl;
@@ -153,7 +170,7 @@ static struct {
     uint32_t bulk_chain_head;
 } ohci_resources[MAX_OHCI_CONTROLLERS] __attribute__((aligned(4096)));
 
-static struct ohci_iso_pending s_ohci_iso[MAX_OHCI_CONTROLLERS];
+static struct ohci_iso_state s_ohci_iso[MAX_OHCI_CONTROLLERS];
 
 uint8_t ohci_dev_is_ls[MAX_OHCI_CONTROLLERS][128];
 uint8_t ohci_dev_mps0[MAX_OHCI_CONTROLLERS][128];
@@ -815,145 +832,278 @@ static int ohci_bulk_transfer(struct ohci_controller *o, uint8_t addr, uint8_t e
     return ret;
 }
 
-static int ohci_iso_transfer_impl(struct ohci_controller *o, uint8_t addr, uint8_t ep,
-                                  void *data, uint16_t total_len, uint8_t n_frames,
-                                  const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!o || !o->initialized || !data) return -1;
-    if (!n_frames || n_frames > OHCI_ISO_MAX_FRAMES) return -1;
-
-    int ri = ohci_res_index(o);
-    if (ri < 0) return -1;
-    if (s_ohci_iso[ri].active) return -2;
-
-    uint8_t ep_num = ep & 0x0Fu;
-    uint8_t is_in = direction ? 1u : 0u;
-
-    uint32_t buf_phys = (uint32_t)mm_ptr_to_phys(data);
-    if (((buf_phys + total_len - 1u) & ~0xFFFu) - (buf_phys & ~0xFFFu) > 0x1000u)
-        return -1;
-
-    uint16_t per_frame = (uint16_t)(total_len / n_frames);
-    uint16_t offset = 0;
-    for (uint8_t i = 0; i < n_frames; i++) {
-        uint16_t flen = frame_lens ? frame_lens[i] : per_frame;
-        if (offset + flen > total_len) flen = (uint16_t)(total_len - offset);
-        s_ohci_iso[ri].frame_offsets[i] = offset;
-        s_ohci_iso[ri].frame_lens[i] = flen;
-        s_ohci_iso[ri].frame_reaped[i] = 0;
-        offset = (uint16_t)(offset + flen);
+static int ohci_iso_td_alloc(int ri) {
+    for (int i = 0; i < OHCI_ISO_TDS; i++) {
+        if (s_ohci_iso[ri].td_used[i]) continue;
+        s_ohci_iso[ri].td_used[i] = 1;
+        struct ohci_iso_td_hw *t = &s_ohci_iso[ri].td[i];
+        t->flags = 0;
+        t->bp0 = 0;
+        t->next_td = 0;
+        t->be = 0;
+        for (int k = 0; k < 8; k++) t->psw[k] = 0;
+        s_ohci_iso[ri].meta[i].req = NULL;
+        s_ohci_iso[ri].meta[i].queued = 0;
+        return i;
     }
-
-    uint16_t cur_frame = ohci_resources[ri].hcca.hcca_frame_number;
-    uint16_t sf = (uint16_t)(cur_frame + 4u);
-
-    struct ohci_iso_td_hw *itd = &s_ohci_iso[ri].iso_td;
-
-    itd->bp0 = buf_phys & ~0xFFFu;
-    itd->be = buf_phys + total_len - 1u;
-    itd->next_td = 0u;
-
-    for (uint8_t i = 0; i < n_frames; i++) {
-        uint32_t off = (uint32_t)(buf_phys + s_ohci_iso[ri].frame_offsets[i]);
-        uint16_t psw = (uint16_t)(off & 0xFFFu);
-        if ((off & ~0xFFFu) != (buf_phys & ~0xFFFu)) psw |= (1u << 12);
-        itd->psw[i] = (uint16_t)(psw | 0xE000u);
-    }
-
-    itd->flags = ((uint32_t)(n_frames - 1u) << 24)
-               | OHCI_TD_DI_NOW
-               | (uint32_t)sf
-               | OHCI_TD_CC_NOTACCESSED;
-    asm volatile("mfence" ::: "memory");
-
-    struct ohci_ed_hw *ied = &s_ohci_iso[ri].iso_ed;
-    ied->info = (uint32_t)(addr & 0x7Fu)
-              | ((uint32_t)(ep_num & 0xFu) << 7)
-              | ((uint32_t)(is_in ? 2u : 1u) << 11)
-              | OHCI_ED_ISO
-              | ((uint32_t)(per_frame ? per_frame : 1u) << 16);
-    ied->tail_p = 0u;
-    ied->head_p = (uint32_t)mm_ptr_to_phys(itd) & ~(uint32_t)OHCI_ED_HEAD_FLAGS_MASK;
-    ied->next_ed = 0u;
-    asm volatile("mfence" ::: "memory");
-
-    ohci_resources[ri].ed_pool[OHCI_ED_INT_BASE + MAX_OHCI_HID_SLOTS - 1].next_ed =
-        (uint32_t)mm_ptr_to_phys(ied);
-    asm volatile("mfence" ::: "memory");
-
-    ohci_write(o, REG_CONTROL, ohci_read(o, REG_CONTROL) | OHCI_CTRL_PLE | OHCI_CTRL_IE);
-
-    s_ohci_iso[ri].active = 1;
-    s_ohci_iso[ri].n_frames = n_frames;
-    s_ohci_iso[ri].endpoint = ep;
-    s_ohci_iso[ri].direction = is_in;
-    s_ohci_iso[ri].data = data;
-    s_ohci_iso[ri].total_len = total_len;
-    s_ohci_iso[ri].cookie = NULL;
-
-    return 0;
+    return -1;
 }
 
-static int ohci_iso_transfer(struct ohci_controller *o, uint8_t addr, uint8_t ep,
-                             void *data, uint16_t total_len, uint8_t n_frames,
-                             const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!o) return -1;
-    spin_lock(&o->lock);
-    int ret = ohci_iso_transfer_impl(o, addr, ep, data, total_len, n_frames, frame_lens, direction);
-    spin_unlock(&o->lock);
-    return ret;
+static void ohci_iso_init(int ri) {
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+    for (int i = 0; i < OHCI_ISO_TDS; i++) is->td_used[i] = 0;
+    for (int i = 0; i < OHCI_ISO_STREAMS; i++) {
+        is->st[i].in_use = 0;
+        is->ed[i].info = OHCI_ED_SKIP;
+        is->ed[i].tail_p = 0;
+        is->ed[i].head_p = 0;
+        is->ed[i].next_ed = (i + 1 < OHCI_ISO_STREAMS) ? (uint32_t)mm_ptr_to_phys(&is->ed[i + 1]) : 0u;
+    }
+    asm volatile("mfence" ::: "memory");
+    ohci_resources[ri].ed_pool[OHCI_ED_INT_BASE + MAX_OHCI_HID_SLOTS - 1].next_ed = (uint32_t)mm_ptr_to_phys(&is->ed[0]);
+    asm volatile("mfence" ::: "memory");
+}
+
+static void ohci_iso_finish_td(int ri, int ti, bool cancelled) {
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+    struct ohci_iso_td_hw *t = &is->td[ti];
+    struct ohci_iso_td_meta *m = &is->meta[ti];
+    struct usb_iso_request *req = m->req;
+
+    if (req && !req->done) {
+        bool in = (req->endpoint & 0x80u) != 0;
+        for (uint8_t k = 0; k < m->count; k++) {
+            uint16_t pi = (uint16_t)(m->first_pkt + k);
+            if (pi >= req->n_packets) break;
+            uint16_t psw = t->psw[k];
+            uint8_t cc = (uint8_t)((psw >> 12) & 0xFu);
+            uint16_t actual = 0;
+            bool ok = !cancelled && (cc == 0 || cc == 9);
+            if (ok) actual = in ? (uint16_t)(psw & 0x7FFu) : req->lens[pi];
+            if (actual > req->lens[pi]) actual = req->lens[pi];
+            req->actual[pi] = actual;
+            if (!ok) req->errors++;
+            req->completed++;
+        }
+        if (cancelled) req->status = USB_ISO_CANCELLED;
+        if (cancelled || req->completed >= req->n_packets) {
+            if (in) ohci_flush_range(req->data, req->length);
+            req->queued = 0;
+            req->done = 1;
+        }
+    }
+    m->req = NULL;
+    m->queued = 0;
+    is->td_used[ti] = 0;
+}
+
+static void ohci_iso_reap_stream(int ri, int si) {
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+    struct ohci_iso_stream *st = &is->st[si];
+    while (st->q_tail != st->q_head) {
+        int ti = st->queue[st->q_tail % OHCI_ISO_TDS];
+        uint32_t cc = (is->td[ti].flags >> 28) & 0xFu;
+        if (cc == 0xFu || cc == 0xEu) break;
+        uint32_t head = is->ed[si].head_p & ~(uint32_t)OHCI_ED_HEAD_FLAGS_MASK;
+        if (head == (uint32_t)mm_ptr_to_phys(&is->td[ti])) break;
+        st->q_tail++;
+        ohci_iso_finish_td(ri, ti, false);
+    }
+}
+
+static int ohci_iso_find_stream(int ri, uint8_t addr, uint8_t ep) {
+    for (int i = 0; i < OHCI_ISO_STREAMS; i++) {
+        struct ohci_iso_stream *st = &s_ohci_iso[ri].st[i];
+        if (st->in_use && st->addr == addr && st->endpoint == ep) return i;
+    }
+    return -1;
+}
+
+static void ohci_iso_stop_stream(struct ohci_controller *o, int ri, int si) {
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+    struct ohci_iso_stream *st = &is->st[si];
+    is->ed[si].info |= OHCI_ED_SKIP;
+    asm volatile("mfence" ::: "memory");
+    uint16_t f0 = *(volatile uint16_t *)&ohci_resources[ri].hcca.hcca_frame_number;
+    for (int w = 0; w < 4; w++) {
+        if ((uint16_t)(*(volatile uint16_t *)&ohci_resources[ri].hcca.hcca_frame_number - f0) >= 2) break;
+        if (delay_ms) delay_ms(1);
+    }
+    (void)o;
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    ohci_iso_reap_stream(ri, si);
+    while (st->q_tail != st->q_head) {
+        int ti = st->queue[st->q_tail % OHCI_ISO_TDS];
+        st->q_tail++;
+        ohci_iso_finish_td(ri, ti, true);
+    }
+    if (st->dummy >= 0) is->td_used[st->dummy] = 0;
+    st->dummy = -1;
+    is->ed[si].head_p = 0;
+    is->ed[si].tail_p = 0;
+    st->in_use = 0;
+    asm volatile("mfence" ::: "memory");
+    spin_unlock_irqrestore(&is->lock, fl);
+}
+
+static int ohci_iso_open(struct usb_device *dev, const struct usb_endpoint_info *ep) {
+    if (!dev || !dev->ctrl || !ep) return USB_ISO_ERR;
+    struct ohci_controller *o = (struct ohci_controller *)dev->ctrl;
+    int ri = ohci_res_index(o);
+    if (ri < 0 || !o->initialized) return USB_ISO_ERR;
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    int si = ohci_iso_find_stream(ri, (uint8_t)dev->address, ep->address);
+    if (si >= 0) {
+        spin_unlock_irqrestore(&is->lock, fl);
+        ohci_iso_stop_stream(o, ri, si);
+        fl = spin_lock_irqsave(&is->lock);
+    }
+    si = -1;
+    for (int i = 0; i < OHCI_ISO_STREAMS; i++)
+        if (!is->st[i].in_use) { si = i; break; }
+    if (si < 0) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_BUSY; }
+    int dummy = ohci_iso_td_alloc(ri);
+    if (dummy < 0) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_BUSY; }
+
+    struct ohci_iso_stream *st = &is->st[si];
+    st->in_use = 1;
+    st->addr = (uint8_t)dev->address;
+    st->endpoint = ep->address;
+    st->mps = ep->max_packet_size & 0x7FFu;
+    st->started = 0;
+    st->dummy = (int16_t)dummy;
+    st->q_head = st->q_tail = 0;
+
+    uint32_t dummy_phys = (uint32_t)mm_ptr_to_phys(&is->td[dummy]);
+    struct ohci_ed_hw *ed = &is->ed[si];
+    ed->tail_p = dummy_phys;
+    ed->head_p = dummy_phys;
+    asm volatile("mfence" ::: "memory");
+    ed->info = (uint32_t)(dev->address & 0x7Fu)
+             | ((uint32_t)(ep->address & 0xFu) << 7)
+             | ((uint32_t)((ep->address & 0x80u) ? 2u : 1u) << 11)
+             | OHCI_ED_ISO
+             | ((uint32_t)(st->mps ? st->mps : 1023u) << 16);
+    asm volatile("mfence" ::: "memory");
+    spin_unlock_irqrestore(&is->lock, fl);
+
+    ohci_write(o, REG_CONTROL, ohci_read(o, REG_CONTROL) | OHCI_CTRL_PLE | OHCI_CTRL_IE);
+    return USB_ISO_OK;
+}
+
+static int ohci_iso_submit(struct usb_device *dev, struct usb_iso_request *req) {
+    if (!dev || !dev->ctrl || !req) return USB_ISO_ERR;
+    struct ohci_controller *o = (struct ohci_controller *)dev->ctrl;
+    int ri = ohci_res_index(o);
+    if (ri < 0) return USB_ISO_ERR;
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    int si = ohci_iso_find_stream(ri, (uint8_t)dev->address, req->endpoint);
+    if (si < 0) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_ERR; }
+    struct ohci_iso_stream *st = &is->st[si];
+    ohci_iso_reap_stream(ri, si);
+
+    int need = (req->n_packets + OHCI_ISO_TD_FRAMES - 1) / OHCI_ISO_TD_FRAMES + 2;
+    int free_tds = 0;
+    for (int i = 0; i < OHCI_ISO_TDS; i++) if (!is->td_used[i]) free_tds++;
+    if (free_tds < need) { spin_unlock_irqrestore(&is->lock, fl); return USB_ISO_BUSY; }
+
+    bool in = (req->endpoint & 0x80u) != 0;
+    ohci_flush_range(req->data, req->length);
+
+    uint16_t cur = *(volatile uint16_t *)&ohci_resources[ri].hcca.hcca_frame_number;
+    if (!st->started || (int16_t)(st->next_frame - cur) < 2) {
+        st->next_frame = (uint16_t)(cur + (st->started ? 3u : OHCI_ISO_START_LEAD));
+        st->started = 1;
+    }
+
+    req->queued = 1;
+    req->start_frame = st->next_frame;
+    uint16_t pi = 0;
+    while (pi < req->n_packets) {
+        uint32_t start_phys = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[pi]);
+        uint32_t page0 = start_phys & ~0xFFFu;
+        uint8_t count = 0;
+        uint32_t end_phys = start_phys;
+        while (count < OHCI_ISO_TD_FRAMES && pi + count < req->n_packets) {
+            uint16_t k = (uint16_t)(pi + count);
+            uint32_t last = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[k] + (req->lens[k] ? req->lens[k] - 1u : 0u));
+            if ((last & ~0xFFFu) != page0 && (last & ~0xFFFu) != page0 + 0x1000u) break;
+            end_phys = last;
+            count++;
+        }
+        if (count == 0) count = 1;
+
+        int ti = st->dummy;
+        int nd = ohci_iso_td_alloc(ri);
+        if (nd < 0) break;
+        struct ohci_iso_td_hw *t = &is->td[ti];
+        for (uint8_t k = 0; k < count; k++) {
+            uint32_t ph = (uint32_t)mm_ptr_to_phys((uint8_t *)req->data + req->offsets[pi + k]);
+            uint16_t psw = (uint16_t)(ph & 0xFFFu);
+            if ((ph & ~0xFFFu) != page0) psw |= (1u << 12);
+            t->psw[k] = (uint16_t)(psw | 0xE000u);
+        }
+        for (uint8_t k = count; k < 8; k++) t->psw[k] = 0;
+        t->bp0 = page0;
+        t->be = end_phys;
+        t->next_td = (uint32_t)mm_ptr_to_phys(&is->td[nd]);
+        bool last_td = (pi + count >= req->n_packets);
+        t->flags = ((uint32_t)(count - 1u) << 24)
+                 | (last_td ? OHCI_TD_DI_NOW : OHCI_TD_DI_NONE)
+                 | (uint32_t)st->next_frame
+                 | OHCI_TD_CC_NOTACCESSED;
+        is->meta[ti].req = req;
+        is->meta[ti].first_pkt = pi;
+        is->meta[ti].count = count;
+        is->meta[ti].queued = 1;
+        asm volatile("mfence" ::: "memory");
+
+        st->queue[st->q_head % OHCI_ISO_TDS] = (uint8_t)ti;
+        st->q_head++;
+        st->dummy = (int16_t)nd;
+        is->ed[si].tail_p = (uint32_t)mm_ptr_to_phys(&is->td[nd]);
+        asm volatile("mfence" ::: "memory");
+
+        st->next_frame = (uint16_t)(st->next_frame + count);
+        pi = (uint16_t)(pi + count);
+    }
+    (void)in;
+    spin_unlock_irqrestore(&is->lock, fl);
+    return USB_ISO_OK;
 }
 
 void ohci_poll_iso(struct ohci_controller *o) {
     if (!o || !o->initialized) return;
     int ri = ohci_res_index(o);
-    if (ri < 0 || !s_ohci_iso[ri].active) return;
+    if (ri < 0) return;
+    struct ohci_iso_state *is = &s_ohci_iso[ri];
+    uint64_t fl = spin_lock_irqsave(&is->lock);
+    for (int si = 0; si < OHCI_ISO_STREAMS; si++)
+        if (is->st[si].in_use) ohci_iso_reap_stream(ri, si);
+    spin_unlock_irqrestore(&is->lock, fl);
+}
 
-    struct ohci_iso_td_hw *itd = &s_ohci_iso[ri].iso_td;
+static void ohci_iso_poll_dev(struct usb_device *dev) {
+    if (!dev || !dev->ctrl) return;
+    ohci_poll_iso((struct ohci_controller *)dev->ctrl);
+}
 
-    int all_done = 1;
-    for (uint8_t fi = 0; fi < s_ohci_iso[ri].n_frames; fi++) {
-        if (s_ohci_iso[ri].frame_reaped[fi]) continue;
+static void ohci_iso_close(struct usb_device *dev, uint8_t endpoint) {
+    if (!dev || !dev->ctrl) return;
+    struct ohci_controller *o = (struct ohci_controller *)dev->ctrl;
+    int ri = ohci_res_index(o);
+    if (ri < 0) return;
+    int si = ohci_iso_find_stream(ri, (uint8_t)dev->address, endpoint);
+    if (si >= 0) ohci_iso_stop_stream(o, ri, si);
+}
 
-        uint16_t psw = itd->psw[fi];
-        uint8_t cc = (uint8_t)((psw >> 12) & 0xFu);
-        if (cc == 0xFu || cc == 0x7u) { all_done = 0; continue; }
-
-        int ok = (cc == 0);
-        uint16_t actual = (uint16_t)(psw & 0x7FFu);
-        if (actual > s_ohci_iso[ri].frame_lens[fi])
-            actual = s_ohci_iso[ri].frame_lens[fi];
-        if (!ok) actual = 0;
-
-        if (ok && s_ohci_iso[ri].direction)
-            ohci_flush_range((uint8_t *)s_ohci_iso[ri].data +
-                             s_ohci_iso[ri].frame_offsets[fi], actual);
-
-        usb_event_t evt = {
-            .type = ok ? USB_EVENT_ISO_DONE : USB_EVENT_ISO_ERR,
-            .src = USB_SRC_OHCI,
-            .transfer_type = USB_XFER_ISO,
-            .slot_id = (uint8_t)ri,
-            .endpoint = s_ohci_iso[ri].endpoint,
-            .completion_code = cc,
-            .data = ok ? ((uint8_t *)s_ohci_iso[ri].data
-                          + s_ohci_iso[ri].frame_offsets[fi])
-                       : NULL,
-            .data_len = actual,
-            .iso_frame_index = fi,
-            .iso_expected_len = s_ohci_iso[ri].frame_lens[fi],
-            .cookie = s_ohci_iso[ri].cookie,
-        };
-        usb_push_iso_event(&evt);
-        s_ohci_iso[ri].frame_reaped[fi] = 1;
-    }
-
-    if (all_done) {
-        ohci_resources[ri].ed_pool[OHCI_ED_INT_BASE + MAX_OHCI_HID_SLOTS - 1].next_ed = 0u;
-        asm volatile("mfence" ::: "memory");
-        s_ohci_iso[ri].active = 0;
-    }
+static void ohci_iso_drop_device(struct ohci_controller *o, int ri, uint8_t addr) {
+    for (int si = 0; si < OHCI_ISO_STREAMS; si++)
+        if (s_ohci_iso[ri].st[si].in_use && s_ohci_iso[ri].st[si].addr == addr) ohci_iso_stop_stream(o, ri, si);
 }
 
 static void ohci_init_lists(int ri) {
@@ -999,12 +1149,13 @@ static void ohci_init_lists(int ri) {
     s_ohci_bulk_pending[ri].slot = -1;
     s_ohci_bulk_pending[ri].device = NULL;
     s_ohci_bulk_pending[ri].td = NULL;
-    s_ohci_iso[ri].active = 0;
 
     ohci_resources[ri].bulk_chain_head = (uint32_t)mm_ptr_to_phys(&eds[OHCI_ED_BULK_BASE]);
 
     uint32_t int_head = (uint32_t)mm_ptr_to_phys(&eds[OHCI_ED_INT_BASE]);
     ohci_resources[ri].int_chain_head = int_head;
+
+    ohci_iso_init(ri);
 
     for (int i = 0; i < 32; i++)
         ohci_resources[ri].hcca.hcca_interrupt_table[i] = int_head;
@@ -1284,6 +1435,8 @@ void ohci_notify_disconnect(struct usb_device *dev) {
             b->td = NULL;
         }
 
+        if (ri < ohci_controller_count) ohci_iso_drop_device(&ohci_resources[ri].ctrl, ri, dev->address);
+
         for (int bs = 0; bs < MAX_OHCI_BULK_SLOTS; bs++) {
             if (!s_ohci_bulk_slots[ri][bs].in_use) continue;
             if (s_ohci_bulk_slots[ri][bs].addr != dev->address) continue;
@@ -1306,7 +1459,10 @@ struct ohci_driver ohci_driver_loaded = {
     .control_transfer = ohci_control_transfer,
     .interrupt_transfer = ohci_interrupt_transfer,
     .bulk_transfer = ohci_bulk_transfer,
-    .iso_transfer = ohci_iso_transfer,
+    .iso_open = ohci_iso_open,
+    .iso_submit = ohci_iso_submit,
+    .iso_poll = ohci_iso_poll_dev,
+    .iso_close = ohci_iso_close,
     .reset_port = ohci_reset_port,
     .enumerate_device = ohci_enumerate,
     .start = ohci_start,

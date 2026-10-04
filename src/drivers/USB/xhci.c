@@ -32,6 +32,8 @@
 #define MAX_XHCI_CONTROLLERS 8
 #define TRB_RING_SIZE 256
 #define MAX_SLOTS 64
+#define XHCI_ISO_EPS 16
+#define XHCI_ISO_RING_TRBS 512
 #define ERDP_WITH_EHB(pa) ((pa) | (1ULL << 3))
 
 #define TRB_TYPE_NORMAL 1
@@ -114,7 +116,7 @@ static struct {
     struct xhci_trb transfer_rings[MAX_SLOTS][TRB_RING_SIZE] __attribute__((aligned(4096)));
     struct xhci_trb intr_rings[MAX_SLOTS][TRB_RING_SIZE] __attribute__((aligned(4096)));
     struct xhci_trb bulk_rings[MAX_SLOTS][2][TRB_RING_SIZE] __attribute__((aligned(4096)));
-    struct xhci_trb iso_rings [MAX_SLOTS][TRB_RING_SIZE] __attribute__((aligned(4096)));
+    struct xhci_trb iso_rings [XHCI_ISO_EPS][XHCI_ISO_RING_TRBS] __attribute__((aligned(4096)));
 } __attribute__((aligned(4096))) xhci_mem[MAX_XHCI_CONTROLLERS];
 
 _Static_assert(sizeof(struct xhci_trb) * TRB_RING_SIZE == 4096,
@@ -151,24 +153,34 @@ static volatile uint8_t intr_submitted[MAX_XHCI_CONTROLLERS][MAX_SLOTS];
 static volatile uint8_t intr_done [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
 static volatile uint8_t intr_error [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
 
-static uint32_t iso_tr_idx [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
-static uint8_t iso_cycle [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
-static uint8_t iso_ep_configured[MAX_XHCI_CONTROLLERS][MAX_SLOTS];
-static uint8_t iso_slot_dci [MAX_XHCI_CONTROLLERS][MAX_SLOTS];
+#define XHCI_ISO_FIFO XHCI_ISO_RING_TRBS
+typedef struct xhci_iso_slot_entry {
+    struct usb_iso_request *req;
+    uint16_t pkt;
+    uint16_t trb;
+} xhci_iso_slot_entry;
 
-#define XHCI_ISO_MAX_FRAMES 8
-typedef struct xhci_iso_ctx {
-    uint8_t active;
-    uint8_t n_frames;
-    uint8_t frames_done;
+typedef struct xhci_iso_ep {
+    uint8_t in_use;
+    uint8_t configured;
     uint8_t slot_id;
+    uint8_t dci;
     uint8_t endpoint;
-    void *data;
-    uint16_t frame_offsets[XHCI_ISO_MAX_FRAMES];
-    uint16_t frame_lens [XHCI_ISO_MAX_FRAMES];
-    void *cookie;
-} xhci_iso_ctx_t;
-static xhci_iso_ctx_t xhci_iso_ctx[MAX_XHCI_CONTROLLERS][MAX_SLOTS];
+    uint8_t mult;
+    uint8_t interval;
+    uint8_t cycle;
+    uint16_t mps;
+    uint16_t enq;
+    uint16_t pending;
+    uint16_t fifo_head;
+    uint16_t fifo_tail;
+    uint32_t missed;
+    uint32_t errors;
+    xhci_iso_slot_entry fifo[XHCI_ISO_FIFO];
+} xhci_iso_ep_t;
+static xhci_iso_ep_t xhci_iso_eps[MAX_XHCI_CONTROLLERS][XHCI_ISO_EPS];
+static bool xhci_iso_event(struct xhci_controller *x, uint8_t slot_id, uint8_t dci, uint8_t code, uint32_t residual, uint64_t trb_ptr);
+static void xhci_iso_release_slot(struct xhci_controller *x, uint8_t slot_id);
 
 static struct xhci_controller ctrls[MAX_XHCI_CONTROLLERS];
 static int ctrl_count = 0;
@@ -344,6 +356,8 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
             x->last_completion_code = code;
             x->last_cmd_code = code;
 
+        } else if (type == TRB_TYPE_TRANSFER_EVENT && ev_ep > 1 &&
+                   xhci_iso_event(x, ev_slot, ev_ep, code, ev->status & 0xFFFFFFu, ev->param)) {
         } else if (type == TRB_TYPE_TRANSFER_EVENT) {
 
             if (ev_slot != 0 && ev_slot == x->pending_xfer_slot && ev_ep <= 1) {
@@ -356,7 +370,7 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
                 {
                     int ci_e = (int)(x - ctrls);
                     int ki_e = (int)ev_slot - 1;
-                    uint8_t is_bulk = 0, is_iso = 0;
+                    uint8_t is_bulk = 0;
                     uint8_t bulk_dir = 0;
                     if (ki_e >= 0 && ki_e < MAX_SLOTS) {
 
@@ -365,9 +379,7 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
                             bulk_slot_dci[ci_e][ki_e][dir] == ev_ep) {
                             is_bulk = 1;
                         bulk_dir = dir;
-                            } else if (iso_slot_dci[ci_e][ki_e] == ev_ep &&
-                                xhci_iso_ctx[ci_e][ki_e].active)
-                                is_iso = 1;
+                            }
                     }
 
                     if (is_bulk) {
@@ -388,29 +400,6 @@ static void xhci_poll_event_ring_locked(struct xhci_controller *x) {
                             .cookie = NULL,
                         };
                         usb_push_bulk_event(&uevt);
-                    } else if (is_iso) {
-
-                        xhci_iso_ctx_t *ictx = (ki_e >= 0 && ki_e < MAX_SLOTS)
-                        ? &xhci_iso_ctx[ci_e][ki_e] : NULL;
-                        if (ictx) {
-                            uint8_t fi = ictx->frames_done;
-                            usb_event_t uevt = {
-                                .type = (code == 1 || code == 13) ? USB_EVENT_ISO_DONE : USB_EVENT_ISO_ERR,
-                                .src = USB_SRC_XHCI,
-                                .slot_id = ev_slot,
-                                .endpoint = ev_ep,
-                                .completion_code = code,
-                                .data = NULL,
-                                .data_len = 0,
-                                .iso_frame_index = fi,
-                                .iso_expected_len = (fi < XHCI_ISO_MAX_FRAMES) ? ictx->frame_lens[fi] : 0,
-                                .cookie = ictx->cookie,
-                            };
-                            usb_push_iso_event(&uevt);
-                            ictx->frames_done++;
-                            if (ictx->frames_done >= ictx->n_frames)
-                                ictx->active = 0;
-                        }
                     } else {
 
                         struct usb_device *ev_dev = NULL;
@@ -799,6 +788,7 @@ static int xhci_disable_slot_impl(struct xhci_controller *x, uint8_t slot_id) {
     intr_submitted[idx][slot_id - 1] = 0;
     intr_done[idx][slot_id - 1] = 0;
     intr_error[idx][slot_id - 1] = 0;
+    xhci_iso_release_slot(x, slot_id);
 
     return 0;
 }
@@ -838,6 +828,7 @@ static int xhci_address_device_impl(struct xhci_controller *x, uint8_t slot_id, 
     ep_needs_reset[idx][slot_id - 1] = 0;
     ctrl_tr_idx[idx][slot_id - 1] = 0;
     ctrl_tr_cycle[idx][slot_id - 1] = 1;
+    xhci_iso_release_slot(x, slot_id);
 
     uint32_t ss, mps;
     if (topo->parent_hub_slot == 0) {
@@ -1065,7 +1056,11 @@ static int xhci_update_ep0_mps_impl(struct xhci_controller *x, uint8_t slot_id, 
     return 0;
 }
 
-static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, uint8_t dci, uint8_t ep_type, uint16_t mps, uint8_t interval)
+#define XHCI_CFG_EP_READD 0x01u
+#define XHCI_CFG_EP_DROP 0x02u
+
+static int xhci_configure_endpoint_ex(struct xhci_controller *x, uint8_t slot_id, uint8_t dci, uint8_t ep_type, uint16_t mps, uint8_t interval,
+                                      struct xhci_trb *iso_ring, uint8_t burst, uint8_t flags)
 {
 
 
@@ -1083,23 +1078,29 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     uint8_t *dctx = (uint8_t *)xhci_mem[ci].dev_ctx[slot_id - 1];
 
     uint8_t is_bulk_ep = (ep_type == EP_TYPE_BULK_IN || ep_type == EP_TYPE_BULK_OUT);
+    uint8_t is_iso_ep = (ep_type == EP_TYPE_ISO_IN || ep_type == EP_TYPE_ISO_OUT);
     uint8_t bulk_dir = (ep_type == EP_TYPE_BULK_IN) ? 1u : 0u;
     int ki = (int)slot_id - 1;
 
     struct xhci_trb *tr_ring;
     if (is_bulk_ep) {
         tr_ring = xhci_mem[ci].bulk_rings[ki][bulk_dir];
+    } else if (is_iso_ep) {
+        tr_ring = iso_ring;
+        if (!tr_ring) return -1;
     } else {
         tr_ring = xhci_mem[ci].intr_rings[slot_id - 1];
     }
-    memset(tr_ring, 0, sizeof(struct xhci_trb) * TRB_RING_SIZE);
-    tr_ring[TRB_RING_SIZE - 1].param = virt_to_phys(tr_ring);
-    tr_ring[TRB_RING_SIZE - 1].status = 0;
-    tr_ring[TRB_RING_SIZE - 1].control = (TRB_TYPE_LINK << 10) | (1u << 1) | 1u;
-    for (int i = 0; i < TRB_RING_SIZE; i++) CACHE_FLUSH(&tr_ring[i]);
+    int ring_trbs = is_iso_ep ? XHCI_ISO_RING_TRBS : TRB_RING_SIZE;
+    memset(tr_ring, 0, sizeof(struct xhci_trb) * (size_t)ring_trbs);
+    tr_ring[ring_trbs - 1].param = virt_to_phys(tr_ring);
+    tr_ring[ring_trbs - 1].status = 0;
+    tr_ring[ring_trbs - 1].control = (TRB_TYPE_LINK << 10) | (1u << 1) | 1u;
+    for (int i = 0; i < ring_trbs; i++) CACHE_FLUSH(&tr_ring[i]);
     FULL_BARRIER();
 
-    if (!is_bulk_ep) {
+    if (is_iso_ep) {
+    } else if (!is_bulk_ep) {
         intr_tr_idx[ci][slot_id - 1] = 0;
         intr_cycle[ci][slot_id - 1] = 1;
         intr_active[ci][slot_id - 1] = 0;
@@ -1119,8 +1120,8 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     memset(ictx, 0, XHCI_INPUT_CTX_BYTES);
     {
         uint32_t *ictrl = (uint32_t *)xhci_input_ctx_ctrl(ictx);
-        ictrl[0] = 0;
-        ictrl[1] = (1u << 0) | (1u << dci);
+        ictrl[0] = (flags & (XHCI_CFG_EP_READD | XHCI_CFG_EP_DROP)) ? (1u << dci) : 0u;
+        ictrl[1] = (flags & XHCI_CFG_EP_DROP) ? (1u << 0) : ((1u << 0) | (1u << dci));
     }
 
     for (size_t fi = 0; fi < XHCI_DEV_CTX_BYTES; fi += 64)
@@ -1149,7 +1150,12 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
         bool is_fs_ls = (dev_speed == 1u || dev_speed == 2u);
 
         if (ep_is_periodic) {
-            if (is_fs_ls) {
+            if (is_fs_ls && is_iso_ep) {
+                int v = (int)(interval ? interval : 1u) - 1 + 3;
+                if (v < 3) v = 3;
+                if (v > 18) v = 18;
+                xhci_interval = (uint8_t)v;
+            } else if (is_fs_ls) {
 
                 uint32_t bi = interval ? (uint32_t)interval : 1u;
                 uint8_t log2val = 0;
@@ -1169,7 +1175,7 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     }
     LOG_DEBUG("CFG_EP interval(xhci) 0x%x", xhci_interval);
 
-    uint32_t max_burst = 0u;
+    uint32_t max_burst = (is_iso_ep || ep_type == EP_TYPE_INTR_IN || ep_type == EP_TYPE_INTR_OUT) ? (uint32_t)(burst & 3u) : 0u;
     uint32_t max_esit = ep_is_periodic ? ((uint32_t)mps * (max_burst + 1u)) : 0u;
     uint32_t avg_trb_len = mps ? (uint32_t)mps : 8u;
 
@@ -1179,9 +1185,10 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
     epctx->dw1 = ((uint32_t)mps << 16)
     | (max_burst << 8)
     | ((uint32_t)ep_type << 3)
-    | (3u << 1);
+    | (is_iso_ep ? 0u : (3u << 1));
     epctx->tr_dequeue_ptr = tr_phys | 1u;
     epctx->dw4 = (avg_trb_len & 0xFFFFu) | ((max_esit & 0xFFFFu) << 16);
+    if (flags & XHCI_CFG_EP_DROP) memset(epctx, 0, sizeof(*epctx));
 
     for (size_t fi = 0; fi < XHCI_INPUT_CTX_BYTES; fi += 64)
         CACHE_FLUSH(ictx + fi);
@@ -1206,7 +1213,8 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
         return -1;
     }
     LOG_DEBUG("Configure EP OK slot %u, USBSTS=0x%08x", (unsigned)slot_id, rd32(x->op_base, XHCI_OP_USBSTS));
-    delay_ms(10);
+    if (flags & XHCI_CFG_EP_DROP) return 0;
+    delay_ms(is_iso_ep ? 1 : 10);
 
     struct xhci_endpoint_context *dev_ep =
         (struct xhci_endpoint_context *)xhci_dev_ctx_ep(dctx, ctx_size, dci);
@@ -1229,9 +1237,14 @@ static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, u
         FULL_BARRIER();
     }
 
-    ep_configured[ci][slot_id - 1] = 1;
+    if (!is_iso_ep) ep_configured[ci][slot_id - 1] = 1;
     LOG_DEBUG("EP configured");
     return 0;
+}
+
+static int xhci_configure_endpoint(struct xhci_controller *x, uint8_t slot_id, uint8_t dci, uint8_t ep_type, uint16_t mps, uint8_t interval)
+{
+    return xhci_configure_endpoint_ex(x, slot_id, dci, ep_type, mps, interval, NULL, 0, 0);
 }
 
 static int xhci_reset_endpoint(struct xhci_controller *x, uint8_t slot_id, uint8_t dci);
@@ -2253,118 +2266,273 @@ static int xhci_bulk_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_
     return ret;
 }
 
-static int xhci_iso_transfer_impl(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!x || !x->initialized || slot_id == 0 || slot_id > x->max_slots)
-        return -1;
-    if (!n_frames || n_frames > XHCI_ISO_MAX_FRAMES) return -1;
-
-    int ci = x - ctrls;
-    int ki = slot_id - 1;
-
-    uint8_t ep_num = endpoint & 0x0Fu;
-    uint8_t is_in = (endpoint & 0x80u) ? 1u : 0u;
-    uint8_t dci = (ep_num * 2u) + is_in;
-    if (dci == 0 || dci > 31) return -1;
-    (void)direction;
-
-    if (xhci_iso_ctx[ci][ki].active) {
-        xhci_poll_event_ring(x);
-        if (xhci_iso_ctx[ci][ki].active) return -2;
+static xhci_iso_ep_t *xhci_iso_find(struct xhci_controller *x, uint8_t slot_id, uint8_t dci) {
+    int ci = (int)(x - ctrls);
+    if (ci < 0 || ci >= MAX_XHCI_CONTROLLERS) return NULL;
+    for (int i = 0; i < XHCI_ISO_EPS; i++) {
+        xhci_iso_ep_t *e = &xhci_iso_eps[ci][i];
+        if (e->in_use && e->slot_id == slot_id && e->dci == dci) return e;
     }
-
-    struct xhci_trb *tr_ring = xhci_mem[ci].iso_rings[ki];
-
-    if (!iso_ep_configured[ci][ki]) {
-        uint8_t ep_type = is_in ? EP_TYPE_ISO_IN : EP_TYPE_ISO_OUT;
-
-        uint16_t mps = 1024u;
-
-        if (xhci_configure_endpoint(x, slot_id, dci, ep_type, mps, 3) != 0)
-            return -1;
-        xhci_poll_event_ring(x);
-        uint32_t s = rd32(x->op_base, XHCI_OP_USBSTS);
-        if (s & (1u << 3)) wr32(x->op_base, XHCI_OP_USBSTS, (1u << 3));
-        wr32(x->rt_base, 0x20, rd32(x->rt_base, 0x20) | 3u);
-        FULL_BARRIER();
-        iso_ep_configured[ci][ki] = 1;
-        iso_slot_dci[ci][ki] = dci;
-    }
-
-    uint16_t per_frame = (n_frames > 0) ? (total_len / n_frames) : total_len;
-    uint16_t offset = 0;
-    for (uint8_t i = 0; i < n_frames; i++) {
-        xhci_iso_ctx[ci][ki].frame_lens[i] = frame_lens ? frame_lens[i] : per_frame;
-        xhci_iso_ctx[ci][ki].frame_offsets[i] = offset;
-        offset = (uint16_t)(offset + xhci_iso_ctx[ci][ki].frame_lens[i]);
-    }
-
-    for (uint64_t a = (uint64_t)data; a < (uint64_t)data + total_len; a += 64)
-        CACHE_FLUSH((void *)a);
-    FULL_BARRIER();
-
-    uint32_t cur_idx = iso_tr_idx[ci][ki];
-    uint8_t cur_cycle = iso_cycle[ci][ki];
-
-    for (uint8_t fi = 0; fi < n_frames; fi++) {
-        uint16_t flen = xhci_iso_ctx[ci][ki].frame_lens[fi];
-        uint16_t foffset = xhci_iso_ctx[ci][ki].frame_offsets[fi];
-        uint64_t buf_phys = virt_to_phys((uint8_t *)data + foffset);
-
-        memset(&tr_ring[cur_idx], 0, sizeof(struct xhci_trb));
-        CACHE_FLUSH(&tr_ring[cur_idx]);
-        FULL_BARRIER();
-
-        tr_ring[cur_idx].param = buf_phys;
-        tr_ring[cur_idx].status = (uint32_t)flen;
-        COMPILER_BARRIER();
-
-        tr_ring[cur_idx].control = (uint32_t)cur_cycle
-        | (1u << 5)
-        | (TRB_TYPE_ISOCH << 10);
-        STORE_BARRIER();
-        CACHE_FLUSH(&tr_ring[cur_idx]);
-        FULL_BARRIER();
-
-        uint32_t nxt = cur_idx + 1u;
-        if (nxt >= (uint32_t)(TRB_RING_SIZE - 1)) {
-            tr_ring[TRB_RING_SIZE - 1].control =
-            (TRB_TYPE_LINK << 10) | (1u << 1) | (uint32_t)cur_cycle;
-            CACHE_FLUSH(&tr_ring[TRB_RING_SIZE - 1]);
-            FULL_BARRIER();
-            cur_idx = 0;
-            cur_cycle = cur_cycle ^ 1u;
-        } else {
-            cur_idx = nxt;
-        }
-    }
-
-    iso_tr_idx[ci][ki] = cur_idx;
-    iso_cycle[ci][ki] = cur_cycle;
-
-    FULL_BARRIER();
-    wr32(x->db_base, (uint32_t)slot_id * 4u, (uint32_t)dci);
-    (void)rd32(x->db_base, (uint32_t)slot_id * 4u);
-    FULL_BARRIER();
-
-    xhci_iso_ctx[ci][ki].active = 1;
-    xhci_iso_ctx[ci][ki].n_frames = n_frames;
-    xhci_iso_ctx[ci][ki].frames_done = 0;
-    xhci_iso_ctx[ci][ki].slot_id = slot_id;
-    xhci_iso_ctx[ci][ki].endpoint = endpoint;
-    xhci_iso_ctx[ci][ki].data = data;
-    xhci_iso_ctx[ci][ki].cookie = NULL;
-
-    return 0;
+    return NULL;
 }
 
-static int xhci_iso_transfer(struct xhci_controller *x, uint8_t slot_id, uint8_t endpoint, void *data, uint16_t total_len, uint8_t n_frames, const uint16_t *frame_lens, uint8_t direction)
-{
-    if (!x) return -1;
+static void xhci_iso_finish_entry(xhci_iso_ep_t *e, uint16_t actual, bool error) {
+    xhci_iso_slot_entry *en = &e->fifo[e->fifo_tail];
+    struct usb_iso_request *req = en->req;
+    e->fifo_tail = (uint16_t)((e->fifo_tail + 1) % XHCI_ISO_FIFO);
+    if (e->pending) e->pending--;
+    if (!req) return;
+    if (en->pkt < req->n_packets) {
+        if (actual > req->lens[en->pkt]) actual = req->lens[en->pkt];
+        req->actual[en->pkt] = error ? 0 : actual;
+    }
+    if (error) req->errors++;
+    req->completed++;
+    if (req->completed >= req->n_packets) {
+        if (e->endpoint & 0x80u) {
+            for (uint64_t a = (uint64_t)req->data; a < (uint64_t)req->data + req->length; a += 64)
+                CACHE_FLUSH((void *)a);
+            FULL_BARRIER();
+        }
+        req->queued = 0;
+        req->done = 1;
+    }
+}
+
+static void xhci_iso_cancel_all(xhci_iso_ep_t *e) {
+    while (e->fifo_tail != e->fifo_head) {
+        xhci_iso_slot_entry *en = &e->fifo[e->fifo_tail];
+        struct usb_iso_request *req = en->req;
+        e->fifo_tail = (uint16_t)((e->fifo_tail + 1) % XHCI_ISO_FIFO);
+        if (req && !req->done) {
+            req->status = USB_ISO_CANCELLED;
+            req->queued = 0;
+            req->done = 1;
+        }
+    }
+    e->pending = 0;
+}
+
+static bool xhci_iso_event(struct xhci_controller *x, uint8_t slot_id, uint8_t dci, uint8_t code, uint32_t residual, uint64_t trb_ptr) {
+    xhci_iso_ep_t *e = xhci_iso_find(x, slot_id, dci);
+    if (!e) return false;
+    if (code == 14 || code == 15) return true;
+    if (code == 23) e->missed++;
+
+    int ci = (int)(x - ctrls);
+    int ei = (int)(e - xhci_iso_eps[ci]);
+    uint64_t ring_phys = virt_to_phys(xhci_mem[ci].iso_rings[ei]);
+    if (trb_ptr < ring_phys || trb_ptr >= ring_phys + sizeof(struct xhci_trb) * XHCI_ISO_RING_TRBS) return true;
+    uint16_t idx = (uint16_t)((trb_ptr - ring_phys) / sizeof(struct xhci_trb));
+
+    bool found = false;
+    for (uint16_t k = e->fifo_tail; k != e->fifo_head; k = (uint16_t)((k + 1) % XHCI_ISO_FIFO))
+        if (e->fifo[k].trb == idx) { found = true; break; }
+    if (!found) return true;
+
+    while (e->fifo_tail != e->fifo_head && e->fifo[e->fifo_tail].trb != idx) {
+        xhci_iso_slot_entry *en = &e->fifo[e->fifo_tail];
+        uint16_t len = (en->req && en->pkt < en->req->n_packets) ? en->req->lens[en->pkt] : 0;
+        xhci_iso_finish_entry(e, len, false);
+    }
+    xhci_iso_slot_entry *en = &e->fifo[e->fifo_tail];
+    uint16_t len = (en->req && en->pkt < en->req->n_packets) ? en->req->lens[en->pkt] : 0;
+    bool ok = (code == 1 || code == 13);
+    if (!ok) e->errors++;
+    uint16_t actual = ok ? (uint16_t)(residual >= len ? 0 : len - residual) : 0;
+    xhci_iso_finish_entry(e, actual, !ok);
+    return true;
+}
+
+static void xhci_iso_release_slot(struct xhci_controller *x, uint8_t slot_id) {
+    int ci = (int)(x - ctrls);
+    if (ci < 0 || ci >= MAX_XHCI_CONTROLLERS) return;
+    for (int i = 0; i < XHCI_ISO_EPS; i++) {
+        xhci_iso_ep_t *e = &xhci_iso_eps[ci][i];
+        if (!e->in_use || e->slot_id != slot_id) continue;
+        xhci_iso_cancel_all(e);
+        e->in_use = 0;
+        e->configured = 0;
+    }
+}
+
+static struct xhci_controller *xhci_of(struct usb_device *dev) {
+    if (!dev || !dev->ctrl || dev->ctrl->type != USB_TYPE_XHCI) return NULL;
+    struct xhci_controller *x = (struct xhci_controller *)dev->ctrl;
+    if (!x->initialized || dev->address == 0 || dev->address > x->max_slots) return NULL;
+    return x;
+}
+
+static int xhci_iso_open_impl(struct xhci_controller *x, struct usb_device *dev, const struct usb_endpoint_info *ep) {
+    int ci = (int)(x - ctrls);
+    uint8_t slot_id = (uint8_t)dev->address;
+    uint8_t is_in = (ep->address & 0x80u) ? 1u : 0u;
+    uint8_t dci = (uint8_t)(((ep->address & 0x0Fu) * 2u) + is_in);
+    if (dci < 2 || dci > 31) return USB_ISO_ERR;
+
+    uint16_t mps = ep->max_packet_size & 0x7FFu;
+    uint8_t mult = (uint8_t)((ep->max_packet_size >> 11) & 3u);
+    uint8_t interval = ep->interval ? ep->interval : 1u;
+    if (!mps) return USB_ISO_ERR;
+
+    xhci_iso_ep_t *e = xhci_iso_find(x, slot_id, dci);
+    if (!e) {
+        for (int i = 0; i < XHCI_ISO_EPS; i++) {
+            if (!xhci_iso_eps[ci][i].in_use) { e = &xhci_iso_eps[ci][i]; break; }
+        }
+        if (!e) return USB_ISO_BUSY;
+        memset(e, 0, sizeof(*e));
+        e->in_use = 1;
+        e->slot_id = slot_id;
+        e->dci = dci;
+    }
+    if (e->configured && e->mps == mps && e->mult == mult && e->interval == interval && e->pending == 0) return USB_ISO_OK;
+
+    xhci_iso_cancel_all(e);
+    int ei = (int)(e - xhci_iso_eps[ci]);
+    uint8_t flags = e->configured ? XHCI_CFG_EP_READD : 0u;
+    e->configured = 0;
+    if (xhci_configure_endpoint_ex(x, slot_id, dci, is_in ? EP_TYPE_ISO_IN : EP_TYPE_ISO_OUT, mps, interval,
+                                   xhci_mem[ci].iso_rings[ei], mult, flags) != 0) {
+        e->in_use = 0;
+        return USB_ISO_ERR;
+    }
+    uint32_t st = rd32(x->op_base, XHCI_OP_USBSTS);
+    if (st & (1u << 3)) wr32(x->op_base, XHCI_OP_USBSTS, (1u << 3));
+    wr32(x->rt_base, 0x20, rd32(x->rt_base, 0x20) | 3u);
+    FULL_BARRIER();
+
+    e->configured = 1;
+    e->endpoint = ep->address;
+    e->mps = mps;
+    e->mult = mult;
+    e->interval = interval;
+    e->enq = 0;
+    e->cycle = 1;
+    e->pending = 0;
+    e->fifo_head = e->fifo_tail = 0;
+    LOG_DEBUG("slot %u ep 0x%02x: isochronous ring %d ready (mps %u x%u, interval %u)", (unsigned)slot_id,
+              (unsigned)ep->address, ei, (unsigned)mps, (unsigned)(mult + 1), (unsigned)interval);
+    return USB_ISO_OK;
+}
+
+static int xhci_iso_open(struct usb_device *dev, const struct usb_endpoint_info *ep) {
+    struct xhci_controller *x = xhci_of(dev);
+    if (!x || !ep) return USB_ISO_ERR;
     xhci_ctrl_enter(x);
-    int ret = xhci_iso_transfer_impl(x, slot_id, endpoint, data, total_len, n_frames, frame_lens, direction);
+    int r = xhci_iso_open_impl(x, dev, ep);
     xhci_ctrl_leave(x);
-    return ret;
+    return r;
+}
+
+static int xhci_iso_submit_impl(struct xhci_controller *x, struct usb_device *dev, struct usb_iso_request *req) {
+    int ci = (int)(x - ctrls);
+    uint8_t is_in = (req->endpoint & 0x80u) ? 1u : 0u;
+    uint8_t dci = (uint8_t)(((req->endpoint & 0x0Fu) * 2u) + is_in);
+    xhci_iso_ep_t *e = xhci_iso_find(x, (uint8_t)dev->address, dci);
+    if (!e || !e->configured) return USB_ISO_ERR;
+
+    uint16_t n = req->n_packets;
+    if ((uint32_t)e->pending + n > (uint32_t)(XHCI_ISO_RING_TRBS - 16)) {
+        xhci_poll_event_ring(x);
+        if ((uint32_t)e->pending + n > (uint32_t)(XHCI_ISO_RING_TRBS - 16)) return USB_ISO_BUSY;
+    }
+
+    int ei = (int)(e - xhci_iso_eps[ci]);
+    struct xhci_trb *ring = xhci_mem[ci].iso_rings[ei];
+
+    if (!is_in) {
+        for (uint64_t a = (uint64_t)req->data; a < (uint64_t)req->data + req->length; a += 64)
+            CACHE_FLUSH((void *)a);
+    }
+    FULL_BARRIER();
+
+    req->queued = 1;
+    uint16_t cur = e->enq;
+    uint8_t cyc = e->cycle;
+    uint16_t mps = e->mps ? e->mps : 1u;
+
+    for (uint16_t i = 0; i < n; i++) {
+        uint32_t len = req->lens[i];
+        uint32_t tdpc = (len + mps - 1u) / mps;
+        if (tdpc == 0) tdpc = 1;
+        uint32_t tlbpc = (tdpc - 1u) & 0xFu;
+
+        struct xhci_trb *t = &ring[cur];
+        t->param = virt_to_phys((uint8_t *)req->data + req->offsets[i]);
+        t->status = len & 0x1FFFFu;
+        COMPILER_BARRIER();
+        t->control = (uint32_t)cyc
+                   | (is_in ? (1u << 2) : 0u)
+                   | ((i == n - 1u) ? (1u << 5) : 0u)
+                   | (TRB_TYPE_ISOCH << 10)
+                   | (tlbpc << 16)
+                   | (1u << 31);
+        STORE_BARRIER();
+        CACHE_FLUSH(t);
+
+        xhci_iso_slot_entry *en = &e->fifo[e->fifo_head];
+        en->req = req;
+        en->pkt = i;
+        en->trb = cur;
+        e->fifo_head = (uint16_t)((e->fifo_head + 1) % XHCI_ISO_FIFO);
+        e->pending++;
+
+        cur++;
+        if (cur >= (uint16_t)(XHCI_ISO_RING_TRBS - 1)) {
+            ring[XHCI_ISO_RING_TRBS - 1].param = virt_to_phys(ring);
+            ring[XHCI_ISO_RING_TRBS - 1].status = 0;
+            ring[XHCI_ISO_RING_TRBS - 1].control = (TRB_TYPE_LINK << 10) | (1u << 1) | (uint32_t)cyc;
+            CACHE_FLUSH(&ring[XHCI_ISO_RING_TRBS - 1]);
+            cur = 0;
+            cyc ^= 1u;
+        }
+    }
+    e->enq = cur;
+    e->cycle = cyc;
+
+    FULL_BARRIER();
+    wr32(x->db_base, (uint32_t)dev->address * 4u, (uint32_t)dci);
+    (void)rd32(x->db_base, (uint32_t)dev->address * 4u);
+    FULL_BARRIER();
+    return USB_ISO_OK;
+}
+
+static int xhci_iso_submit(struct usb_device *dev, struct usb_iso_request *req) {
+    struct xhci_controller *x = xhci_of(dev);
+    if (!x || !req) return USB_ISO_ERR;
+    xhci_ctrl_enter(x);
+    int r = xhci_iso_submit_impl(x, dev, req);
+    xhci_ctrl_leave(x);
+    return r;
+}
+
+static void xhci_iso_poll(struct usb_device *dev) {
+    struct xhci_controller *x = xhci_of(dev);
+    if (!x) return;
+    xhci_poll_event_ring(x);
+}
+
+static void xhci_iso_close(struct usb_device *dev, uint8_t endpoint) {
+    struct xhci_controller *x = xhci_of(dev);
+    if (!x) return;
+    uint8_t is_in = (endpoint & 0x80u) ? 1u : 0u;
+    uint8_t dci = (uint8_t)(((endpoint & 0x0Fu) * 2u) + is_in);
+    xhci_ctrl_enter(x);
+    xhci_iso_ep_t *e = xhci_iso_find(x, (uint8_t)dev->address, dci);
+    if (e) {
+        if (e->configured) {
+            int ci = (int)(x - ctrls);
+            int ei = (int)(e - xhci_iso_eps[ci]);
+            xhci_configure_endpoint_ex(x, (uint8_t)dev->address, dci, is_in ? EP_TYPE_ISO_IN : EP_TYPE_ISO_OUT, e->mps,
+                                       e->interval, xhci_mem[ci].iso_rings[ei], e->mult, XHCI_CFG_EP_DROP);
+            xhci_poll_event_ring(x);
+        }
+        xhci_iso_cancel_all(e);
+        e->configured = 0;
+        e->in_use = 0;
+    }
+    xhci_ctrl_leave(x);
 }
 
 static int get_cnt(void) { return ctrl_count; }
@@ -2419,7 +2587,10 @@ struct xhci_driver xhci_driver_loaded = {
     .disable_slot = xhci_disable_slot,
     .interrupt_transfer = xhci_interrupt_transfer,
     .bulk_transfer = xhci_bulk_transfer,
-    .iso_transfer = xhci_iso_transfer,
+    .iso_open = xhci_iso_open,
+    .iso_submit = xhci_iso_submit,
+    .iso_poll = xhci_iso_poll,
+    .iso_close = xhci_iso_close,
     .control_transfer = xhci_control_transfer,
     .poll_event_ring = xhci_poll_event_ring,
     .reset_bulk_toggle = xhci_reset_bulk_toggle,

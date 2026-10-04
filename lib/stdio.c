@@ -11,6 +11,8 @@
 
 static spinlock_t stdio_out_lock = SPINLOCK_INIT;
 
+#define STDIO_MAX_FIELD 4096
+
 stdio_stream_t stdio_streams[STDIO_MAX_STREAMS] = {0};
 
 int stdio_register_stream(int index, void (*write_fn)(const char*, uint32_t), uint32_t default_color, uint32_t error_color, const char *name)
@@ -18,18 +20,22 @@ int stdio_register_stream(int index, void (*write_fn)(const char*, uint32_t), ui
     if (index < 0 || index >= STDIO_MAX_STREAMS) return -1;
     if (!write_fn) return -1;
 
+    uint64_t flags = spin_lock_irqsave(&stdio_out_lock);
     stdio_streams[index].write = write_fn;
     stdio_streams[index].default_color = default_color;
     stdio_streams[index].error_color = error_color;
     stdio_streams[index].name = name;
     stdio_streams[index].active = 1;
+    spin_unlock_irqrestore(&stdio_out_lock, flags);
     return index;
 }
 
 void stdio_unregister_stream(int index) {
     if (index < 0 || index >= STDIO_MAX_STREAMS) return;
+    uint64_t flags = spin_lock_irqsave(&stdio_out_lock);
     stdio_streams[index].active = 0;
     stdio_streams[index].write = 0;
+    spin_unlock_irqrestore(&stdio_out_lock, flags);
 }
 
 static void _video_write(const char *str, uint32_t color) {
@@ -105,7 +111,7 @@ typedef struct {
 
 static void _ctx_putc(_fmt_ctx *ctx, char c) {
     if (ctx->buf) {
-        if (ctx->cap == 0 || ctx->pos + 1 < ctx->cap) {
+        if (ctx->cap > 0 && ctx->pos + 1 < ctx->cap) {
             ctx->buf[ctx->pos] = c;
         }
     } else {
@@ -113,8 +119,9 @@ static void _ctx_putc(_fmt_ctx *ctx, char c) {
         char tmp[2] = { c, '\0' };
         if (ctx->stream >= 0 && ctx->stream < STDIO_MAX_STREAMS) {
             stdio_stream_t *st = &stdio_streams[ctx->stream];
-            if (st->active && st->write) {
-                st->write(tmp, ctx->color);
+            void (*write_fn)(const char*, uint32_t) = st->active ? st->write : 0;
+            if (write_fn) {
+                write_fn(tmp, ctx->color);
             }
         }
     }
@@ -129,8 +136,9 @@ static void _ctx_puts(_fmt_ctx *ctx, const char *s) {
     } else {
         if (ctx->stream >= 0 && ctx->stream < STDIO_MAX_STREAMS) {
             stdio_stream_t *st = &stdio_streams[ctx->stream];
-            if (st->active && st->write) {
-                st->write(s, ctx->color);
+            void (*write_fn)(const char*, uint32_t) = st->active ? st->write : 0;
+            if (write_fn) {
+                write_fn(s, ctx->color);
 
                 while (*s++) ctx->pos++;
             }
@@ -180,11 +188,13 @@ static int _vformat(_fmt_ctx *ctx, const char *fmt, va_list ap) {
         if (*fmt == '*') {
             width = va_arg(ap, int);
             if (width < 0) { left_align = 1; width = -width; }
+            if (width > STDIO_MAX_FIELD) width = STDIO_MAX_FIELD;
             has_width = 1;
             fmt++;
         } else {
             while (*fmt >= '0' && *fmt <= '9') {
                 width = width * 10 + (*fmt - '0');
+                if (width > STDIO_MAX_FIELD) width = STDIO_MAX_FIELD;
                 has_width = 1;
                 fmt++;
             }
@@ -197,10 +207,12 @@ static int _vformat(_fmt_ctx *ctx, const char *fmt, va_list ap) {
             if (*fmt == '*') {
                 precision = va_arg(ap, int);
                 if (precision < 0) precision = -1;
+                if (precision > STDIO_MAX_FIELD) precision = STDIO_MAX_FIELD;
                 fmt++;
             } else {
                 while (*fmt >= '0' && *fmt <= '9') {
                     precision = precision * 10 + (*fmt - '0');
+                    if (precision > STDIO_MAX_FIELD) precision = STDIO_MAX_FIELD;
                     fmt++;
                 }
             }
