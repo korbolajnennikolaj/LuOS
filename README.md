@@ -39,7 +39,7 @@ How reliable and stable each component is right now (scale: Bad < Normal < Good 
 | AHCI | Good |
 | USB MSC | Good |
 | ATA | Good (multi-sector PIO with SET MULTIPLE MODE, string I/O, per-device sector cache) |
-| HDA | Normal (QEMU; the >4 GiB DMA fix of 0.10.13 is not yet confirmed on real hardware) |
+| HDA | Good |
 | AC97 | Good (real hardware: Sony VAIO) |
 | USB Audio | Normal (UAC1 playback confirmed on real hardware; UAC2, capture and EHCI tested in QEMU) |
 
