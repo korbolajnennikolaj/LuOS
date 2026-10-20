@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "isr.h"
 
 #include "components/drivers.h"
@@ -5,8 +8,87 @@
 #include "components/logger.h"
 #include "components/panic.h"
 #include "kernel/scheduler/scheduler.h"
+#include "kernel/scheduler/spinlock.h"
+#include "kernel/proc/process.h"
+#include "components/Memory/vmm.h"
 
 static irq_handler_t s_irq_handlers[256];
+
+static struct {
+    irq_ctx_handler_t handler;
+    void *ctx;
+} s_ctx_handlers[256];
+
+static uint8_t s_dyn_used[256];
+static uint64_t s_vector_hits[256];
+static spinlock_t s_vector_lock = SPINLOCK_INIT;
+
+int irq_alloc_vector(void) {
+    int v = -1;
+    uint64_t flags = spin_lock_irqsave(&s_vector_lock);
+    for (int i = IRQ_VECTOR_DYN_BASE; i <= IRQ_VECTOR_DYN_LAST; i++) {
+        if (!s_dyn_used[i] && !s_irq_handlers[i] && !s_ctx_handlers[i].handler) {
+            s_dyn_used[i] = 1;
+            v = i;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&s_vector_lock, flags);
+    if (v < 0) LOG_WARNING("no free interrupt vectors in 0x%02x-0x%02x", IRQ_VECTOR_DYN_BASE, IRQ_VECTOR_DYN_LAST);
+    return v;
+}
+
+int irq_alloc_vectors(int count, int *out_vectors) {
+    int got = 0;
+    for (; got < count; got++) {
+        int v = irq_alloc_vector();
+        if (v < 0) break;
+        out_vectors[got] = v;
+    }
+    if (got < count) {
+        for (int i = 0; i < got; i++) irq_free_vector((uint8_t)out_vectors[i]);
+        return -1;
+    }
+    return 0;
+}
+
+void irq_free_vector(uint8_t vector) {
+    uint64_t flags = spin_lock_irqsave(&s_vector_lock);
+    s_ctx_handlers[vector].handler = (irq_ctx_handler_t)0;
+    s_ctx_handlers[vector].ctx = (void *)0;
+    s_dyn_used[vector] = 0;
+    spin_unlock_irqrestore(&s_vector_lock, flags);
+}
+
+int irq_register_ctx_handler(uint8_t vector, irq_ctx_handler_t handler, void *ctx) {
+    uint64_t flags = spin_lock_irqsave(&s_vector_lock);
+    if (s_ctx_handlers[vector].handler && s_ctx_handlers[vector].handler != handler) {
+        spin_unlock_irqrestore(&s_vector_lock, flags);
+        LOG_WARNING("vector 0x%02x already has a handler", (unsigned)vector);
+        return -1;
+    }
+    s_ctx_handlers[vector].ctx = ctx;
+    __atomic_store_n(&s_ctx_handlers[vector].handler, handler, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&s_vector_lock, flags);
+    return 0;
+}
+
+void irq_unregister_ctx_handler(uint8_t vector) {
+    uint64_t flags = spin_lock_irqsave(&s_vector_lock);
+    __atomic_store_n(&s_ctx_handlers[vector].handler, (irq_ctx_handler_t)0, __ATOMIC_RELEASE);
+    s_ctx_handlers[vector].ctx = (void *)0;
+    spin_unlock_irqrestore(&s_vector_lock, flags);
+}
+
+uint64_t irq_vector_hits(uint8_t vector) {
+    return __atomic_load_n(&s_vector_hits[vector], __ATOMIC_RELAXED);
+}
+
+int irq_dyn_vectors_used(void) {
+    int n = 0;
+    for (int i = IRQ_VECTOR_DYN_BASE; i <= IRQ_VECTOR_DYN_LAST; i++) n += s_dyn_used[i] ? 1 : 0;
+    return n;
+}
 
 void irq_register_handler(uint8_t vector, irq_handler_t handler) {
     if (s_irq_handlers[vector] && s_irq_handlers[vector] != handler)
@@ -39,16 +121,41 @@ extern void *scheduler_set_isr_fx(void *fx);
 
 static void isr_dispatch(struct registers *regs);
 
+static void isr_user_return_check(struct registers *regs, struct task *entry_task)
+{
+    if ((regs->cs & 3) != 3 || !entry_task || !entry_task->proc) return;
+    if (current_task() != entry_task) return;
+    proc_check_pending();
+}
+
+static volatile int s_isr_depth[MAX_CORES];
+
+int isr_in_interrupt(void)
+{
+    return s_isr_depth[current_core()] > 0;
+}
+
 void isr_handler(struct registers *regs, void *fx)
 {
     void *prev_fx = scheduler_set_isr_fx(fx);
+    struct task *entry_task = (regs->cs & 3) == 3 ? current_task() : NULL;
+    s_isr_depth[current_core()]++;
     isr_dispatch(regs);
+    s_isr_depth[current_core()]--;
     scheduler_set_isr_fx(prev_fx);
+    isr_user_return_check(regs, entry_task);
 }
 
 static void isr_dispatch(struct registers *regs)
 {
     uint64_t vec = regs->int_no;
+
+    if (vec == 14 && vmm_vmemmap_fault(read_cr2())) return;
+    if (vec == 14 && user_fault(regs, read_cr2())) return;
+    if (vec < 32 && (regs->cs & 3) == 3) {
+        user_exception(regs);
+        return;
+    }
 
     if (vec < 32) {
 
@@ -73,6 +180,7 @@ static void isr_dispatch(struct registers *regs)
         cpu_regs.rflags = regs->rflags;
         cpu_regs.cr2 = read_cr2();
         cpu_regs.cr3 = read_cr3();
+        cpu_regs.err_code = regs->err_code;
 
         enum panic_code code;
         const char *msg;
@@ -115,6 +223,15 @@ static void isr_dispatch(struct registers *regs)
         return;
     }
 
+    __atomic_fetch_add(&s_vector_hits[vec], 1, __ATOMIC_RELAXED);
+
+    irq_ctx_handler_t ctx_handler = __atomic_load_n(&s_ctx_handlers[vec].handler, __ATOMIC_ACQUIRE);
+    if (ctx_handler) {
+        ctx_handler(s_ctx_handlers[vec].ctx, regs);
+        apic_send_eoi();
+        return;
+    }
+
     if (vec >= MSI_VECTOR_XHCI_BASE && vec < MSI_VECTOR_MAX) {
 
         if (s_irq_handlers[vec]) {
@@ -136,7 +253,5 @@ static void isr_dispatch(struct registers *regs)
         }
     }
 
-    if (vec == 0x41) return;
-
-    apic_send_eoi();
+    if (vec != 0x41) apic_send_eoi();
 }

@@ -1,3 +1,8 @@
+LuOS is licensed under the MIT license below for the code written for LuOS itself.
+The Linux kernel code bundled under linux/upstream/ is GPL-2.0 and keeps its own
+license. See "Mixed licensing" at the bottom of this file for the exact split and
+an important warning about what happens when you compile everything.
+
 MIT License
 
 Copyright (c) 2026 korbolajnennikolaj
@@ -19,3 +24,46 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Mixed licensing
+================
+
+This project mixes two licenses at source level.
+
+LuOS code — MIT, the license above. Every file written for LuOS carries an
+"SPDX-License-Identifier: MIT" header. This covers:
+
+  src/                 LuOS kernel, components, drivers, filesystems, console and
+                       games (src/lua/ is the third-party Lua interpreter — see below)
+  include/ lib/        freestanding headers and the libc replacement
+  linux/kpi/           the LinuxKPI runtime written for LuOS
+                       (include/asm/agp.h is a verbatim Linux header and keeps GPL-2.0)
+  linux/gen/           generated KPI glue for the GPU drivers
+  linux/tools/         KPI build helpers (lkcc, lkadd, lkgen, kbuild-objs.mk)
+  linux/linux.mk, linux/sync-upstream.py, linux/verify-upstream.sh
+  userspace/           built-in filesystem builder (sysroot), the Mesa executor host
+                       (mesa), the DRM/KMS test programs (drm) and the ring-3 test
+                       programs (tests)
+  scripts/             linker script and build helpers
+  micropython/ports/luos/   the LuOS port of MicroPython
+  Makefile, unpack.py
+
+Linux code — GPL-2.0. linux/upstream/ is the Linux 6.18 kernel, taken verbatim;
+every file keeps its original copyright headers and SPDX identifiers.
+
+Third-party code — their own licenses, listed in THIRD_PARTY_LICENSES.md:
+
+  src/lua/             Lua (MIT)
+  micropython/         MicroPython (MIT), except ports/luos/ which is LuOS code
+
+Warning: the compiled kernel is GPL
+===================================
+
+The split above only exists at source level. LuOS compiles all of this code into a
+single kernel binary, and that binary is a derivative work of the GPL-2.0 Linux code
+in linux/upstream/. When you compile this project, the result as a whole becomes
+GPL-2.0: the MIT parts remain MIT as source, but the compiled image may only be
+redistributed under the terms of GPL-2.0. The mixing is possible because the MIT
+license is GPL-compatible. Keep the split in mind when you reuse anything: LuOS MIT
+files stay MIT wherever you copy them, while any binary that includes linux/upstream/
+code is a GPL-2.0 work.

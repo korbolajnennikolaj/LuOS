@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef GAMES_H
 #define GAMES_H
 

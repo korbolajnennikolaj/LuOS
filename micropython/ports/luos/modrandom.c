@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // modrandom.c — the "random" module for MicroPython on LuOS.
 //
 // There's nowhere to get a real /dev/urandom from here (no kernel

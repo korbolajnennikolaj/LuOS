@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef HDA_H
 #define HDA_H
 
@@ -336,6 +339,7 @@ typedef struct hda_codec_dev {
     uint64_t last_jack_ms;
     int8_t hp_present;
     uint8_t is_digital;
+    uint8_t all_outputs;
 } hda_codec_dev;
 
 typedef struct hda_controller {

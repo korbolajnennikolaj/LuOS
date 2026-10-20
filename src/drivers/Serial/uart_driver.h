@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef UART_DRIVER_H
 #define UART_DRIVER_H
 

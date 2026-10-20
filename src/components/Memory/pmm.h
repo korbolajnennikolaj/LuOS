@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef PMM_H
 #define PMM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,6 +16,8 @@
 #define PAGE_TO_PHYS(x) ((uint64_t)(x) << PAGE_SHIFT)
 
 void pmm_init(void);
+
+void pmm_reserve_range(uint64_t base, uint64_t length);
 
 uint64_t pmm_alloc_page(void);
 uint64_t pmm_alloc_pages(uint64_t count);
@@ -32,6 +38,13 @@ uint64_t pmm_get_free_memory(void);
 #define PMM_DMA32_POOL_PAGES 4096
 
 uint64_t pmm_alloc_pages_below(uint64_t count, uint64_t limit);
+
+uint64_t pmm_alloc_pages_aligned(uint64_t count, uint64_t align_pages, uint64_t limit);
+
+uint64_t pmm_highest_frame(void);
+int pmm_ram_range_count(void);
+int pmm_ram_range(int index, uint64_t *base, uint64_t *length);
+bool pmm_frame_is_ram(uint64_t frame);
 void pmm_dma32_pool_init(uint64_t pages);
 uint64_t pmm_alloc_dma32_pages(uint64_t count);
 void pmm_free_dma32_pages(uint64_t phys, uint64_t count);

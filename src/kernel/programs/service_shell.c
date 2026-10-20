@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "service_shell.h"
 
 #include "audio_player.h"
 #include "shell_audio.h"
+#include "shell_hw.h"
+#include "shell_proc.h"
 #include "service_root_fs.h"
 #include "service_keyboard_updater.h"
 #include "service_mouse_updater.h"
@@ -11,6 +16,8 @@
 
 #include "components/drivers.h"
 #include "components/logger.h"
+
+static void shell_term_print(const char *s, uint32_t color);
 #include "components/panic.h"
 #include "components/GDT/gdt.h"
 #include "drivers/Timer/timer.h"
@@ -19,6 +26,7 @@
 #include "drivers/Timer/hpet_driver.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Input/mouse_driver.h"
+#include "drivers/GPU/mesa.h"
 #include "drivers/Serial/uart_driver.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "components/pci.h"
@@ -36,6 +44,7 @@
 #include "components/Memory/pmm.h"
 #include "components/Memory/vmm.h"
 #include "components/Memory/heap.h"
+#include "kernel/proc/initfs.h"
 #include "components/ACPI/acpi.h"
 #include "components/ACPI/power.h"
 #include "components/ACPI/hpet_acpi.h"
@@ -583,6 +592,31 @@ static const luaL_Reg kernel_lib[] = {
     { NULL, NULL }
 };
 
+
+#define HELP_COL1 44
+
+void help_row(uint32_t color, const char *left, const char *right);
+void help_section(const char *title);
+void luos_register_gpu_libs(lua_State *L);
+
+void help_row(uint32_t color, const char *left, const char *right) {
+    if (!right || !*right) {
+        printf_color(color, "  %s\n", left);
+        return;
+    }
+    size_t len = strlen(left);
+    if (len >= HELP_COL1) {
+        printf_color(color, "  %s\n", left);
+        printf_color(color, "  %*s%s\n", HELP_COL1 + 2, "", right);
+        return;
+    }
+    printf_color(color, "  %-*s%s\n", HELP_COL1, left, right);
+}
+
+void help_section(const char *title) {
+    printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- %s --\n", title);
+}
+
 static void luos_register_kernel_lib(lua_State *L) {
     lua_newtable(L);
 
@@ -896,7 +930,7 @@ static void cmd_lua_repl(struct limine_video_driver* video, struct keyboard_driv
 
     char line[512];
     while (1) {
-        kbd->input("lua> ", line, 512, LIMINE_COLOR_LIGHT_GREEN, video->printf);
+        kbd->input("lua> ", line, 512, LIMINE_COLOR_LIGHT_GREEN, shell_term_print);
 
         if (str_cmp(line, "exit") == 0 || str_cmp(line, "quit") == 0) {
             printf_color(LIMINE_COLOR_LIGHT_GRAY, "Leaving Lua REPL.\n\n");
@@ -947,7 +981,7 @@ static void cmd_python_repl(struct limine_video_driver* video, struct keyboard_d
 
     char line[512];
     while (1) {
-        kbd->input("py> ", line, 512, LIMINE_COLOR_LIGHT_GREEN, video->printf);
+        kbd->input("py> ", line, 512, LIMINE_COLOR_LIGHT_GREEN, shell_term_print);
 
         if (str_cmp(line, "exit") == 0 || str_cmp(line, "quit") == 0) {
             printf_color(LIMINE_COLOR_LIGHT_GRAY, "Leaving Python REPL.\n\n");
@@ -2960,6 +2994,14 @@ static void cmd_fastfetch(struct limine_video_driver* video) {
     printf_color(c_white, "%lu MB / %lu MB\n", p_used / 256, p_total / 256);
     printf_color(c_logo, "  |___/     "); printf_color(c_label, "Heap:    ");
     printf_color(c_white, "%lu%% used (%lu MB)\n", h_perc, h_total / (1024 * 1024));
+    if (initfs_present()) {
+        uint32_t ifs_entries;
+        uint64_t ifs_image, ifs_files, ifs_cached;
+        initfs_stats(&ifs_entries, &ifs_image, &ifs_files, &ifs_cached);
+        printf_color(c_logo, "            "); printf_color(c_label, "Initfs:  ");
+        printf_color(c_white, "%llu MB unpacked of %llu MB\n", (unsigned long long)(ifs_cached >> 20),
+                     (unsigned long long)(ifs_files >> 20));
+    }
     printf_color(c_logo, "            "); printf_color(c_label, "Lua:     ");
     printf_color(g_lua ? c_white : 0xFFFF5555, g_lua ? LUA_VERSION " active\n" : "not loaded\n");
     printf_color(c_logo, "            "); printf_color(c_label, "Python:  ");
@@ -3000,6 +3042,12 @@ static void cmd_fastfetch(struct limine_video_driver* video) {
 
 static volatile bool shell_ready = false;
 
+static void shell_term_print(const char *s, uint32_t color) {
+    struct limine_video_driver* video = g_bind_video;
+    if (video && video->printf) video->printf(s, color);
+    logger_console_mirror(s);
+}
+
 static void shell_entry(void *arg) {
     (void)arg;
 
@@ -3023,9 +3071,11 @@ static void shell_entry(void *arg) {
     g_bind_pit = pit;
     g_bind_tsc = tsc;
     mp_kernel_bind(video, rtc, pit, tsc);
+    mesa_start_async();
 
     if (g_lua) {
         luos_register_kernel_lib(g_lua);
+    luos_register_gpu_libs(g_lua);
     }
 
     session_start_tsc = tsc ? tsc->get_tsc_ms() : 0;
@@ -3082,7 +3132,7 @@ static void shell_entry(void *arg) {
                         : "failed to init\n",
                   g_lua ? LIMINE_COLOR_LIGHT_GREEN : LIMINE_COLOR_LIGHT_RED);
 
-    char cmd_buffer[128];
+    char cmd_buffer[512];
 
     cmd_fastfetch(video);
     acpi_print_summary();
@@ -3090,82 +3140,86 @@ static void shell_entry(void *arg) {
     shell_ready = true;
 
     while (!service_stop_requested(svc->id)) {
-        kbd->input("luos # ", cmd_buffer, 128, LIMINE_COLOR_LIGHT_CYAN, video->printf);
+        kbd->input("luos # ", cmd_buffer, sizeof(cmd_buffer), LIMINE_COLOR_LIGHT_CYAN, shell_term_print);
 
         if (str_cmp(cmd_buffer, "help") == 0) {
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "-- General --\n");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "help          - this help", "clear         - clear screen");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "ram           - memory/heap info", "time          - current time");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "cpu           - CPU information", "pci           - PCI devices");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "usb-list      - USB devices", "disks         - block devices");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "partitions    - partition tables", "usb-debug on|off - USB MSC command trace");
+            help_section("General");
+            help_row(LIMINE_COLOR_AMBER, "help", "clear - clear screen");
+            help_row(LIMINE_COLOR_AMBER, "ram - memory/heap info", "time - current time");
+            help_row(LIMINE_COLOR_AMBER, "cpu - CPU information", "pci - PCI devices");
+            help_row(LIMINE_COLOR_AMBER, "usb-list - USB devices", "disks - block devices");
+            help_row(LIMINE_COLOR_AMBER, "partitions - partition tables", "usb-debug on|off - USB MSC trace");
 
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Filesystem --\n");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "mount NAME [POINT] - mount disk to POINT (default /)", "umount [POINT] - unmount POINT");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "mounts        - list mount points", "usb-rescan    - full USB re-enumeration");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "ls [PATH]     - list directory", "cd PATH       - change directory");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "pwd           - print cwd", "mkdir PATH    - create directory");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "rmdir PATH    - remove empty dir", "rm PATH       - delete file");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "cat PATH      - print contents", "touch PATH    - create empty file");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "stat PATH     - name/type/size", "partitions    - disk partition tables");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "fs-test [DIR] - filesystem self-test", "fs-sum [DIR]  - CRC32 of every file");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "mount ramfs POINT - in-memory filesystem", "mkfs TYPE NAME [LABEL] - format disk");
-            printf_color(LIMINE_COLOR_LIGHT_GREEN, "%-46s %-40s\n", "  TYPE: fat, fat12, fat16, fat32, exfat", "");
+            help_section("Filesystem");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "mount NAME [POINT] - mount disk", "umount [POINT] - unmount");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "mounts - list mount points", "usb-rescan - USB re-enumeration");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "ls [PATH] - list directory", "cd PATH - change directory");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "pwd - print cwd", "mkdir PATH - create directory");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "rmdir PATH - remove empty dir", "rm PATH - delete file");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "cat PATH - print contents", "touch PATH - create empty file");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "stat PATH - name/type/size", "fs-test [DIR] - self-test");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "fs-sum [DIR] - CRC32 of every file", "mkfs TYPE NAME [LABEL] - format");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "mount ramfs POINT - in-memory fs", "  TYPE: fat fat12 fat16 fat32 exfat");
 
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Hardware / Input --\n");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "usb           - USB controllers", "usb-ports     - root hub ports");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "kbd-test      - keyboard test", "mouse-test    - mouse test (5s)");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "mouse         - live cursor/buttons from mouse service", "");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "hid-test      - kbd+mouse test (15s)", "hpet          - HPET info/self-test");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "scheduler-test [cores] [tasks] [iters] - scheduler/multitask test", "guess-game    - guess the number");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "ps            - tasks, MLFQ levels, per-core load", "scheduler-fair - starvation/fairness demo");
+            help_section("Hardware / Input");
+            help_row(LIMINE_COLOR_AMBER, "usb - USB controllers", "usb-ports - root hub ports");
+            help_row(LIMINE_COLOR_AMBER, "kbd-test - keyboard test", "mouse-test - mouse test (5s)");
+            help_row(LIMINE_COLOR_AMBER, "mouse - live cursor/buttons", "hid-test - kbd+mouse test (15s)");
+            help_row(LIMINE_COLOR_AMBER, "hpet - HPET info/self-test", "ps - tasks, MLFQ, load");
+            help_row(LIMINE_COLOR_AMBER, "scheduler-test [cores] [tasks] [iters]", "scheduler-fair - fairness demo");
+            help_row(LIMINE_COLOR_AMBER, "guess-game - guess the number", "");
 
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Lua / Python --\n");
-            printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "lua-test      - Lua test suite", "lua-kernel-test - kernel.* bindings");
-            printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "lua           - Lua REPL", "lua-run CODE  - run one line of Lua");
-            printf_color(LIMINE_COLOR_LIGHT_MAGENTA, "%-46s %-40s\n", "python (py)   - MicroPython REPL", "python-run CODE - run one line");
-            printf_color(LIMINE_COLOR_LIGHT_MAGENTA, "%-46s %-40s\n", "python-test   - Python test suite", "python-kernel-test - kernel.* bind.");
-            printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "lua-file F    - run a .lua file from /", "python-file F - run a .py file from /");
-            printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "run FILE      - run .lua or .py by extension", "lua-io-test   - io.read() keyboard test");
+            help_section("GPU (real Mesa OpenGL + Vulkan in the kernel)");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-init [PATH] - start GPU stack (fw)", "gpu-reinit [PATH] - restart it");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-devs / gpu-info [N] - cards", "gpu-drivers - DRM drivers");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-prime [llvm|N|auto] - render device", "gpu-mesa - translator + renderer");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "kmscube [SEC DEV MON WxH] - GL cube", "vkkmv [SEC DEV MON WxH] - Vulkan cube");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "glxgears [SEC DEV MON WxH] - GL gears", "gpu-shader [gl|vk] - shader self test");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-test - batch + DRM self test", "gpu-api - command surface");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-intel - old Intel iGPU scan/bind", "gpu-bind/unbind BDF|N - driver");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-mons - monitors", "gpu-mon-on/off/mode/modes/bright");
+            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-mon-move N X Y - position", "gpu-bright [N VALUE] - backlight");
 
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Timers / Misc --\n");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "sleep N       - sleep ms (APIC)", "sleepRTC N    - sleep sec (RTC)");
+            help_section("Lua / Python (gl.* vk.* gpu.* registered)");
+            help_row(LIMINE_COLOR_CYAN, "lua - Lua REPL", "lua-run CODE - run one line");
+            help_row(LIMINE_COLOR_CYAN, "lua-file F - run a .lua file", "lua-test / lua-kernel-test");
+            help_row(LIMINE_COLOR_LIGHT_MAGENTA, "python (py) - MicroPython REPL", "python-run CODE - run one line");
+            help_row(LIMINE_COLOR_LIGHT_MAGENTA, "python-file F - run a .py file", "python-test / python-kernel-test");
+            help_row(LIMINE_COLOR_CYAN, "run FILE - run .lua or .py by ext", "lua-io-test - io.read() test");
 
+            help_section("Timers / Misc");
+            help_row(LIMINE_COLOR_AMBER, "sleep N - sleep ms (APIC)", "sleepRTC N - sleep seconds");
             if (tsc)
-                printf_color(LIMINE_COLOR_AMBER, "%-46s", "sleepTSC N    - sleep ms (TSC)");
-
+                help_row(LIMINE_COLOR_AMBER, "sleepTSC N - sleep ms (TSC)", "");
             if (pit)
-                printf_color(LIMINE_COLOR_AMBER, "%-46s", " sleepPIT N    - sleep ms (PIT)");
-
-            if (tsc || pit)
-                printf_color(LIMINE_COLOR_AMBER, "\n");
-
+                help_row(LIMINE_COLOR_AMBER, "sleepPIT N - sleep ms (PIT)", "");
             if (hpet && hpet->is_hpet_available())
-                printf_color(LIMINE_COLOR_AMBER, "%-46s\n", "sleepHPET N   - sleep ms (HPET)");
+                help_row(LIMINE_COLOR_AMBER, "sleepHPET N - sleep ms (HPET)", "");
+            help_row(LIMINE_COLOR_AMBER, "allocate N - leak test", "math-test - math diagnostics");
+            help_row(LIMINE_COLOR_AMBER, "libc-test - libc diagnostics", "fastfetch - system info");
+            help_row(LIMINE_COLOR_AMBER, "repeat N TEXT - repeat TEXT N times", "");
 
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "allocate N    - leak test", "math-test     - math diagnostics");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "libc-test     - libc diagnostics", "fastfetch     - system info");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "repeat N TEXT - repeat TEXT N times", "pasha         - special message");
+            help_section("Games");
+            help_row(LIMINE_COLOR_AMBER, "snake-game - snake", "bird-game - flappy bird");
+            help_row(LIMINE_COLOR_AMBER, "race-game - race game", "rps-game - rock-paper-scissors");
+            help_row(LIMINE_COLOR_AMBER, "pong-game - ping pong", "arco-game - arkanoid");
+            help_row(LIMINE_COLOR_AMBER, "tetris-game - tetris", "2048-game - 2048");
+            help_row(LIMINE_COLOR_AMBER, "3d-cube [W H] - wireframe shapes", "");
 
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Games --\n");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "snake-game    - snake", "bird-game     - flappy bird");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "race-game     - race game", "rps-game      - rock-paper-scissors");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "pong-game     - ping pong", "arco-game     - arkanoid");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "tetris-game   - tetris", "2048-game     - 2048");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "3d-cube [W H] - spinning wireframe shapes (W,H = pixels)", "reboot        - reboot system");
-
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Power / Debug --\n");
-
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "poweroff      - shutdown system", "debug         - debug menu");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log           - logger status and levels", "dmesg [N]     - kernel log (last N lines)");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log-dump [FILE] - save kernel log to FILE.txt", "log-clear     - clear the log buffer");
-            printf_color(LIMINE_COLOR_AMBER, "%-46s %-40s\n", "log-level [buffer|uart|video] LEVEL", "panic [MSG]   - trigger a kernel panic");
+            help_section("Power / Debug");
+            help_row(LIMINE_COLOR_AMBER, "poweroff - shutdown", "reboot - restart system");
+            help_row(LIMINE_COLOR_AMBER, "debug - debug menu", "panic [MSG] - kernel panic");
+            help_row(LIMINE_COLOR_AMBER, "log - logger status", "dmesg [N] - kernel log");
+            help_row(LIMINE_COLOR_AMBER, "log-dump [FILE] - log to FILE.txt", "log-clear - clear the log");
+            help_row(LIMINE_COLOR_AMBER, "log-level [buffer|uart|video] LEVEL", "");
 
             shell_audio_help();
+            shell_hw_help();
+            shell_proc_help();
 
-            printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Services --\n");
-            printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "services      - service table", "service-start NAME - start service");
-            printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "service-stop NAME  - stop service", "service-restart NAME - restart service");
+            help_section("Services");
+            help_row(LIMINE_COLOR_CYAN, "services - service table", "service-start NAME - start");
+            help_row(LIMINE_COLOR_CYAN, "service-stop NAME - stop", "service-restart NAME - restart");
         }
         else if (str_cmp(cmd_buffer, "clear") == 0) {
             video->clear(LIMINE_COLOR_BLACK);
@@ -3402,6 +3456,8 @@ static void shell_entry(void *arg) {
             panic(&info);
         }
         else if (shell_audio_command(cmd_buffer)) { }
+        else if (shell_hw_command(cmd_buffer)) { }
+        else if (shell_proc_command(cmd_buffer)) { }
         else if (cmd_buffer[0] != '\0') {
             video->printf("Unknown command. Type 'help' for list.\n", LIMINE_COLOR_LIGHT_RED);
         }

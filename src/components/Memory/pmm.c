@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "pmm.h"
 
 #include "components/logger.h"
@@ -72,6 +75,18 @@ static void _pmm_reserve_region(uint64_t base, uint64_t length) {
             if (pmm_free > 0) pmm_free--;
         }
     }
+}
+
+void pmm_reserve_range(uint64_t base, uint64_t length) {
+    uint64_t before = pmm_free;
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    _pmm_reserve_region(base, length);
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    if (pmm_free < before)
+        LOG_INFO("pmm: reserved 0x%016llx-0x%016llx (%llu KiB) for hardware",
+                  (unsigned long long)PAGE_ALIGN_DOWN(base),
+                  (unsigned long long)(PAGE_ALIGN(base + length) - 1),
+                  (unsigned long long)((before - pmm_free) * PAGE_SIZE / 1024));
 }
 
 void pmm_init(void) {
@@ -217,6 +232,82 @@ static uint64_t pmm_alloc_run_locked(uint64_t count, uint64_t limit_frame) {
         }
     }
     return PMM_ALLOC_FAIL;
+}
+
+static uint64_t pmm_alloc_aligned_locked(uint64_t count, uint64_t align, uint64_t limit_frame) {
+    uint64_t end = pmm_total < limit_frame ? pmm_total : limit_frame;
+    if (align == 0) align = 1;
+
+    uint64_t frame = align;
+    while (frame + count <= end) {
+        uint64_t run = 0;
+        while (run < count && !_bitmap_test(frame + run)) run++;
+        if (run == count) {
+            for (uint64_t i = frame; i < frame + count; i++) _bitmap_set(i);
+            pmm_free -= count;
+            return PAGE_TO_PHYS(frame);
+        }
+        uint64_t next = frame + run + 1;
+        frame = (next + align - 1) / align * align;
+    }
+    return PMM_ALLOC_FAIL;
+}
+
+uint64_t pmm_alloc_pages_aligned(uint64_t count, uint64_t align_pages, uint64_t limit) {
+    if (!pmm_bitmap || count == 0 || pmm_free < count) return PMM_ALLOC_FAIL;
+    uint64_t limit_frame = limit ? PHYS_TO_PAGE(limit) : ~0ULL;
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
+    uint64_t p = pmm_alloc_aligned_locked(count, align_pages, limit_frame);
+    spin_unlock_irqrestore(&pmm_lock, flags);
+    return p;
+}
+
+uint64_t pmm_highest_frame(void) { return pmm_total; }
+
+int pmm_ram_range_count(void) {
+    struct limine_memmap_response *mm = memmap_req.response;
+    if (!mm) return 0;
+    int n = 0;
+    for (uint64_t i = 0; i < mm->entry_count; i++) {
+        uint64_t t = mm->entries[i]->type;
+        if (t == LIMINE_MEMMAP_USABLE || t == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE ||
+            t == LIMINE_MEMMAP_ACPI_RECLAIMABLE || t == LIMINE_MEMMAP_KERNEL_AND_MODULES)
+            n++;
+    }
+    return n;
+}
+
+int pmm_ram_range(int index, uint64_t *base, uint64_t *length) {
+    struct limine_memmap_response *mm = memmap_req.response;
+    if (!mm) return -1;
+    int n = 0;
+    for (uint64_t i = 0; i < mm->entry_count; i++) {
+        struct limine_memmap_entry *e = mm->entries[i];
+        uint64_t t = e->type;
+        if (t != LIMINE_MEMMAP_USABLE && t != LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE &&
+            t != LIMINE_MEMMAP_ACPI_RECLAIMABLE && t != LIMINE_MEMMAP_KERNEL_AND_MODULES)
+            continue;
+        if (n++ == index) {
+            *base = e->base;
+            *length = e->length;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+bool pmm_frame_is_ram(uint64_t frame) {
+    struct limine_memmap_response *mm = memmap_req.response;
+    if (!mm) return false;
+    uint64_t addr = PAGE_TO_PHYS(frame);
+    for (uint64_t i = 0; i < mm->entry_count; i++) {
+        struct limine_memmap_entry *e = mm->entries[i];
+        if (addr < e->base || addr >= e->base + e->length) continue;
+        uint64_t t = e->type;
+        return t == LIMINE_MEMMAP_USABLE || t == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE ||
+               t == LIMINE_MEMMAP_ACPI_RECLAIMABLE || t == LIMINE_MEMMAP_KERNEL_AND_MODULES;
+    }
+    return false;
 }
 
 uint64_t pmm_alloc_pages_below(uint64_t count, uint64_t limit) {

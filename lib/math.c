@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #pragma GCC target("sse2")
 
 #include <math.h>
@@ -541,9 +544,6 @@ double fma(double x, double y, double z) {
     return x * y + z;
 }
 
-// POSIX double nan(const char *tagp) — the NaN payload tag isn't
-// supported here (not needed by MicroPython's number parser, which
-// calls nan("")); we just return a "quiet" NaN.
 double nan(const char *tagp) {
     (void)tagp;
     return NAN;

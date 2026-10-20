@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef XHCI_H
 #define XHCI_H
 #include "kernel/scheduler/spinlock.h"

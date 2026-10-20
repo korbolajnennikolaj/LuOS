@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "drivers/Audio/audio_quirks.h"
 
 #define HDAC_NAME(_v, _d, _model) \

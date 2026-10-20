@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // modos.c — the "os" module for MicroPython on LuOS.
 //
 // Wired directly to the kernel's single root filesystem mount (see

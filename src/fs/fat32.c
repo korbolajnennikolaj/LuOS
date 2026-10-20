@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "fs/fat32.h"
 
 #include "components/logger.h"
@@ -211,19 +214,6 @@ static void free_chain(fat32_fs_t *fs, uint32_t start) {
         set_fat_entry(fs, cluster, FAT32_CLUSTER_FREE);
         cluster = next;
     }
-}
-
-static uint32_t chain_last_cluster(fat32_fs_t *fs, uint32_t start, uint32_t *out_count) {
-    uint32_t cluster = start;
-    uint32_t count = 0;
-    uint32_t last = 0;
-    while (cluster >= 2 && cluster < FAT32_CLUSTER_EOC_MIN) {
-        last = cluster;
-        count++;
-        cluster = get_fat_entry(fs, cluster);
-    }
-    if (out_count) *out_count = count;
-    return last;
 }
 
 static bool sfn_char_ok(char c) {
@@ -779,8 +769,66 @@ static int resolve_parent(fat32_fs_t *fs, const char *path, char *leaf_out, size
     return FS_OK;
 }
 
+static void runs_append(fat32_file_t *ff, uint32_t cluster) {
+    if (!ff->runs_valid) return;
+    if (ff->run_count && ff->runs[ff->run_count - 1].first + ff->runs[ff->run_count - 1].count == cluster) {
+        ff->runs[ff->run_count - 1].count++;
+        return;
+    }
+    if (ff->run_count == ff->run_cap) {
+        uint32_t cap = ff->run_cap ? ff->run_cap * 2 : 16;
+        fat32_run_t *n = krealloc(ff->runs, sizeof(fat32_run_t) * cap);
+        if (!n) {
+            ff->runs_valid = false;
+            return;
+        }
+        ff->runs = n;
+        ff->run_cap = cap;
+    }
+    ff->runs[ff->run_count].first = cluster;
+    ff->runs[ff->run_count].count = 1;
+    ff->run_count++;
+}
+
+static void runs_truncate(fat32_file_t *ff, uint32_t keep) {
+    uint32_t base = 0;
+    for (uint32_t i = 0; i < ff->run_count; i++) {
+        if (base + ff->runs[i].count >= keep) {
+            ff->runs[i].count = keep - base;
+            ff->run_count = ff->runs[i].count ? i + 1 : i;
+            return;
+        }
+        base += ff->runs[i].count;
+    }
+}
+
+static uint32_t file_load_runs(fat32_fs_t *fs, fat32_file_t *ff, uint32_t *out_count) {
+    uint32_t cluster = ff->first_cluster;
+    uint32_t count = 0;
+    uint32_t last = 0;
+    ff->run_count = 0;
+    ff->runs_valid = true;
+    while (cluster >= 2 && cluster < FAT32_CLUSTER_EOC_MIN) {
+        last = cluster;
+        count++;
+        runs_append(ff, cluster);
+        cluster = get_fat_entry(fs, cluster);
+    }
+    if (out_count) *out_count = count;
+    return last;
+}
+
 static uint32_t file_cluster_at(fat32_fs_t *fs, fat32_file_t *ff, uint32_t index) {
     if (ff->first_cluster < 2) return 0;
+
+    if (ff->runs_valid) {
+        uint32_t base = 0;
+        for (uint32_t i = 0; i < ff->run_count; i++) {
+            if (index < base + ff->runs[i].count) return ff->runs[i].first + (index - base);
+            base += ff->runs[i].count;
+        }
+        return 0;
+    }
 
     if (index >= ff->cache_index && ff->cache_cluster >= 2) {
         uint32_t cluster = ff->cache_cluster;
@@ -817,10 +865,13 @@ static int file_ensure_capacity(fat32_fs_t *fs, fat32_file_t *ff, uint64_t neede
             ff->last_cluster = newc;
             ff->cache_index = 0;
             ff->cache_cluster = newc;
+            ff->run_count = 0;
+            ff->runs_valid = true;
         } else {
             if (set_fat_entry(fs, ff->last_cluster, newc) != FS_OK) return FS_ERR_IO;
             ff->last_cluster = newc;
         }
+        runs_append(ff, newc);
         ff->alloc_clusters++;
         ff->dirty = true;
     }
@@ -901,7 +952,7 @@ static int fat32_op_open(fs_t *fsroot, const char *path, bool create, bool trunc
 
     if (first_cluster >= 2) {
         uint32_t count = 0;
-        ff->last_cluster = chain_last_cluster(fs, first_cluster, &count);
+        ff->last_cluster = file_load_runs(fs, ff, &count);
         ff->alloc_clusters = count;
     } else {
         ff->last_cluster = 0;
@@ -926,6 +977,7 @@ static int fat32_op_close(fs_file_t *f) {
         patch_dirent(ff->fs, ff->dirent_cluster, ff->dirent_offset, ff->first_cluster, (uint32_t)f->size);
     }
     if (ff->iobuf) kfree(ff->iobuf);
+    if (ff->runs) kfree(ff->runs);
     kfree(ff);
     f->priv = NULL;
     return FS_OK;
@@ -1017,6 +1069,7 @@ static int fat32_op_truncate(fs_file_t *f, uint64_t size) {
             ff->alloc_clusters = 0;
             ff->cache_index = 0;
             ff->cache_cluster = 0;
+            ff->run_count = 0;
         } else if (needed_clusters < ff->alloc_clusters) {
             uint32_t keep_last = file_cluster_at(fs, ff, needed_clusters - 1);
             uint32_t next = get_fat_entry(fs, keep_last);
@@ -1024,6 +1077,7 @@ static int fat32_op_truncate(fs_file_t *f, uint64_t size) {
             if (next >= 2 && next < FAT32_CLUSTER_EOC_MIN) free_chain(fs, next);
             ff->last_cluster = keep_last;
             ff->alloc_clusters = needed_clusters;
+            runs_truncate(ff, needed_clusters);
         }
         f->size = size;
         if (f->pos > size) f->pos = size;

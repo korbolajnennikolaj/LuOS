@@ -1,3 +1,49 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
+/*
+ *                                             MOUSE STACK
+ *
+ *                       +----------------+   +---------+   +--------------------+
+ *                       |    console     |   | games.c |   | lua + micropython  |
+ *                       | cursor dx / dy |   | buttons |   | position / buttons |
+ *                       +----------------+   +---------+   +--------------------+
+ *                                |                |                   |
+ *                                +----------------+-------------------+
+ *                                                   |
+ *                                                   |
+ *                            +=============================================+
+ *                            |         m o u s e _ d r i v e r . c         |
+ *                            +---------------------------------------------+
+ *                            | state     x / y / wheel / btn L R M         |
+ *                            | accum     dx / dy / wheel over all backends |
+ *                            | deltas    reset after each consumer read    |
+ *                            | backends  ps2 + usb, hotplug set            |
+ *                            | pump      service_mouse_updater polls       |
+ *                            +=============================================+
+ *                                                   |
+ *                                                   |
+ *                                      +------------+--------------+
+ *                                      |                           |
+ *                          +-----------------------+     +------------------+
+ *                          |    ps2_mouse_driver   |     | usb_mouse_driver |
+ *                          | i8042 + IRQ12         |     | HID boot         |
+ *                          | 3 / 4 byte packets    |     | rpt 1: btn dx dy |
+ *                          | wheel: 200-100-80-200 |     | rpt 2: + wheel   |
+ *                          +-----------------------+     | 8 ms interval    |
+ *                                      |                 +------------------+
+ *                                      |                           |
+ *                                      +---------------------------+
+ *                                                   |
+ *                         +--------------------------------------------------+
+ *                         | i8042 ports 0x60 / 0x64   |   USB HCD (usb_core) |
+ *                         +--------------------------------------------------+
+ *
+ *   move:  IRQ -> packet -> decode -> state -> cursor / game
+ *   wheel: 4th byte, 0x08 sign bit -> +/- 1 notch
+ *   plug:  usb claim -> register_backend -> active set
+ */
+
 #include "drivers/Input/mouse_driver.h"
 
 #include "components/drivers.h"

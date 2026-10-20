@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "apic_driver.h"
 
 #include "components/drivers.h"
@@ -66,6 +69,24 @@ void apic_send_eoi(void) {
 uint8_t apic_get_lapic_id(void) {
     if (!apic_base) return 0;
     return (uint8_t)((apic_read(APIC_REG_ID) >> 24) & 0xFF);
+}
+
+#define APIC_REG_ICR_LOW 0x300
+#define APIC_REG_ICR_HIGH 0x310
+#define APIC_ICR_PENDING (1u << 12)
+#define APIC_ICR_ASSERT (1u << 14)
+
+void apic_send_ipi(uint8_t lapic_id, uint8_t vector) {
+    if (!apic_base) return;
+    uint64_t rflags;
+    asm volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    while (apic_read(APIC_REG_ICR_LOW) & APIC_ICR_PENDING)
+        asm volatile("pause");
+    apic_write(APIC_REG_ICR_HIGH, (uint32_t)lapic_id << 24);
+    apic_write(APIC_REG_ICR_LOW, (uint32_t)vector | APIC_ICR_ASSERT);
+    while (apic_read(APIC_REG_ICR_LOW) & APIC_ICR_PENDING)
+        asm volatile("pause");
+    if (rflags & (1 << 9)) asm volatile("sti");
 }
 
 static void apic_enable(void) {

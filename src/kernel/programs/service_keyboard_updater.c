@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "service_keyboard_updater.h"
 
 #include "service_usb_hotplug.h"

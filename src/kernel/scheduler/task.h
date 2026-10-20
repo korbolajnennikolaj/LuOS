@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef TASK_H
 #define TASK_H
 
@@ -19,6 +22,7 @@
 #define TASK_ANY_CORE (-1)
 
 #define TASK_FX_SIZE 512
+#define TASK_FX_MAX 3072
 
 enum task_state {
     TASK_READY = 0,
@@ -66,8 +70,20 @@ struct task {
     struct task *next;
     struct task *sleep_next;
 
+    void *proc;
+    uint64_t cr3;
+    uint64_t fs_base;
+    uint64_t gs_base;
+    uint64_t clear_child_tid;
+    uint32_t wait_seq;
+    uint8_t timed_wait;
+    uint8_t kill_pending;
+
+    int preempt_count;
+    void *lx_task;
+
     uint8_t *fx;
-    uint8_t fx_raw[TASK_FX_SIZE + 16];
+    uint8_t fx_raw[TASK_FX_MAX + 64];
 };
 
 #endif

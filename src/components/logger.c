@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "logger.h"
 
 #include "components/drivers.h"
@@ -9,7 +12,6 @@
 #include <stdio.h>
 #include <string.h>
 
-// format [timestamp] [level] [caller] message
 
 static spinlock_t logger_lock = SPINLOCK_INIT;
 
@@ -511,4 +513,12 @@ void logger_init(void) {
              logger_level_name(logger_levels[LOGGER_OUTPUT_BUFFER]),
              logger_level_name(logger_levels[LOGGER_OUTPUT_UART]),
              logger_level_name(logger_levels[LOGGER_OUTPUT_VIDEO]));
+}
+
+void logger_console_mirror(const char *s) {
+    if (!s) return;
+    logger_resolve_outputs();
+    if (!logger_uart || !logger_uart->is_present || !logger_uart->is_present()) return;
+    size_t n = strlen(s);
+    if (n) logger_uart->write(s, n);
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef LUOS_ISO9660_H
 #define LUOS_ISO9660_H
 

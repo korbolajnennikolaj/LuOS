@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "hpet_driver.h"
 
 #include "components/ACPI/hpet_acpi.h"

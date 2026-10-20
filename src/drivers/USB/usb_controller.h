@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef USB_CONTROLLER_H
 #define USB_CONTROLLER_H
 

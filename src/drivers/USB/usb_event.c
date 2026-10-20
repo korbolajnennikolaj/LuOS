@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "drivers/USB/usb_event.h"
 
 #include "components/logger.h"

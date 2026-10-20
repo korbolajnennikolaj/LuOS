@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "kernel/scheduler/scheduler.h"
 
 #include "kernel/scheduler/spinlock.h"
+#include "kernel/scheduler/fpu.h"
 #include "drivers/Timer/apic_driver.h"
 #include "components/Memory/heap.h"
 #include "components/Interruptions/isr.h"
@@ -8,6 +12,10 @@
 #include "components/drivers.h"
 #include "components/logger.h"
 #include "drivers/Timer/timer.h"
+#include "components/GDT/gdt.h"
+#include "components/Memory/vmm.h"
+
+#include <msr.h>
 
 #include <string.h>
 #include <stddef.h>
@@ -60,11 +68,13 @@ static volatile uint64_t g_ticks = 0;
 static uint64_t (*g_clock_ms)(void) = NULL;
 
 static uint8_t g_lapic_to_core[256];
+static uint8_t g_core_to_lapic[MAX_CORES];
 static int g_core_count = 1;
 
-static uint8_t g_fx_template[TASK_FX_SIZE] __attribute__((aligned(16)));
+static uint8_t g_fx_template[TASK_FX_MAX] __attribute__((aligned(64)));
 
 static void scheduler_yield_isr(struct registers *regs);
+static void reschedule(int core, struct registers *regs, enum sched_reason reason);
 
 static inline uint64_t irq_save_local(void) {
     uint64_t flags;
@@ -97,6 +107,7 @@ static inline int rq_nr_running(const struct rq *rq) {
 
 void scheduler_register_core(uint8_t lapic_id, int logical_id) {
     g_lapic_to_core[lapic_id] = (uint8_t)logical_id;
+    if (logical_id >= 0 && logical_id < MAX_CORES) g_core_to_lapic[logical_id] = lapic_id;
     if (logical_id + 1 > g_core_count) g_core_count = logical_id + 1;
 }
 
@@ -225,25 +236,43 @@ static int select_core(struct task *t) {
 
     int prev = t->core;
     if (prev < 0 || prev >= g_core_count || !g_rq[prev].online) prev = 0;
+    int prev_load = rq_nr_running(&g_rq[prev]);
+    if (prev_load == 0) return prev;
     int best = least_loaded_online(prev);
-    if (rq_nr_running(&g_rq[prev]) <= rq_nr_running(&g_rq[best]) + 1)
-        return prev;
-    return best;
+    return rq_nr_running(&g_rq[best]) < prev_load ? best : prev;
 }
 
 static void wake_task(struct task *t) {
     int core = select_core(t);
     struct rq *rq = &g_rq[core];
+    int kick = 0;
 
     uint64_t f = spin_lock_irqsave(&rq->lock);
     if (!t->on_rq && t->state != TASK_ZOMBIE && t->state != TASK_RUNNING) {
         t->core = core;
         rq_enqueue(rq, t, 0);
         struct task *cur = rq->current;
-        if (!cur || cur->is_idle || t->priority < cur->priority)
+        if (!cur || cur->is_idle || t->priority < cur->priority) {
             rq->need_resched = 1;
+            kick = core != current_core();
+        }
     }
     spin_unlock_irqrestore(&rq->lock, f);
+    if (kick) apic_send_ipi(g_core_to_lapic[core], IRQ_VECTOR_RESCHEDULE);
+}
+
+static void scheduler_resched_isr(struct registers *regs) {
+    int core = current_core();
+    struct rq *rq = &g_rq[core];
+    if (!rq->online) return;
+    spin_lock(&rq->lock);
+    finish_prev(rq);
+    struct task *cur = rq->current;
+    int cur_is_idle = !cur || cur->is_idle;
+    int want = rq->need_resched || (cur_is_idle && rq->nr_queued > 0);
+    if (want && !cur_is_idle && cur->state == TASK_RUNNING && cur->preempt_count > 0) want = 0;
+    spin_unlock(&rq->lock);
+    if (want) reschedule(core, regs, SCHED_REASON_PREEMPT);
 }
 
 static void idle_entry(void *arg) {
@@ -268,8 +297,8 @@ static void task_init_context(struct task *t) {
     t->regs.ss = read_ss();
     t->regs.rflags = 0x202;
 
-    t->fx = (uint8_t *)(((uintptr_t)t->fx_raw + 15) & ~(uintptr_t)15);
-    memcpy(t->fx, g_fx_template, TASK_FX_SIZE);
+    t->fx = (uint8_t *)(((uintptr_t)t->fx_raw + 63) & ~(uintptr_t)63);
+    memcpy(t->fx, g_fx_template, fpu_save_size);
 
     *(uint64_t *)t->kstack = SCHED_STACK_MAGIC;
 }
@@ -298,8 +327,8 @@ static struct task *task_alloc(const char *name, int priority, uint32_t stack_si
         t->stack_size = stack_size;
         task_init_context(t);
     } else {
-        t->fx = (uint8_t *)(((uintptr_t)t->fx_raw + 15) & ~(uintptr_t)15);
-        memcpy(t->fx, g_fx_template, TASK_FX_SIZE);
+        t->fx = (uint8_t *)(((uintptr_t)t->fx_raw + 63) & ~(uintptr_t)63);
+        memcpy(t->fx, g_fx_template, fpu_save_size);
     }
     return t;
 }
@@ -363,7 +392,13 @@ void scheduler_init(void) {
 
     scheduler_register_core(apic_get_lapic_id(), 0);
     irq_register_handler(SCHEDULER_YIELD_VECTOR, scheduler_yield_isr);
+    irq_register_handler(IRQ_VECTOR_RESCHEDULE, scheduler_resched_isr);
     LOG_DEBUG("scheduler initialized, BSP LAPIC %u, max %d tasks", (unsigned)apic_get_lapic_id(), MAX_TASKS);
+    if (fpu_use_xsave)
+        LOG_INFO("FPU state: XSAVE, XCR0 0x%llx, %llu bytes per context", (unsigned long long)fpu_xcr0(),
+                 (unsigned long long)fpu_save_size);
+    else
+        LOG_INFO("FPU state: FXSAVE, 512 bytes per context");
 }
 
 void scheduler_start(void) {
@@ -433,6 +468,44 @@ struct task *task_create_ex(const char *name, void (*entry)(void *), void *arg,
 
     LOG_DEBUG("task '%s' tid %u created on core %d, priority %d, stack %u",
               t->name, t->tid, t->core, t->priority, t->stack_size);
+    return t;
+}
+
+void task_start(struct task *t) {
+    struct rq *rq = &g_rq[t->core];
+    uint64_t flags = spin_lock_irqsave(&rq->lock);
+    rq_enqueue(rq, t, 0);
+    struct task *cur = rq->current;
+    if (!cur || cur->is_idle || t->priority < cur->priority)
+        rq->need_resched = 1;
+    spin_unlock_irqrestore(&rq->lock, flags);
+}
+
+struct task *task_create_user(const char *name, void (*entry)(void *), void *arg, int priority,
+                              void *proc, uint64_t cr3, uint32_t stack_size, int start) {
+    reap_zombies();
+
+    if (!stack_size) stack_size = TASK_STACK_SIZE;
+    struct task *t = task_alloc(name, priority, stack_size);
+    if (!t) {
+        LOG_ERROR("cannot allocate user task '%s'", name ? name : "task");
+        return NULL;
+    }
+    t->entry = entry;
+    t->arg = arg;
+    t->proc = proc;
+    t->cr3 = cr3;
+    t->affinity = TASK_ANY_CORE;
+    t->core = least_loaded_online(current_core());
+
+    if (register_task(t) != 0) {
+        LOG_ERROR("task table full (%d), '%s' not created", MAX_TASKS, t->name);
+        kfree(t->kstack);
+        kfree(t);
+        return NULL;
+    }
+
+    if (start) task_start(t);
     return t;
 }
 
@@ -527,6 +600,24 @@ static struct task *steal_for(int core) {
     return t;
 }
 
+static void arch_switch(int core, struct task *cur, struct task *next) {
+    if (cur && cur->cr3) {
+        cur->fs_base = rdmsr(MSR_IA32_FS_BASE);
+        cur->gs_base = rdmsr(MSR_IA32_GS_BASE);
+    }
+
+    uint64_t want = next->cr3 ? next->cr3 : vmm_kernel_pml4();
+    uint64_t have;
+    asm volatile("mov %%cr3, %0" : "=r"(have));
+    if ((have & ~0xFFFULL) != want) asm volatile("mov %0, %%cr3" :: "r"(want) : "memory");
+
+    if (next->cr3) {
+        wrmsr(MSR_IA32_FS_BASE, next->fs_base);
+        wrmsr(MSR_IA32_GS_BASE, next->gs_base);
+    }
+    if (next->kstack) cpu_set_kernel_stack(core, (uint64_t)next->kstack + next->stack_size);
+}
+
 static void reschedule(int core, struct registers *regs, enum sched_reason reason) {
     struct rq *rq = &g_rq[core];
     if (!rq->online) return;
@@ -557,7 +648,7 @@ static void reschedule(int core, struct registers *regs, enum sched_reason reaso
     if (cur) {
         stack_check(cur, regs);
         cur->regs = *regs;
-        if (rq->isr_fx && cur->fx) memcpy(cur->fx, rq->isr_fx, TASK_FX_SIZE);
+        if (rq->isr_fx && cur->fx) memcpy(cur->fx, rq->isr_fx, fpu_save_size);
         if (cur->is_idle) cur->state = TASK_READY;
         rq->prev = cur;
     }
@@ -571,8 +662,9 @@ static void reschedule(int core, struct registers *regs, enum sched_reason reaso
     rq->current = next;
     rq->switches++;
 
+    arch_switch(core, cur, next);
     *regs = next->regs;
-    if (rq->isr_fx && next->fx) memcpy(rq->isr_fx, next->fx, TASK_FX_SIZE);
+    if (rq->isr_fx && next->fx) memcpy(rq->isr_fx, next->fx, fpu_save_size);
 
     spin_unlock(&rq->lock);
 }
@@ -582,21 +674,46 @@ static void wake_expired_sleepers(uint64_t now) {
     if (!h || h->wake_tick > now) return;
     if (!spin_trylock(&g_sleep_lock)) return;
 
-    struct task *ready = NULL;
-    while (g_sleep_head && g_sleep_head->wake_tick <= now) {
+    struct task *ready[64];
+    uint32_t seqs[64];
+    int n = 0;
+    while (g_sleep_head && g_sleep_head->wake_tick <= now && n < 64) {
         struct task *t = g_sleep_head;
         g_sleep_head = t->sleep_next;
-        t->sleep_next = ready;
-        ready = t;
+        t->sleep_next = NULL;
+        ready[n] = t;
+        seqs[n] = t->wait_seq;
+        n++;
     }
     spin_unlock(&g_sleep_lock);
 
-    while (ready) {
-        struct task *t = ready;
-        ready = t->sleep_next;
-        t->sleep_next = NULL;
-        if (t->state == TASK_SLEEPING) wake_task(t);
+    for (int i = 0; i < n; i++) {
+        struct task *t = ready[i];
+        int wake = 0;
+        spin_lock(&g_tasks_lock);
+        if (t->wait_seq == seqs[i]) {
+            if (t->state == TASK_SLEEPING) {
+                wake = 1;
+            } else if (t->state == TASK_BLOCKED && t->timed_wait) {
+                t->wait_channel = 0;
+                t->timed_wait = 0;
+                wake = 1;
+            }
+        }
+        spin_unlock(&g_tasks_lock);
+        if (wake) wake_task(t);
     }
+}
+
+static void sleep_list_remove(struct task *t) {
+    spin_lock(&g_sleep_lock);
+    struct task **pp = &g_sleep_head;
+    while (*pp && *pp != t) pp = &(*pp)->sleep_next;
+    if (*pp == t) {
+        *pp = t->sleep_next;
+        t->sleep_next = NULL;
+    }
+    spin_unlock(&g_sleep_lock);
 }
 
 static void age_queue(struct rq *rq, uint64_t now) {
@@ -691,6 +808,10 @@ void scheduler_tick(struct registers *regs) {
     int want = rq->need_resched || expired ||
                (cur && cur->state != TASK_RUNNING) ||
                (cur_is_idle && rq->nr_queued > 0);
+    if (want && cur && !cur_is_idle && cur->state == TASK_RUNNING && cur->preempt_count > 0) {
+        rq->need_resched = 1;
+        want = 0;
+    }
     spin_unlock(&rq->lock);
 
     if (!want && cur_is_idle && g_core_count > 1 && others_have_work(core))
@@ -698,6 +819,14 @@ void scheduler_tick(struct registers *regs) {
 
     if (want)
         reschedule(core, regs, expired ? SCHED_REASON_EXPIRED : SCHED_REASON_PREEMPT);
+}
+
+void scheduler_preempt_resume(void) {
+    uint64_t f = irq_save_local();
+    struct rq *rq = &g_rq[current_core()];
+    int pending = rq->online && rq->need_resched;
+    irq_restore_local(f);
+    if (pending && (f & (1u << 9))) scheduler_yield();
 }
 
 static void scheduler_yield_isr(struct registers *regs) {
@@ -717,8 +846,13 @@ void scheduler_sleep_ms(uint64_t ms) {
     if (ms == 0) { scheduler_yield(); return; }
 
     uint64_t f = irq_save_local();
+    if (t->kill_pending) {
+        irq_restore_local(f);
+        return;
+    }
 
     spin_lock(&g_sleep_lock);
+    t->wait_seq++;
     t->wake_tick = g_ticks + ms;
     t->state = TASK_SLEEPING;
     struct task **pp = &g_sleep_head;
@@ -768,6 +902,79 @@ void scheduler_wake(void *channel) {
 
 void scheduler_wake_all(void *channel) {
     wake_channel(channel, 1);
+}
+
+int scheduler_wait(void *channel, volatile int *flag, uint64_t timeout_ms) {
+    struct task *t = current_task();
+    if (!t || t->is_idle || !g_rq[t->core].online) return __atomic_load_n(flag, __ATOMIC_ACQUIRE) ? 0 : -1;
+
+    uint64_t f = irq_save_local();
+
+    t->wait_seq++;
+    if (timeout_ms) {
+        spin_lock(&g_sleep_lock);
+        t->wake_tick = g_ticks + timeout_ms;
+        t->timed_wait = 1;
+        struct task **pp = &g_sleep_head;
+        while (*pp && (*pp)->wake_tick <= t->wake_tick) pp = &(*pp)->sleep_next;
+        t->sleep_next = *pp;
+        __atomic_store_n(pp, t, __ATOMIC_RELEASE);
+        spin_unlock(&g_sleep_lock);
+    }
+
+    spin_lock(&g_tasks_lock);
+    if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) || t->kill_pending) {
+        t->timed_wait = 0;
+        spin_unlock(&g_tasks_lock);
+        if (timeout_ms) sleep_list_remove(t);
+        irq_restore_local(f);
+        return __atomic_load_n(flag, __ATOMIC_ACQUIRE) ? 0 : -1;
+    }
+    t->wait_channel = channel;
+    t->state = TASK_BLOCKED;
+    spin_unlock(&g_tasks_lock);
+
+    asm volatile("int $0x41" ::: "memory");
+
+    if (timeout_ms) {
+        spin_lock(&g_tasks_lock);
+        t->timed_wait = 0;
+        spin_unlock(&g_tasks_lock);
+        sleep_list_remove(t);
+    }
+    irq_restore_local(f);
+    return __atomic_load_n(flag, __ATOMIC_ACQUIRE) ? 0 : -1;
+}
+
+void scheduler_for_each_task(void (*fn)(struct task *, void *), void *ctx) {
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
+    for (int i = 0; i < g_task_count; i++) fn(g_tasks[i], ctx);
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
+}
+
+int scheduler_wake_matching(int (*pred)(struct task *, void *), void *ctx) {
+    struct task *list[64];
+    int n = 0;
+
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
+    for (int i = 0; i < g_task_count && n < 64; i++) {
+        struct task *t = g_tasks[i];
+        if ((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && pred(t, ctx)) {
+            t->wait_channel = 0;
+            t->timed_wait = 0;
+            t->wait_seq++;
+            list[n++] = t;
+        }
+    }
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
+
+    for (int i = 0; i < n; i++) {
+        uint64_t f = irq_save_local();
+        sleep_list_remove(list[i]);
+        irq_restore_local(f);
+        wake_task(list[i]);
+    }
+    return n;
 }
 
 int scheduler_snapshot(struct sched_task_info *out, int max) {

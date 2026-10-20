@@ -1,6 +1,11 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "heap.h"
 
 #include "components/logger.h"
+#include "components/Memory/pmm.h"
+#include "components/Memory/vmm.h"
 #include "kernel/scheduler/spinlock.h"
 
 #include <stddef.h>
@@ -31,7 +36,11 @@ typedef struct block {
     size_t size;
 
     int is_free;
+
+    uint32_t magic;
 } block_t;
+
+#define BLOCK_MAGIC 0x4C754F53u
 
 #define BLOCK_SIZE sizeof(block_t)
 
@@ -44,6 +53,14 @@ static rb_root_t size_root;
 static size_t heap_used = 0;
 static size_t heap_total = 0;
 static spinlock_t heap_lock = SPINLOCK_INIT;
+
+static uintptr_t heap_start = 0;
+static uintptr_t heap_end = 0;
+static uintptr_t heap_limit = 0;
+static uint64_t heap_grow_count = 0;
+
+#define HEAP_GROW_MIN (8UL * 1024 * 1024)
+#define HEAP_MAP_FLAGS (VMM_FLAG_PRESENT | VMM_FLAG_WRITE)
 
 size_t heap_get_used(void) { return heap_used; }
 size_t heap_get_total(void) { return heap_total; }
@@ -383,6 +400,7 @@ static void block_split(block_t *b, size_t size)
 
     tail->size = remaining;
     tail->is_free = 1;
+    tail->magic = BLOCK_MAGIC;
 
     b->size = size;
 
@@ -408,13 +426,74 @@ void heap_init(uintptr_t addr, size_t size)
     block_t *b = (block_t*)addr;
     b->size = heap_total;
     b->is_free = 1;
+    b->magic = BLOCK_MAGIC;
 
     addr_insert(b);
     size_insert(b);
 
+    heap_start = addr;
+    heap_end = addr + size;
+
     LOG_DEBUG("heap initialized at 0x%llx, %llu bytes usable",
               (unsigned long long)addr, (unsigned long long)heap_total);
 }
+
+void heap_enable_growth(uintptr_t limit)
+{
+    heap_limit = limit;
+}
+
+static int heap_grow_locked(size_t need)
+{
+    if (!heap_limit || heap_end >= heap_limit) return 0;
+
+    uint64_t bytes = need + 4 * BLOCK_SIZE + 2 * ALIGN;
+    if (bytes < HEAP_GROW_MIN) bytes = HEAP_GROW_MIN;
+    bytes = PAGE_ALIGN(bytes);
+    if (heap_end + bytes > heap_limit) bytes = heap_limit - heap_end;
+
+    uint64_t mapped = 0;
+    while (mapped < bytes) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys) break;
+        if (vmm_map_page(vmm_kernel_pml4(), heap_end + mapped, phys, HEAP_MAP_FLAGS) != 0) {
+            pmm_free_page(phys);
+            break;
+        }
+        mapped += PAGE_SIZE;
+    }
+    if (!mapped) return 0;
+
+    uintptr_t region = heap_end;
+    heap_end += mapped;
+    heap_grow_count++;
+
+    block_t *prev = addr_find_prev(region);
+    if (prev && prev->is_free && (uintptr_t)prev + BLOCK_SIZE + prev->size == region) {
+        size_erase(prev);
+        prev->size += mapped;
+        size_insert(prev);
+        heap_total += mapped;
+    } else {
+        block_t *b = (block_t*)region;
+        b->size = mapped - BLOCK_SIZE;
+        b->is_free = 1;
+        b->magic = BLOCK_MAGIC;
+        addr_insert(b);
+        size_insert(b);
+        heap_total += mapped - BLOCK_SIZE;
+    }
+    return 1;
+}
+
+size_t heap_get_mapped(void) { return (size_t)(heap_end - heap_start); }
+
+size_t heap_block_size(const void *ptr)
+{
+    if (!ptr) return 0;
+    return DATA_BLOCK(ptr)->size;
+}
+uint64_t heap_get_grow_count(void) { return heap_grow_count; }
 
 static void* kmalloc_impl(size_t size)
 {
@@ -423,6 +502,7 @@ static void* kmalloc_impl(size_t size)
     size = ALIGN_UP(size);
 
     block_t *b = size_find_best(size);
+    if (!b && heap_grow_locked(size)) b = size_find_best(size);
     if (!b) return NULL;
 
     size_erase(b);
@@ -444,8 +524,9 @@ static void* kmalloc_aligned_impl(size_t size, size_t align)
 
     size = ALIGN_UP(size);
 
-    size_t need = size + align + 2 * BLOCK_SIZE + 2 * MIN_SPLIT;
+    size_t need = size + 2 * align + 2 * BLOCK_SIZE + 2 * MIN_SPLIT;
     block_t *b = size_find_best(need);
+    if (!b && heap_grow_locked(need)) b = size_find_best(need);
     if (!b) return NULL;
 
     size_erase(b);
@@ -458,6 +539,10 @@ static void* kmalloc_aligned_impl(size_t size, size_t align)
     while (hdr > (uintptr_t)b && (size_t)(hdr - (uintptr_t)b) < BLOCK_SIZE + MIN_SPLIT) {
         target += align;
         hdr = target - BLOCK_SIZE;
+    }
+    if (target + size > data + span) {
+        size_insert(b);
+        return NULL;
     }
 
     if (hdr == (uintptr_t)b) {
@@ -473,8 +558,9 @@ static void* kmalloc_aligned_impl(size_t size, size_t align)
     size_insert(b);
 
     block_t *nb = (block_t *)hdr;
-    nb->size = span - (size_t)(hdr - (uintptr_t)b) - BLOCK_SIZE;
+    nb->size = span - (size_t)(hdr - (uintptr_t)b);
     nb->is_free = 0;
+    nb->magic = BLOCK_MAGIC;
     addr_insert(nb);
 
     if (nb->size >= size + BLOCK_SIZE + MIN_SPLIT)
@@ -505,13 +591,33 @@ void* kmalloc_aligned(size_t size, size_t align)
     return p;
 }
 
-static void kfree_impl(void* ptr)
+static int block_check(block_t *b, const void *ptr, void *caller)
+{
+    if ((uintptr_t)b < heap_start || (uintptr_t)b >= heap_end || b->magic != BLOCK_MAGIC) {
+        LOG_ERROR("heap: bad block header for %p (freed or resized from %p), header %016llx %016llx", ptr, caller,
+                  (unsigned long long)((uint64_t *)b)[8], (unsigned long long)((uint64_t *)b)[9]);
+        return -1;
+    }
+    uintptr_t end = (uintptr_t)b + BLOCK_SIZE + b->size;
+    if (end < heap_end && ((block_t *)end)->magic != BLOCK_MAGIC) {
+        uint64_t *n = (uint64_t *)end;
+        LOG_ERROR("heap: write past the end of %p (%llu bytes) detected when %p freed or resized it; next header "
+                  "%016llx %016llx %016llx %016llx | %016llx %016llx", ptr, (unsigned long long)b->size, caller,
+                  (unsigned long long)n[0], (unsigned long long)n[1], (unsigned long long)n[2],
+                  (unsigned long long)n[3], (unsigned long long)n[8], (unsigned long long)n[9]);
+        return -1;
+    }
+    return 0;
+}
+
+static void kfree_impl(void* ptr, void *caller)
 {
     if (!ptr) return;
 
     block_t *b = DATA_BLOCK(ptr);
+    if (block_check(b, ptr, caller)) return;
     if (b->is_free) {
-        LOG_WARNING("double free of %p ignored", ptr);
+        LOG_WARNING("double free of %p ignored (from %p)", ptr, caller);
         return;
     }
 
@@ -542,7 +648,7 @@ static void kfree_impl(void* ptr)
 void kfree(void* ptr)
 {
     uint64_t flags = spin_lock_irqsave(&heap_lock);
-    kfree_impl(ptr);
+    kfree_impl(ptr, __builtin_return_address(0));
     spin_unlock_irqrestore(&heap_lock, flags);
 }
 
@@ -556,6 +662,10 @@ void* krealloc(void* ptr, size_t size)
     uint64_t flags = spin_lock_irqsave(&heap_lock);
 
     block_t *b = DATA_BLOCK(ptr);
+    if (block_check(b, ptr, __builtin_return_address(0))) {
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return NULL;
+    }
 
     if (b->size >= size) {
 
@@ -600,7 +710,7 @@ void* krealloc(void* ptr, size_t size)
     for (size_t i = 0; i < copy_sz; i++)
         dst[i] = src[i];
 
-    kfree_impl(ptr);
+    kfree_impl(ptr, __builtin_return_address(0));
     spin_unlock_irqrestore(&heap_lock, flags);
     return new_ptr;
 }

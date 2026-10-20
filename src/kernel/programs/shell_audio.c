@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "shell_audio.h"
 
 #include "audio_player.h"
@@ -110,7 +113,11 @@ static void audio_shell_list(void) {
         struct audio_device *d = audio_get_device(i);
         if (!d) continue;
         found++;
-        printf_color(i == def ? LIMINE_COLOR_LIGHT_GREEN : LIMINE_COLOR_WHITE, " %c audio%d ", i == def ? '*' : ' ', i);
+        uint32_t route_mask = audio_route_mask_get();
+        bool routed = (i < AUDIO_ROUTE_MAX_DEVICES) && (route_mask & (1u << i));
+        char mark = routed ? '>' : (i == def ? '*' : ' ');
+        printf_color(routed ? LIMINE_COLOR_LIGHT_GREEN : (i == def ? LIMINE_COLOR_LIGHT_GREEN : LIMINE_COLOR_WHITE),
+                     " %c audio%d ", mark, i);
         printf_color(LIMINE_COLOR_AMBER, "[%s] ", audio_type_name(d->type));
         printf_color(LIMINE_COLOR_WHITE, "%s", d->name);
         printf_color(LIMINE_COLOR_DARK_GRAY, " - %s\n", d->description);
@@ -139,11 +146,13 @@ static int audio_shell_pick_device(const char *arg) {
     struct audio_core_driver *core = get_self_driver(AUDIO_DRIVER, AUDIO_CORE_SLOT);
     long n;
     if (arg && *arg && audio_shell_number(arg, &n)) return (int)n;
-    return core ? core->get_default_device() : -1;
+    return core ? AUDIO_ROUTE_DEFAULT : -1;
 }
 
 static void audio_shell_info(const char *arg) {
     int idx = audio_shell_pick_device(audio_shell_skip(arg));
+    if (idx < 0) idx = get_self_driver(AUDIO_DRIVER, AUDIO_CORE_SLOT) ?
+                     ((struct audio_core_driver *)get_self_driver(AUDIO_DRIVER, AUDIO_CORE_SLOT))->get_default_device() : -1;
     struct audio_device *d = audio_get_device(idx);
     if (!d) {
         printf_color(LIMINE_COLOR_LIGHT_RED, "No such audio device.\n");
@@ -183,7 +192,7 @@ static void audio_shell_beep(const char *arg) {
     }
     if (!audio_shell_core()) return;
     int idx = (dev >= 0) ? (int)dev : audio_shell_pick_device(NULL);
-    printf_color(LIMINE_COLOR_WHITE, "Tone %ld Hz for %ld ms on audio%d...", freq, ms, idx);
+    printf_color(LIMINE_COLOR_WHITE, "Tone %ld Hz for %ld ms on %s...", freq, ms, audio_route_target_name(idx));
     int r = audio_generate_tone(idx, (uint32_t)freq, (uint32_t)ms, 60);
     if (r == AUDIO_OK) printf_color(LIMINE_COLOR_LIGHT_GREEN, " done\n");
     else printf_color(LIMINE_COLOR_LIGHT_RED, " failed (%d)\n", r);
@@ -228,8 +237,9 @@ static void audio_shell_playing(void) {
     audio_shell_time(st.elapsed_ms, el, sizeof(el));
     audio_shell_time(st.total_ms, tot, sizeof(tot));
     struct audio_device *d = audio_get_device(st.device);
-    printf_color(LIMINE_COLOR_LIGHT_GRAY, "  track %d/%d  %s / %s  on audio%d (%s)\n", st.track + 1, st.track_count, el, tot,
-                 st.device, d ? d->name : "gone");
+    printf_color(LIMINE_COLOR_LIGHT_GRAY, "  track %d/%d  %s / %s  on %s (%s)\n", st.track + 1, st.track_count, el, tot,
+                 audio_route_target_name(st.device),
+                 st.device >= 0 ? (d ? d->name : "gone") : "multi-output route");
     if (st.fmt.sample_rate)
         printf_color(LIMINE_COLOR_LIGHT_GRAY, "  %u Hz, %u ch, %s, loop %s, %u done, %u skipped\n", st.fmt.sample_rate,
                      (unsigned)st.fmt.channels, audio_format_name(st.fmt.format), st.loop ? "on" : "off",
@@ -399,9 +409,9 @@ static void audio_shell_volume(const char *arg) {
     long a = -1, b = -1;
     bool h1 = w1[0] && audio_shell_number(w1, &a);
     bool h2 = w2[0] && audio_shell_number(w2, &b);
-    int idx = h2 ? (int)a : core->get_default_device();
+    int idx = h2 ? (int)a : AUDIO_ROUTE_DEFAULT;
     long vol = h2 ? b : a;
-    if (!audio_get_device(idx)) {
+    if (idx >= 0 && !audio_get_device(idx)) {
         printf_color(LIMINE_COLOR_LIGHT_RED, "No such audio device.\n");
         return;
     }
@@ -410,14 +420,14 @@ static void audio_shell_volume(const char *arg) {
         return;
     }
     if (h1) core->set_volume(idx, AUDIO_DIR_PLAYBACK, (uint8_t)vol);
-    printf_color(LIMINE_COLOR_WHITE, "audio%d playback volume: %d%%%s\n", idx, core->get_volume(idx, AUDIO_DIR_PLAYBACK),
-                 core->get_mute(idx, AUDIO_DIR_PLAYBACK) == 1 ? " (muted)" : "");
+    printf_color(LIMINE_COLOR_WHITE, "%s playback volume: %d%%%s\n", audio_route_target_name(idx),
+                 core->get_volume(idx, AUDIO_DIR_PLAYBACK), core->get_mute(idx, AUDIO_DIR_PLAYBACK) == 1 ? " (muted)" : "");
 }
 
 static void audio_shell_mute(const char *arg) {
     struct audio_core_driver *core = audio_shell_core();
     if (!core) return;
-    int idx = core->get_default_device();
+    int idx = AUDIO_ROUTE_DEFAULT;
     arg = audio_shell_skip(arg);
     int cur = core->get_mute(idx, AUDIO_DIR_PLAYBACK);
     if (cur < 0) {
@@ -428,7 +438,7 @@ static void audio_shell_mute(const char *arg) {
     if (strcmp(arg, "on") == 0) want = true;
     else if (strcmp(arg, "off") == 0) want = false;
     core->set_mute(idx, AUDIO_DIR_PLAYBACK, want);
-    printf_color(LIMINE_COLOR_WHITE, "audio%d %s\n", idx, want ? "muted" : "unmuted");
+    printf_color(LIMINE_COLOR_WHITE, "%s %s\n", audio_route_target_name(idx), want ? "muted" : "unmuted");
 }
 
 static void audio_shell_default(const char *arg) {
@@ -441,6 +451,89 @@ static void audio_shell_default(const char *arg) {
     }
     if (core->set_default_device((int)n) != AUDIO_OK) printf_color(LIMINE_COLOR_LIGHT_RED, "No such audio device.\n");
     else printf_color(LIMINE_COLOR_LIGHT_GREEN, "audio%ld is now the default device\n", n);
+}
+
+static void audio_shell_route(const char *arg) {
+    struct audio_core_driver *core = audio_shell_core();
+    if (!core) return;
+    char w1[16], w2[16];
+    const char *p = audio_shell_word(arg, w1, sizeof(w1));
+    audio_shell_word(p, w2, sizeof(w2));
+    long n;
+
+    if (w1[0] && strcmp(w1, "add") == 0) {
+        if (!audio_shell_number(w2, &n) || core->route_add((int)n) != AUDIO_OK)
+            printf_color(LIMINE_COLOR_LIGHT_RED, "Usage: audio-route add N (playback device)\n");
+        return;
+    }
+    if (w1[0] && strcmp(w1, "del") == 0) {
+        if (!audio_shell_number(w2, &n) || core->route_remove((int)n) != AUDIO_OK)
+            printf_color(LIMINE_COLOR_LIGHT_RED, "Usage: audio-route del N\n");
+        return;
+    }
+    if (w1[0] && strcmp(w1, "reset") == 0) {
+        core->route_reset();
+        printf_color(LIMINE_COLOR_LIGHT_GREEN, "Route reset to the default device.\n");
+        return;
+    }
+
+    printf_color(LIMINE_COLOR_CYAN, "\n=== Audio route ===\n");
+    printf_color(LIMINE_COLOR_LIGHT_GRAY, "Default device: audio%d, route outputs: %d\n",
+                 core->get_default_device(), core->route_count());
+    uint32_t mask = core->route_get();
+    for (int i = 0; i < audio_get_device_count(); i++) {
+        struct audio_device *d = audio_get_device(i);
+        if (!d || !d->has_direction[AUDIO_DIR_PLAYBACK]) continue;
+        bool routed = (i < AUDIO_ROUTE_MAX_DEVICES) && (mask & (1u << i));
+        printf_color(routed ? LIMINE_COLOR_LIGHT_GREEN : LIMINE_COLOR_WHITE, " %c audio%d ", routed ? '>' : ' ', i);
+        printf_color(LIMINE_COLOR_AMBER, "[%s] ", audio_type_name(d->type));
+        printf_color(LIMINE_COLOR_WHITE, "%s\n", d->name);
+    }
+    printf_color(LIMINE_COLOR_DARK_GRAY,
+                 " audio-route add N / del N / reset - sound goes to every marked output at once\n");
+    printf_color(LIMINE_COLOR_CYAN, "==================\n");
+}
+
+static void audio_shell_outs(const char *arg) {
+    struct audio_core_driver *core = audio_shell_core();
+    if (!core) return;
+    char w1[16], w2[16];
+    const char *p = audio_shell_word(arg, w1, sizeof(w1));
+    audio_shell_word(p, w2, sizeof(w2));
+    long n = -1;
+    bool have_dev = audio_shell_number(w2, &n);
+    int idx = have_dev ? (int)n : AUDIO_ROUTE_DEFAULT;
+
+    if (w1[0] && strcmp(w1, "all") == 0) {
+        if (audio_set_output_mode(idx, AUDIO_OUT_MODE_ALL) == AUDIO_OK)
+            printf_color(LIMINE_COLOR_LIGHT_GREEN, "All physical outputs on at once (jack + speakers).\n");
+        else
+            printf_color(LIMINE_COLOR_LIGHT_RED, "audio-outs: device does not support multi-pin output\n");
+        return;
+    }
+    if (w1[0] && (strcmp(w1, "auto") == 0 || strcmp(w1, "jack") == 0)) {
+        if (audio_set_output_mode(idx, AUDIO_OUT_MODE_AUTO) == AUDIO_OK)
+            printf_color(LIMINE_COLOR_LIGHT_GREEN, "Outputs follow jack sense again.\n");
+        else
+            printf_color(LIMINE_COLOR_LIGHT_RED, "audio-outs: device does not support multi-pin output\n");
+        return;
+    }
+
+    printf_color(LIMINE_COLOR_CYAN, "\n=== Physical output pins ===\n");
+    for (int i = 0; i < audio_get_device_count(); i++) {
+        struct audio_device *d = audio_get_device(i);
+        if (!d) continue;
+        int mode = audio_get_output_mode(i);
+        if (mode == AUDIO_ERR_NODEV) continue;
+        printf_color(LIMINE_COLOR_WHITE, " audio%d %s: ", i, d->name);
+        if (mode == AUDIO_ERR_UNSUPPORTED)
+            printf_color(LIMINE_COLOR_DARK_GRAY, "single output\n");
+        else
+            printf_color(mode == AUDIO_OUT_MODE_ALL ? LIMINE_COLOR_LIGHT_GREEN : LIMINE_COLOR_LIGHT_GRAY,
+                         "%s\n", mode == AUDIO_OUT_MODE_ALL ? "ALL (jack + speakers together)" : "auto (jack sense)");
+    }
+    printf_color(LIMINE_COLOR_DARK_GRAY, " audio-outs all [DEV] - every pin at once, audio-outs auto [DEV] - jack sense\n");
+    printf_color(LIMINE_COLOR_CYAN, "===========================\n");
 }
 
 static void audio_shell_quirks(void) {
@@ -467,19 +560,23 @@ static void audio_shell_stop(const char *arg) {
     int idx = audio_shell_pick_device(audio_shell_skip(arg));
     core->stop(idx, AUDIO_DIR_PLAYBACK);
     core->close(idx, AUDIO_DIR_PLAYBACK);
-    printf_color(LIMINE_COLOR_AMBER, "audio%d playback stopped\n", idx);
+    printf_color(LIMINE_COLOR_AMBER, "%s playback stopped\n", audio_route_target_name(idx));
 }
 
+void help_row(uint32_t color, const char *left, const char *right);
+void help_section(const char *title);
+
 void shell_audio_help(void) {
-    printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- Audio --\n");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "audio         - list audio devices", "audio-info [DEV] - device/codec details");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "play FILE|DIR [DEV] - background playback", "playing (np) - what plays, from which dir");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "stop / pause / resume - player control", "next / prev   - skip in the directory");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "loop [on|off] - repeat the playlist", "audio-beep [HZ] [MS] [DEV] - test tone");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "audio-rec FILE [SEC] [DEV] - record WAV", "audio-stop [DEV] - stop playback");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "audio-vol [DEV] [0-100] - volume", "audio-mute [on|off] - toggle mute");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "audio-default [DEV] - default device", "audio-quirks  - quirk tables / matches");
-    printf_color(LIMINE_COLOR_CYAN, "%-46s %-40s\n", "audio-rescan  - probe for new devices", "");
+    help_section("Audio");
+    help_row(LIMINE_COLOR_CYAN, "audio - list audio devices", "audio-info [DEV] - codec details");
+    help_row(LIMINE_COLOR_CYAN, "play FILE|DIR [DEV] - background playback", "playing (np) - what plays");
+    help_row(LIMINE_COLOR_CYAN, "stop / pause / resume - player control", "next / prev - skip in directory");
+    help_row(LIMINE_COLOR_CYAN, "loop [on|off] - repeat playlist", "audio-beep [HZ] [MS] [DEV] - tone");
+    help_row(LIMINE_COLOR_CYAN, "audio-rec FILE [SEC] - record WAV", "audio-stop [DEV] - stop playback");
+    help_row(LIMINE_COLOR_CYAN, "audio-vol [DEV] [0-100] - volume", "audio-mute [on|off] - toggle mute");
+    help_row(LIMINE_COLOR_CYAN, "audio-default [DEV] - default device", "audio-route [add N|del N|reset]");
+    help_row(LIMINE_COLOR_CYAN, "audio-outs [all|auto] - jack+speakers", "audio-quirks - quirk matches");
+    help_row(LIMINE_COLOR_CYAN, "audio-rescan - probe for new devices", "");
 }
 
 bool shell_audio_command(const char *cmd) {
@@ -508,6 +605,10 @@ bool shell_audio_command(const char *cmd) {
     if (strncmp(cmd, "audio-mute ", 11) == 0) { audio_shell_mute(cmd + 11); return true; }
     if (strcmp(cmd, "audio-default") == 0) { audio_shell_default(""); return true; }
     if (strncmp(cmd, "audio-default ", 14) == 0) { audio_shell_default(cmd + 14); return true; }
+    if (strcmp(cmd, "audio-route") == 0) { audio_shell_route(""); return true; }
+    if (strncmp(cmd, "audio-route ", 12) == 0) { audio_shell_route(cmd + 12); return true; }
+    if (strcmp(cmd, "audio-outs") == 0) { audio_shell_outs(""); return true; }
+    if (strncmp(cmd, "audio-outs ", 11) == 0) { audio_shell_outs(cmd + 11); return true; }
     if (strcmp(cmd, "audio-quirks") == 0) { audio_shell_quirks(); return true; }
     if (strcmp(cmd, "audio-stop") == 0) { audio_shell_stop(""); return true; }
     if (strncmp(cmd, "audio-stop ", 11) == 0) { audio_shell_stop(cmd + 11); return true; }

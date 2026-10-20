@@ -1,3 +1,51 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
+/*
+ *                                             AUDIO STACK
+ *
+ *                   +-----------------+   +---------------+   +--------------------+
+ *                   |  audio_player.c |   | service_audio |   |    shell_audio     |
+ *                   | .wav playlist   |   | poll pump     |   | audio-* cmds       |
+ *                   | background task |   +---------------+   | route / outs / vol |
+ *                   +-----------------+           |           +--------------------+
+ *                            |                    |                      |
+ *                            +--------------------+----------------------+
+ *                                                   |
+ *                       +=======================================================+
+ *                       |                a u d i o _ c o r e . c                |
+ *                       +-------------------------------------------------------+
+ *                       | registry  backends[8] + audio_device[] (ops + caps)   |
+ *                       | streams   ring 64 KiB, period 4096 B, play / capture  |
+ *                       | convert   any PCM in -> best HW out: rate / ch / fmt  |
+ *                       | default   score HDA 60 > AC97 50 > USB 40 (+ analog)  |
+ *                       | routing   route set <= 32 sinks, one stream broadcast |
+ *                       +=======================================================+
+ *                                                   |
+ *                                                   |
+ *                            +-------------------+--+-------------------+
+ *                            |                   |                      |
+ *                   +----------------+   +--------------+   +----------------------+
+ *                   |     hda.c      |   |    ac97.c    |   |     usb_audio.c      |
+ *                   | PCI 0403       |   | PCI 0401     |   | UAC1 + UAC2          |
+ *                   | CORB / RIRB    |   | codec regs   |   | iso EPs via usb_core |
+ *                   | codec widgets  |   | split stereo |   | implicit feedback    |
+ *                   | BDL stream DMA |   +--------------+   +----------------------+
+ *                   +----------------+           |                      |
+ *                            |                   |                      |
+ *                            +-------------------+----------------------+
+ *                                                   |
+ *                             +-------------------------------------------+
+ *                             | audio_quirks.c + quirks/ (pin cfg tables) |
+ *                             +-------------------------------------------+
+ *
+ *   play:    player -> open(route) -> write -> ring -> converter
+ *            -> DMA per sink: HDA BDL / AC97 / USB iso -> DAC -> pins
+ *            -> jack + speakers + 2nd HBA all at once
+ *   capture: mic -> ADC -> DMA -> ring -> read -> .wav (audio-rec)
+ *   default: rescored on hotplug, audio-default DEV pins by hand
+ */
+
 #include "audio_core.h"
 
 #include "audio_quirks.h"
@@ -11,11 +59,19 @@
 #include "kernel/scheduler/scheduler.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 static spinlock_t audio_registry_lock = SPINLOCK_INIT;
 static int audio_device_slots = 0;
-static volatile int audio_default_device = -1;
+static volatile int audio_default_playback = -1;
+static volatile int audio_default_capture = -1;
+static volatile uint8_t audio_default_pinned = 0;
+
+static volatile uint32_t audio_route_mask = 0;
+static volatile uint8_t audio_route_manual = 0;
+static volatile uint8_t audio_route_live = 0;
+static struct audio_format audio_route_fmt;
 
 static const struct audio_backend *audio_backends[AUDIO_MAX_BACKENDS];
 static int audio_backend_count = 0;
@@ -563,16 +619,60 @@ struct audio_device *audio_get_device(int idx) {
     return dev;
 }
 
-static int audio_pick_default(int exclude) {
-    int fallback = -1;
-    for (int i = 0; i < audio_device_slots; i++) {
-        if (i == exclude) continue;
-        struct audio_device *d = audio_get_device(i);
-        if (!d || !d->has_direction[AUDIO_DIR_PLAYBACK]) continue;
-        if (!(d->flags & AUDIO_DEV_FLAG_DIGITAL)) return i;
-        if (fallback < 0) fallback = i;
+static int audio_device_score(const struct audio_device *d) {
+    if (!d || !d->valid) return -1;
+    int score = 0;
+    switch (d->type) {
+        case HDA_AUDIO: score = 60; break;
+        case AC97_AUDIO: score = 50; break;
+        case USB_AUDIO: score = 40; break;
+        default: score = 10; break;
     }
-    return fallback;
+    if (d->flags & AUDIO_DEV_FLAG_DIGITAL) score -= 25;
+    else score += 15;
+    if (d->flags & AUDIO_DEV_FLAG_HOTPLUG) score -= 10;
+    if (d->flags & AUDIO_DEV_FLAG_REMOVED) score -= 100;
+    return score;
+}
+
+static int audio_pick_default(uint8_t direction) {
+    int best = -1;
+    int best_score = -1;
+    for (int i = 0; i < audio_device_slots; i++) {
+        struct audio_device *d = audio_get_device(i);
+        if (!d || !d->has_direction[direction]) continue;
+        int s = audio_device_score(d);
+        if (s > best_score) {
+            best_score = s;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static uint32_t audio_route_effective_mask(void) {
+    if (audio_route_manual && audio_route_mask) return audio_route_mask;
+    int def = audio_default_playback;
+    if (def < 0 || def >= AUDIO_ROUTE_MAX_DEVICES) return 0;
+    if (!audio_get_device(def)) {
+        def = audio_pick_default(AUDIO_DIR_PLAYBACK);
+        if (def >= 0) audio_default_playback = def;
+    }
+    return (def >= 0) ? (1u << def) : 0;
+}
+
+static int audio_route_count_from_mask(uint32_t mask) {
+    int n = 0;
+    while (mask) {
+        n += (int)(mask & 1u);
+        mask >>= 1;
+    }
+    return n;
+}
+
+static bool audio_broadcast_target(int dev_idx, uint8_t direction) {
+    if (dev_idx != AUDIO_ROUTE_DEFAULT || direction != AUDIO_DIR_PLAYBACK) return false;
+    return audio_route_count_from_mask(audio_route_effective_mask()) > 1;
 }
 
 int audio_core_add_device(struct audio_device *dev) {
@@ -615,13 +715,13 @@ int audio_core_add_device(struct audio_device *dev) {
 
     bool make_default = false;
     if (dev->has_direction[AUDIO_DIR_PLAYBACK]) {
-        int cur = audio_default_device;
+        int cur = audio_default_playback;
         struct audio_device *cd = (cur >= 0) ? (struct audio_device *)device_table[AUDIO_DEVICE][cur] : NULL;
         if (!cd) make_default = true;
-        else if ((cd->flags & AUDIO_DEV_FLAG_DIGITAL) && !(dev->flags & AUDIO_DEV_FLAG_DIGITAL)) make_default = true;
-        else if (dev->flags & AUDIO_DEV_FLAG_HOTPLUG) make_default = true;
+        else if (!audio_default_pinned && audio_device_score(dev) > audio_device_score(cd)) make_default = true;
     }
-    if (make_default) audio_default_device = slot;
+    if (make_default) audio_default_playback = slot;
+    if (dev->has_direction[AUDIO_DIR_CAPTURE] && audio_default_capture < 0) audio_default_capture = slot;
     spin_unlock_irqrestore(&audio_registry_lock, flags);
 
     LOG_INFO("audio%d: %s \"%s\"%s%s%s", slot, audio_type_name(dev->type), dev->name,
@@ -669,12 +769,22 @@ void audio_core_remove_device(struct audio_device *dev) {
     uint64_t flags = spin_lock_irqsave(&audio_registry_lock);
     device_table[AUDIO_DEVICE][slot] = NULL;
     while (audio_device_slots > 0 && !device_table[AUDIO_DEVICE][audio_device_slots - 1]) audio_device_slots--;
-    bool was_default = (audio_default_device == slot);
-    if (was_default) audio_default_device = audio_pick_default(slot);
-    int new_default = audio_default_device;
+    uint32_t bit = 1u << slot;
+    bool was_routed = (audio_route_mask & bit) != 0;
+    audio_route_mask &= ~bit;
+    if (audio_route_manual && !audio_route_mask) audio_route_manual = 0;
+    bool was_default = (audio_default_playback == slot);
+    bool was_capture = (audio_default_capture == slot);
+    if (was_default) {
+        audio_default_pinned = 0;
+        audio_default_playback = audio_pick_default(AUDIO_DIR_PLAYBACK);
+    }
+    if (was_capture) audio_default_capture = audio_pick_default(AUDIO_DIR_CAPTURE);
+    int new_default = audio_default_playback;
     spin_unlock_irqrestore(&audio_registry_lock, flags);
 
-    LOG_INFO("audio%d: \"%s\" removed%s", slot, dev->name, was_default ? ", default device changed" : "");
+    LOG_INFO("audio%d: \"%s\" removed%s%s", slot, dev->name, was_routed ? ", dropped from route" : "",
+             was_default ? ", default device changed" : "");
     if (was_default && new_default >= 0) LOG_INFO("audio%d is now the default device", new_default);
 }
 
@@ -709,12 +819,45 @@ const struct audio_backend *audio_core_get_backend(int idx) {
 }
 
 static struct audio_device *core_dev(int idx) {
-    if (idx < 0) idx = audio_default_device;
+    if (idx < 0) idx = audio_default_playback;
     return audio_get_device(idx);
 }
 
+static struct audio_device *core_dev_dir(int idx, uint8_t direction) {
+    if (idx < 0) idx = (direction == AUDIO_DIR_CAPTURE) ? audio_default_capture : audio_default_playback;
+    return audio_get_device(idx);
+}
+
+static struct audio_device *core_capture_dev(int idx) {
+    return core_dev_dir(idx, AUDIO_DIR_CAPTURE);
+}
+
 static int core_open(int dev_idx, uint8_t direction, const struct audio_format *fmt) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        struct audio_format want;
+        if (fmt) want = *fmt;
+        else {
+            want.sample_rate = AUDIO_DEFAULT_RATE;
+            want.channels = AUDIO_DEFAULT_CHANNELS;
+            want.format = AUDIO_DEFAULT_FORMAT;
+            want.bits_per_sample = 16;
+        }
+        uint32_t mask = audio_route_effective_mask();
+        int ok = 0;
+        int fail = 0;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            int r = core_open(i, direction, &want);
+            if (r == AUDIO_OK) ok++;
+            else fail++;
+        }
+        if (!ok) return fail ? AUDIO_ERR_UNSUPPORTED : AUDIO_ERR_NODEV;
+        audio_route_fmt = want;
+        audio_route_live = 1;
+        LOG_INFO("route: %d output(s) opened for playback", ok);
+        return AUDIO_OK;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT || !dev->has_direction[direction]) return AUDIO_ERR_UNSUPPORTED;
 
@@ -795,7 +938,16 @@ static int core_open(int dev_idx, uint8_t direction, const struct audio_format *
 }
 
 static int core_close(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            core_close(i, direction);
+        }
+        audio_route_live = 0;
+        return AUDIO_OK;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     spin_lock(&dev->lock);
@@ -805,6 +957,35 @@ static int core_close(int dev_idx, uint8_t direction) {
 }
 
 static int core_write(int dev_idx, const void *data, uint32_t len) {
+    if (audio_broadcast_target(dev_idx, AUDIO_DIR_PLAYBACK)) {
+        if (!data) return AUDIO_ERR_PARAM;
+        uint32_t mask = audio_route_effective_mask();
+        uint32_t limit = len;
+        int live = 0;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[AUDIO_DIR_PLAYBACK];
+            if (!s->opened || !s->ring) continue;
+            uint32_t space = audio_stream_space(s);
+            if (space < limit) limit = space;
+            live++;
+        }
+        if (!live) return AUDIO_ERR_NODEV;
+        if (!limit) return 0;
+        mask = audio_route_effective_mask();
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[AUDIO_DIR_PLAYBACK];
+            if (!s->opened || !s->ring) continue;
+            if (core_write(i, data, limit) < 0) live--;
+        }
+        if (live <= 0) return AUDIO_ERR_NODEV;
+        return (int)limit;
+    }
     struct audio_device *dev = core_dev(dev_idx);
     if (!dev) return AUDIO_ERR_NODEV;
     if (!data) return AUDIO_ERR_PARAM;
@@ -821,7 +1002,7 @@ static int core_write(int dev_idx, const void *data, uint32_t len) {
 }
 
 static int core_read(int dev_idx, void *data, uint32_t len) {
-    struct audio_device *dev = core_dev(dev_idx);
+    struct audio_device *dev = core_capture_dev(dev_idx);
     if (!dev) return AUDIO_ERR_NODEV;
     if (!data) return AUDIO_ERR_PARAM;
     spin_lock(&dev->lock);
@@ -840,7 +1021,16 @@ static int core_read(int dev_idx, void *data, uint32_t len) {
 }
 
 static int core_start(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        int ok = 0;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            if (core_start(i, direction) == AUDIO_OK) ok++;
+        }
+        return ok ? AUDIO_OK : AUDIO_ERR_NODEV;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     spin_lock(&dev->lock);
@@ -864,7 +1054,15 @@ static int core_start(int dev_idx, uint8_t direction) {
 }
 
 static int core_stop(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            core_stop(i, direction);
+        }
+        return AUDIO_OK;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     spin_lock(&dev->lock);
@@ -885,7 +1083,16 @@ static int core_stop(int dev_idx, uint8_t direction) {
 }
 
 static int core_pause(int dev_idx, uint8_t direction, bool paused) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        int ok = 0;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            if (core_pause(i, direction, paused) == AUDIO_OK) ok++;
+        }
+        return ok ? AUDIO_OK : AUDIO_ERR_NODEV;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     spin_lock(&dev->lock);
@@ -909,7 +1116,23 @@ static int core_pause(int dev_idx, uint8_t direction, bool paused) {
 }
 
 static uint32_t core_available(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        uint32_t best = 0;
+        bool first = true;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[direction];
+            if (!s->opened) continue;
+            uint32_t a = audio_stream_space(s);
+            if (first || a < best) best = a;
+            first = false;
+        }
+        return first ? 0 : best;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev || direction >= AUDIO_DIR_COUNT) return 0;
     struct audio_stream *s = &dev->streams[direction];
     if (!s->opened) return 0;
@@ -917,7 +1140,17 @@ static uint32_t core_available(int dev_idx, uint8_t direction) {
 }
 
 static int core_set_volume(int dev_idx, uint8_t direction, uint8_t volume) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        int r = AUDIO_OK;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            int rr = core_set_volume(i, direction, volume);
+            if (rr != AUDIO_OK) r = rr;
+        }
+        return r;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     if (volume > AUDIO_VOLUME_MAX) volume = AUDIO_VOLUME_MAX;
@@ -937,14 +1170,24 @@ static int core_set_volume(int dev_idx, uint8_t direction, uint8_t volume) {
 }
 
 static int core_get_volume(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     return dev->streams[direction].volume;
 }
 
 static int core_set_mute(int dev_idx, uint8_t direction, bool muted) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        int r = AUDIO_OK;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            int rr = core_set_mute(i, direction, muted);
+            if (rr != AUDIO_OK) r = rr;
+        }
+        return r;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     spin_lock(&dev->lock);
@@ -957,7 +1200,7 @@ static int core_set_mute(int dev_idx, uint8_t direction, bool muted) {
 }
 
 static int core_get_mute(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     return dev->streams[direction].muted;
@@ -967,19 +1210,147 @@ static int core_set_default_device(int dev_idx) {
     struct audio_device *dev = audio_get_device(dev_idx);
     if (!dev) return AUDIO_ERR_NODEV;
     if (!dev->has_direction[AUDIO_DIR_PLAYBACK] && !dev->has_direction[AUDIO_DIR_CAPTURE]) return AUDIO_ERR_UNSUPPORTED;
-    audio_default_device = dev_idx;
+    uint64_t flags = spin_lock_irqsave(&audio_registry_lock);
+    audio_default_playback = dev_idx;
+    audio_default_pinned = 1;
+    spin_unlock_irqrestore(&audio_registry_lock, flags);
     LOG_INFO("audio%d is now the default device", dev_idx);
     return AUDIO_OK;
 }
 
 static int core_get_default_device(void) {
-    int d = audio_default_device;
-    if (d >= 0 && !audio_get_device(d)) return -1;
+    int d = audio_default_playback;
+    if (d >= 0 && !audio_get_device(d)) {
+        d = audio_pick_default(AUDIO_DIR_PLAYBACK);
+        if (d >= 0) audio_default_playback = d;
+    }
     return d;
 }
 
+int audio_route_add_device(int dev_idx) {
+    struct audio_device *dev = audio_get_device(dev_idx);
+    if (!dev) return AUDIO_ERR_NODEV;
+    if (!dev->has_direction[AUDIO_DIR_PLAYBACK]) return AUDIO_ERR_UNSUPPORTED;
+    if (dev_idx >= AUDIO_ROUTE_MAX_DEVICES) return AUDIO_ERR_PARAM;
+    uint64_t flags = spin_lock_irqsave(&audio_registry_lock);
+    audio_route_mask |= 1u << dev_idx;
+    audio_route_manual = 1;
+    spin_unlock_irqrestore(&audio_registry_lock, flags);
+    if (audio_route_live) {
+        struct audio_format want = audio_route_fmt;
+        bool started = false;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES; i++) {
+            if (i == dev_idx || !(audio_route_mask & (1u << i))) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[AUDIO_DIR_PLAYBACK];
+            if (s->opened && s->state == AUDIO_STATE_PLAYING) started = true;
+        }
+        if (core_open(dev_idx, AUDIO_DIR_PLAYBACK, &want) == AUDIO_OK && started)
+            core_start(dev_idx, AUDIO_DIR_PLAYBACK);
+    }
+    LOG_INFO("route: audio%d added (%d output(s))", dev_idx, audio_route_device_count());
+    return AUDIO_OK;
+}
+
+int audio_route_remove_device(int dev_idx) {
+    if (dev_idx < 0 || dev_idx >= AUDIO_ROUTE_MAX_DEVICES) return AUDIO_ERR_PARAM;
+    if (!audio_get_device(dev_idx)) return AUDIO_ERR_NODEV;
+    uint64_t flags = spin_lock_irqsave(&audio_registry_lock);
+    audio_route_mask &= ~(1u << dev_idx);
+    if (!audio_route_mask) audio_route_manual = 0;
+    spin_unlock_irqrestore(&audio_registry_lock, flags);
+    struct audio_device *d = audio_get_device(dev_idx);
+    struct audio_stream *s = d ? &d->streams[AUDIO_DIR_PLAYBACK] : NULL;
+    if (s && s->opened) core_close(dev_idx, AUDIO_DIR_PLAYBACK);
+    LOG_INFO("route: audio%d removed (%d output(s))", dev_idx, audio_route_device_count());
+    return AUDIO_OK;
+}
+
+void audio_route_reset(void) {
+    uint64_t flags = spin_lock_irqsave(&audio_registry_lock);
+    if (audio_route_live) {
+        uint32_t mask = audio_route_mask;
+        spin_unlock_irqrestore(&audio_registry_lock, flags);
+        if (audio_broadcast_target(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK))
+            core_close(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK);
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[AUDIO_DIR_PLAYBACK];
+            if (s->opened) core_close(i, AUDIO_DIR_PLAYBACK);
+        }
+        flags = spin_lock_irqsave(&audio_registry_lock);
+    }
+    audio_route_mask = 0;
+    audio_route_manual = 0;
+    spin_unlock_irqrestore(&audio_registry_lock, flags);
+    LOG_INFO("route: reset to the default device");
+}
+
+uint32_t audio_route_mask_get(void) {
+    return audio_route_effective_mask();
+}
+
+int audio_route_device_count(void) {
+    return audio_route_count_from_mask(audio_route_effective_mask());
+}
+
+const char *audio_route_target_name(int dev_idx) {
+    if (dev_idx == AUDIO_ROUTE_DEFAULT && audio_route_device_count() > 1) return "route";
+    if (dev_idx >= 0) {
+        static char buf[16];
+        snprintf(buf, sizeof(buf), "audio%d", dev_idx);
+        return buf;
+    }
+    return "default";
+}
+
+int audio_set_output_mode(int dev_idx, int mode) {
+    if (mode != AUDIO_OUT_MODE_AUTO && mode != AUDIO_OUT_MODE_ALL) return AUDIO_ERR_PARAM;
+    if (dev_idx == AUDIO_ROUTE_DEFAULT) {
+        uint32_t mask = audio_route_effective_mask();
+        if (!mask) return AUDIO_ERR_NODEV;
+        int r = AUDIO_OK;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            int rr = audio_set_output_mode(i, mode);
+            if (rr != AUDIO_OK) r = rr;
+        }
+        return r;
+    }
+    struct audio_device *dev = audio_get_device(dev_idx);
+    if (!dev) return AUDIO_ERR_NODEV;
+    if (!dev->ops->set_output_mode) return AUDIO_ERR_UNSUPPORTED;
+    return dev->ops->set_output_mode(dev, mode);
+}
+
+int audio_get_output_mode(int dev_idx) {
+    if (dev_idx == AUDIO_ROUTE_DEFAULT) dev_idx = core_get_default_device();
+    if (dev_idx < 0) return AUDIO_ERR_NODEV;
+    struct audio_device *dev = audio_get_device(dev_idx);
+    if (!dev) return AUDIO_ERR_NODEV;
+    if (!dev->ops->get_output_mode) return AUDIO_OUT_MODE_AUTO;
+    return dev->ops->get_output_mode(dev);
+}
+
 static int core_get_state(int dev_idx, uint8_t direction) {
-    struct audio_device *dev = core_dev(dev_idx);
+    if (audio_broadcast_target(dev_idx, direction)) {
+        uint32_t mask = audio_route_effective_mask();
+        int state = AUDIO_ERR_PARAM;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[direction];
+            if (!s->opened) continue;
+            int st = s->state;
+            if (state < 0 || st < state) state = st;
+        }
+        return state;
+    }
+    struct audio_device *dev = core_dev_dir(dev_idx, direction);
     if (!dev) return AUDIO_ERR_NODEV;
     if (direction >= AUDIO_DIR_COUNT) return AUDIO_ERR_PARAM;
     return dev->streams[direction].opened ? dev->streams[direction].state : AUDIO_ERR_PARAM;
@@ -991,7 +1362,45 @@ static void audio_wait_tick(void) {
     else audio_delay_ms(2);
 }
 
+static bool core_target_valid(int dev_idx) {
+    if (audio_broadcast_target(dev_idx, AUDIO_DIR_PLAYBACK)) {
+        uint32_t mask = audio_route_effective_mask();
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (d && d->valid) return true;
+        }
+        return false;
+    }
+    struct audio_device *dev = core_dev(dev_idx);
+    return dev && dev->valid;
+}
+
 static int core_write_blocking(int dev_idx, const void *data, uint32_t len, uint32_t timeout_ms) {
+    if (audio_broadcast_target(dev_idx, AUDIO_DIR_PLAYBACK)) {
+        const uint8_t *p = (const uint8_t *)data;
+        uint32_t done = 0;
+        uint64_t last_progress = audio_uptime_ms();
+        while (done < len) {
+            int n = core_write(AUDIO_ROUTE_DEFAULT, p + done, len - done);
+            if (n < 0) return done ? (int)done : n;
+            if (n > 0) {
+                done += (uint32_t)n;
+                last_progress = audio_uptime_ms();
+            }
+            if (done >= len) break;
+            if (core_get_state(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK) == AUDIO_STATE_STOPPED &&
+                core_available(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK) * 2 <= AUDIO_RING_SIZE - AUDIO_RING_SIZE / 8)
+                core_start(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK);
+            if (!core_target_valid(AUDIO_ROUTE_DEFAULT)) return (int)done;
+            if (timeout_ms && audio_uptime_ms() - last_progress > timeout_ms) {
+                LOG_WARNING("route: write stalled for %u ms", (unsigned)timeout_ms);
+                break;
+            }
+            audio_wait_tick();
+        }
+        return (int)done;
+    }
     struct audio_device *dev = core_dev(dev_idx);
     if (!dev) return AUDIO_ERR_NODEV;
     struct audio_stream *s = &dev->streams[AUDIO_DIR_PLAYBACK];
@@ -1024,7 +1433,7 @@ static int core_write_blocking(int dev_idx, const void *data, uint32_t len, uint
 }
 
 static int core_read_blocking(int dev_idx, void *data, uint32_t len, uint32_t timeout_ms) {
-    struct audio_device *dev = core_dev(dev_idx);
+    struct audio_device *dev = core_capture_dev(dev_idx);
     if (!dev) return AUDIO_ERR_NODEV;
     struct audio_stream *s = &dev->streams[AUDIO_DIR_CAPTURE];
     if (!s->opened) return AUDIO_ERR_PARAM;
@@ -1049,6 +1458,48 @@ static int core_read_blocking(int dev_idx, void *data, uint32_t len, uint32_t ti
 }
 
 static int core_drain(int dev_idx, uint32_t timeout_ms) {
+    if (audio_broadcast_target(dev_idx, AUDIO_DIR_PLAYBACK)) {
+        if (core_get_state(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK) == AUDIO_STATE_STOPPED &&
+            core_available(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK) < AUDIO_RING_SIZE)
+            core_start(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK);
+        uint32_t mask = audio_route_effective_mask();
+        uint32_t fb_min = 4;
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d) continue;
+            struct audio_stream *s = &d->streams[AUDIO_DIR_PLAYBACK];
+            if (!s->opened) continue;
+            spin_lock(&d->lock);
+            s->draining = 1;
+            spin_unlock(&d->lock);
+            uint32_t fb = audio_frame_bytes(&s->fmt);
+            if (fb && (fb_min == 0 || fb < fb_min)) fb_min = fb;
+        }
+        uint64_t start = audio_uptime_ms();
+        while (core_target_valid(AUDIO_ROUTE_DEFAULT)) {
+            uint32_t mask2 = audio_route_effective_mask();
+            uint32_t max_fill = 0;
+            int live = 0;
+            for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask2; i++, mask2 >>= 1) {
+                if (!(mask2 & 1u)) continue;
+                struct audio_device *d = audio_get_device(i);
+                if (!d) continue;
+                struct audio_stream *s = &d->streams[AUDIO_DIR_PLAYBACK];
+                if (!s->opened || s->state != AUDIO_STATE_PLAYING) continue;
+                live++;
+                uint32_t fill = audio_stream_fill(s);
+                if (fill > max_fill) max_fill = fill;
+            }
+            if (!live || max_fill < fb_min) break;
+            if (timeout_ms && audio_uptime_ms() - start > timeout_ms) return AUDIO_ERR_TIMEOUT;
+            audio_wait_tick();
+        }
+        uint64_t until = audio_uptime_ms() + 30;
+        while (audio_uptime_ms() < until) audio_wait_tick();
+        core_stop(AUDIO_ROUTE_DEFAULT, AUDIO_DIR_PLAYBACK);
+        return AUDIO_OK;
+    }
     struct audio_device *dev = core_dev(dev_idx);
     if (!dev) return AUDIO_ERR_NODEV;
     struct audio_stream *s = &dev->streams[AUDIO_DIR_PLAYBACK];
@@ -1097,8 +1548,9 @@ static void core_scan_all(void) {
 }
 
 int audio_generate_tone(int dev_idx, uint32_t freq_hz, uint32_t duration_ms, uint8_t amplitude) {
-    struct audio_device *dev = core_dev(dev_idx);
-    if (!dev) return AUDIO_ERR_NODEV;
+    struct audio_device *dev = (dev_idx >= 0) ? audio_get_device(dev_idx) : NULL;
+    if (dev_idx >= 0 && !dev) return AUDIO_ERR_NODEV;
+    if (dev_idx < 0 && audio_route_device_count() == 0) return AUDIO_ERR_NODEV;
     if (freq_hz == 0 || freq_hz > 20000) return AUDIO_ERR_PARAM;
     if (amplitude > 100) amplitude = 100;
 
@@ -1108,7 +1560,7 @@ int audio_generate_tone(int dev_idx, uint32_t freq_hz, uint32_t duration_ms, uin
         .bits_per_sample = 16,
         .format = AUDIO_FMT_S16_LE,
     };
-    int r = core_open(dev->index, AUDIO_DIR_PLAYBACK, &fmt);
+    int r = core_open(dev_idx, AUDIO_DIR_PLAYBACK, &fmt);
     if (r != AUDIO_OK) return r;
 
     static int16_t tone_buf[1024 * 2];
@@ -1119,7 +1571,7 @@ int audio_generate_tone(int dev_idx, uint32_t freq_hz, uint32_t duration_ms, uin
     int32_t amp = (int32_t)((32767 * (uint32_t)amplitude) / 100);
     uint32_t pos = 0;
 
-    while (pos < total && dev->valid) {
+    while (pos < total && (dev_idx >= 0 ? dev->valid : core_target_valid(AUDIO_ROUTE_DEFAULT))) {
         uint32_t n = total - pos;
         if (n > 1024) n = 1024;
         for (uint32_t i = 0; i < n; i++) {
@@ -1132,7 +1584,7 @@ int audio_generate_tone(int dev_idx, uint32_t freq_hz, uint32_t duration_ms, uin
             tone_buf[i * 2 + 1] = (int16_t)v;
             phase += phase_inc;
         }
-        int w = core_write_blocking(dev->index, tone_buf, n * 4, 2000);
+        int w = core_write_blocking(dev_idx, tone_buf, n * 4, 2000);
         if (w < (int)(n * 4)) {
             r = AUDIO_ERR_TIMEOUT;
             break;
@@ -1140,8 +1592,8 @@ int audio_generate_tone(int dev_idx, uint32_t freq_hz, uint32_t duration_ms, uin
         pos += n;
     }
 
-    if (r == AUDIO_OK) r = core_drain(dev->index, duration_ms + 2000);
-    core_close(dev->index, AUDIO_DIR_PLAYBACK);
+    if (r == AUDIO_OK) r = core_drain(dev_idx, duration_ms + 2000);
+    core_close(dev_idx, AUDIO_DIR_PLAYBACK);
     return r;
 }
 
@@ -1161,6 +1613,13 @@ static struct audio_core_driver audio_core = {
     .get_mute = core_get_mute,
     .set_default_device = core_set_default_device,
     .get_default_device = core_get_default_device,
+    .route_add = audio_route_add_device,
+    .route_remove = audio_route_remove_device,
+    .route_reset = audio_route_reset,
+    .route_get = audio_route_mask_get,
+    .route_count = audio_route_device_count,
+    .set_output_mode = audio_set_output_mode,
+    .get_output_mode = audio_get_output_mode,
     .poll = audio_core_poll,
     .write_blocking = core_write_blocking,
     .read_blocking = core_read_blocking,
@@ -1174,9 +1633,14 @@ struct audio_core_driver *return_audio_core_driver(void) {
     audio_quirks_init();
     for (int i = 0; i < MAX_AUDIO_DEVICES; i++) device_table[AUDIO_DEVICE][i] = NULL;
     audio_device_slots = 0;
-    audio_default_device = -1;
+    audio_default_playback = -1;
+    audio_default_capture = -1;
+    audio_default_pinned = 0;
+    audio_route_mask = 0;
+    audio_route_manual = 0;
+    audio_route_live = 0;
     audio_core_ready = true;
-    LOG_INFO("audio core ready");
+    LOG_INFO("audio core ready (multi-output routing)");
     return &audio_core;
 }
 

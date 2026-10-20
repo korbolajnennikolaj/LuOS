@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef TSC_DRIVER_H
 #define TSC_DRIVER_H
 

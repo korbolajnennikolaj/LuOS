@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "usb_keyboard_driver.h"
 
 #include "components/drivers.h"

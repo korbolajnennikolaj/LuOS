@@ -1,0 +1,22 @@
+{
+ "objs": [
+  "drivers/gpu/drm/drm_exec.o",
+  "drivers/gpu/drm/drm_suballoc.o",
+  "drivers/gpu/drm/drm_gpuvm.o",
+  "drivers/gpu/drm/drm_gem_ttm_helper.o",
+  "drivers/gpu/drm/scheduler/sched_main.o",
+  "drivers/gpu/drm/scheduler/sched_entity.o",
+  "drivers/gpu/drm/scheduler/sched_fence.o",
+  "lib/maple_tree.o",
+  "lib/kfifo.o",
+  "lib/interval_tree.o",
+  "kernel/time/timeconv.o",
+  "drivers/gpu/drm/drm_panel_backlight_quirks.o"
+ ],
+ "ccflags": [],
+ "cf": {},
+ "cr": {},
+ "cfg": [],
+ "mod": "drm",
+ "force_include": []
+}

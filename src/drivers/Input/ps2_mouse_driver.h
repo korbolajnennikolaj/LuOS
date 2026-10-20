@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef PS2_MOUSE_DRIVER_H
 #define PS2_MOUSE_DRIVER_H
 

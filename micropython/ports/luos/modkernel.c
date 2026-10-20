@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // modkernel.c — the "kernel" module for MicroPython on LuOS.
 //
 // This is a direct counterpart of the kernel.* table from the Lua

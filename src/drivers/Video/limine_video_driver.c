@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "limine_video_driver.h"
 
 #include <components/drivers.h>
@@ -9,6 +12,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 extern struct limine_framebuffer_request* get_framebuffer_request();
 
@@ -40,6 +44,16 @@ static uint32_t max_chars_x = 0;
 static uint32_t max_chars_y = 0;
 static uint32_t current_bg_color = 0x00000000;
 static bool cursor_enabled = true;
+
+static uint8_t* firmware_base = NULL;
+static uint64_t firmware_width = 0;
+static uint64_t firmware_height = 0;
+static uint64_t firmware_pitch = 0;
+
+static uint32_t damage_x1 = 0;
+static uint32_t damage_y1 = 0;
+static uint32_t damage_x2 = 0;
+static uint32_t damage_y2 = 0;
 
 static spinlock_t video_lock = SPINLOCK_INIT;
 
@@ -130,6 +144,24 @@ static inline void fast_memset32(void* dst, uint32_t val, size_t count)
     if (count & 1) ((uint32_t*)dst)[count - 1] = val;
 }
 
+static void mark_damage(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (x >= screen_width || y >= screen_height || !w || !h) return;
+    uint32_t x2 = x + w > screen_width ? (uint32_t)screen_width : x + w;
+    uint32_t y2 = y + h > screen_height ? (uint32_t)screen_height : y + h;
+    if (damage_x2 == 0) {
+        damage_x1 = x;
+        damage_y1 = y;
+        damage_x2 = x2;
+        damage_y2 = y2;
+        return;
+    }
+    if (x < damage_x1) damage_x1 = x;
+    if (y < damage_y1) damage_y1 = y;
+    if (x2 > damage_x2) damage_x2 = x2;
+    if (y2 > damage_y2) damage_y2 = y2;
+}
+
 static void scroll_cache_init(void)
 {
     uint64_t needed = screen_height * phys_pitch;
@@ -166,6 +198,7 @@ static void rect_fill_buf(uint8_t* buf, uint32_t x, uint32_t y, uint32_t w, uint
 
 static void fast_rect_fill(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
 {
+    mark_damage(x, y, w, h);
     rect_fill_buf(backbuffer, x, y, w, h, color);
     if (scroll_cache && y >= FONT_HEIGHT)
         rect_fill_buf(scroll_cache, x, y - FONT_HEIGHT, w, h, color);
@@ -189,6 +222,7 @@ static void draw_char_buf(uint8_t* buf, char c, uint32_t color, uint16_t cx, uin
 
 static void limine_video_char_at_raw(char c, uint32_t color, uint16_t cx, uint16_t cy)
 {
+    mark_damage((uint32_t)cx * FONT_WIDTH, (uint32_t)cy * FONT_HEIGHT, FONT_WIDTH, FONT_HEIGHT);
     draw_char_buf(backbuffer, c, color, cx, cy);
     if (scroll_cache)
         draw_char_buf(scroll_cache, c, color, cx, cy);
@@ -223,6 +257,7 @@ static void limine_video_clear(uint32_t color)
     }
 
     cursor_x = cursor_y = 0;
+    mark_damage(0, 0, (uint32_t)screen_width, (uint32_t)screen_height);
 
     spin_unlock_irqrestore(&video_lock, flags);
 }
@@ -230,6 +265,7 @@ static void limine_video_clear(uint32_t color)
 static void limine_video_scroll(void)
 {
     if (screen_height <= FONT_HEIGHT) return;
+    mark_damage(0, 0, (uint32_t)screen_width, (uint32_t)screen_height);
 
     uint64_t total = screen_height * phys_pitch;
     uint64_t row_bytes = FONT_HEIGHT * phys_pitch;
@@ -336,6 +372,120 @@ static bool limine_video_set_resolution(uint64_t width, uint64_t height) {
     return true;
 }
 
+static void reflow_scroll_cache(uint64_t width, uint64_t height, uint64_t pitch, uint32_t skip_rows)
+{
+    if (height * pitch > SCROLL_CACHE_MAX_BYTES) {
+        scroll_cache = NULL;
+        return;
+    }
+    if (!scroll_cache) {
+        scroll_cache = scroll_cache_storage;
+        for (uint64_t r = 0; r < height; r++) fast_memset32(scroll_cache + r * pitch, current_bg_color, (uint32_t)width);
+        return;
+    }
+    uint64_t old_pitch = phys_pitch;
+    uint64_t rows = screen_height > skip_rows ? screen_height - skip_rows : 0;
+    if (rows > height) rows = height;
+    uint64_t copy_px = screen_width < width ? screen_width : width;
+    if (pitch > old_pitch) {
+        for (uint64_t r = rows; r-- > 0;)
+            memmove(scroll_cache + r * pitch, scroll_cache + (r + skip_rows) * old_pitch, copy_px * 4);
+    } else {
+        for (uint64_t r = 0; r < rows; r++)
+            memmove(scroll_cache + r * pitch, scroll_cache + (r + skip_rows) * old_pitch, copy_px * 4);
+    }
+    for (uint64_t r = 0; r < height; r++) {
+        if (r < rows) {
+            if (copy_px < width) fast_memset32(scroll_cache + r * pitch + copy_px * 4, current_bg_color, (uint32_t)(width - copy_px));
+        } else {
+            fast_memset32(scroll_cache + r * pitch, current_bg_color, (uint32_t)width);
+        }
+    }
+}
+
+static void video_retarget(uint8_t* pixels, uint64_t width, uint64_t height, uint64_t pitch)
+{
+    uint32_t new_rows = (uint32_t)(height / FONT_HEIGHT);
+    uint32_t skip = cursor_y >= new_rows ? cursor_y + 1 - new_rows : 0;
+
+    reflow_scroll_cache(width, height, pitch, skip * FONT_HEIGHT);
+
+    framebuffer_base = pixels;
+    backbuffer = pixels;
+    phys_width = screen_width = width;
+    phys_height = screen_height = height;
+    phys_pitch = pitch;
+    max_chars_x = (uint32_t)(width / FONT_WIDTH);
+    max_chars_y = new_rows;
+    cursor_y -= skip;
+    if (cursor_x >= max_chars_x) cursor_x = max_chars_x ? max_chars_x - 1 : 0;
+
+    if (scroll_cache) sse2_memcpy(backbuffer, scroll_cache, height * pitch);
+    else for (uint64_t r = 0; r < height; r++) fast_memset32(backbuffer + r * pitch, current_bg_color, (uint32_t)width);
+    damage_x2 = 0;
+    mark_damage(0, 0, (uint32_t)width, (uint32_t)height);
+}
+
+bool limine_video_attach(void* pixels, uint64_t width, uint64_t height, uint64_t pitch)
+{
+    if (!pixels || width < FONT_WIDTH || height < FONT_HEIGHT || pitch < width * 4) return false;
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+    video_retarget((uint8_t*)pixels, width, height, pitch);
+    spin_unlock_irqrestore(&video_lock, flags);
+    LOG_INFO("console moved to a %llux%llu framebuffer at 0x%llx", (unsigned long long)width,
+             (unsigned long long)height, (unsigned long long)(uintptr_t)pixels);
+    return true;
+}
+
+void limine_video_detach(void)
+{
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+    if (firmware_base) video_retarget(firmware_base, firmware_width, firmware_height, firmware_pitch);
+    spin_unlock_irqrestore(&video_lock, flags);
+}
+
+void limine_video_panic_takeover(void)
+{
+    spin_lock_init(&video_lock);
+    if (firmware_base && framebuffer_base != firmware_base)
+        video_retarget(firmware_base, firmware_width, firmware_height, firmware_pitch);
+}
+
+bool limine_video_take_damage(uint32_t rect[4])
+{
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+    bool any = damage_x2 != 0;
+    if (any) {
+        rect[0] = damage_x1;
+        rect[1] = damage_y1;
+        rect[2] = damage_x2;
+        rect[3] = damage_y2;
+        damage_x2 = 0;
+    }
+    spin_unlock_irqrestore(&video_lock, flags);
+    return any;
+}
+
+bool limine_video_fb_info(uint8_t** pixels, uint32_t* width, uint32_t* height, uint32_t* pitch)
+{
+    if (!backbuffer || !screen_width || !screen_height) return false;
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+    if (pixels) *pixels = backbuffer;
+    if (width) *width = (uint32_t)screen_width;
+    if (height) *height = (uint32_t)screen_height;
+    if (pitch) *pitch = (uint32_t)phys_pitch;
+    spin_unlock_irqrestore(&video_lock, flags);
+    return true;
+}
+
+void limine_video_announce_damage(void)
+{
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+    if (backbuffer && screen_width && screen_height)
+        mark_damage(0, 0, screen_width, screen_height);
+    spin_unlock_irqrestore(&video_lock, flags);
+}
+
 struct limine_video_driver limine_loaded_driver = {
     .clear = limine_video_clear,
     .char_at = limine_video_char_at,
@@ -359,6 +509,10 @@ struct limine_video_driver* return_limine_video_driver(void) {
     phys_width = fb->width;
     phys_height = fb->height;
     phys_pitch = fb->pitch;
+    firmware_base = framebuffer_base;
+    firmware_width = phys_width;
+    firmware_height = phys_height;
+    firmware_pitch = phys_pitch;
 
     backbuffer = framebuffer_base;
     screen_width = phys_width;

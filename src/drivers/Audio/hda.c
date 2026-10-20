@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "hda.h"
 
 #include "components/drivers.h"
@@ -1070,6 +1073,7 @@ static bool hda_jack_present(struct hda_codec_dev *cd, uint8_t nid) {
 
 static void hda_automute(struct hda_codec_dev *cd) {
     uint64_t flags = cd->quirks.flags;
+    if (cd->all_outputs) return;
     if (flags & (AUDIO_HDA_Q_NO_AUTOMUTE | AUDIO_HDA_Q_SPEAKER_ALWAYS_ON)) return;
 
     bool have_hp = false, have_spk = false, hp = false;
@@ -1095,6 +1099,38 @@ static void hda_automute(struct hda_codec_dev *cd) {
         o->enabled = !hp;
     }
     LOG_INFO("%s: headphones %s, speakers %s", cd->adev.name, hp ? "plugged" : "unplugged", hp ? "muted" : "on");
+}
+
+static int hda_dev_set_output_mode(struct audio_device *adev, int mode) {
+    struct hda_codec_dev *cd = (struct hda_codec_dev *)adev->priv;
+    if (mode != AUDIO_OUT_MODE_AUTO && mode != AUDIO_OUT_MODE_ALL) return AUDIO_ERR_PARAM;
+    if (cd->all_outputs == (uint8_t)(mode == AUDIO_OUT_MODE_ALL ? 1 : 0)) return AUDIO_OK;
+
+    if (mode == AUDIO_OUT_MODE_ALL) {
+        cd->all_outputs = 1;
+        for (uint8_t i = 0; i < cd->out_count; i++) {
+            struct hda_output *o = &cd->outs[i];
+            struct hda_widget *pin = hda_widget_get(cd, o->pin);
+            if (!pin) continue;
+            uint8_t ctl = HDA_PINCTL_OUT_EN | hda_out_vref(cd->quirks.flags);
+            if (o->device == HDA_DEV_HP_OUT && (pin->pincap & HDA_PINCAP_HP_DRIVE)) ctl |= HDA_PINCTL_HP_EN;
+            hda_verb(cd, o->pin, HDA_VERB_SET_PIN_CTL, ctl);
+            hda_set_eapd(cd, pin, true);
+            o->enabled = 1;
+        }
+        LOG_INFO("%s: all outputs on (speakers + jacks together)", cd->adev.name);
+        return AUDIO_OK;
+    }
+
+    cd->all_outputs = 0;
+    hda_automute(cd);
+    LOG_INFO("%s: outputs follow jack sense again", cd->adev.name);
+    return AUDIO_OK;
+}
+
+static int hda_dev_get_output_mode(struct audio_device *adev) {
+    struct hda_codec_dev *cd = (struct hda_codec_dev *)adev->priv;
+    return cd->all_outputs ? AUDIO_OUT_MODE_ALL : AUDIO_OUT_MODE_AUTO;
 }
 
 static void hda_dev_poll(struct audio_device *adev) {
@@ -1218,6 +1254,8 @@ static const struct audio_device_ops hda_ops = {
     .set_mute = hda_dev_set_mute,
     .poll = hda_dev_poll,
     .describe = hda_dev_describe,
+    .set_output_mode = hda_dev_set_output_mode,
+    .get_output_mode = hda_dev_get_output_mode,
     .remove = NULL,
 };
 

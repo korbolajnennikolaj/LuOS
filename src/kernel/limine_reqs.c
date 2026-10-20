@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "kernel/limine.h"
 
 #include <stddef.h>
@@ -43,6 +46,12 @@ volatile struct limine_module_request module_request = {
 };
 
 __attribute__((used, section(".requests")))
+volatile struct limine_kernel_file_request kernel_file_request = {
+    .id = LIMINE_KERNEL_FILE_REQUEST,
+    .revision = 0
+};
+
+__attribute__((used, section(".requests")))
 static volatile void *limine_requests[] = {
     (void *)&framebuffer_request,
     (void *)&hhdm_req,
@@ -50,6 +59,7 @@ static volatile void *limine_requests[] = {
     (void *)&rsdp_request,
     (void *)&smp_request,
     (void *)&module_request,
+    (void *)&kernel_file_request,
     NULL
 };
 
@@ -58,6 +68,12 @@ volatile struct limine_memmap_request memmap_req = {
     .id = LIMINE_MEMMAP_REQUEST,
     .revision = 0
 };
+
+const char *limine_kernel_cmdline(void) {
+    struct limine_kernel_file_response *r = kernel_file_request.response;
+    if (!r || !r->kernel_file || !r->kernel_file->cmdline) return "";
+    return r->kernel_file->cmdline;
+}
 
 struct limine_framebuffer_request* get_framebuffer_request() {
     return (struct limine_framebuffer_request*)&framebuffer_request;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "drivers/Audio/audio_quirks.h"
 
 extern const struct audio_quirk_table audio_quirks_hda_controllers;

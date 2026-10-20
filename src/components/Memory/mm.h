@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef MM_H
 #define MM_H
 
@@ -10,12 +13,14 @@ extern volatile struct limine_hhdm_request hhdm_req;
 extern volatile struct limine_kernel_address_request kernel_address_request;
 extern volatile struct limine_rsdp_request rsdp_request;
 
+extern char __kernel_end[];
+
 static inline uint64_t mm_virt_to_phys(uint64_t addr) {
     if (kernel_address_request.response) {
         uint64_t kv = kernel_address_request.response->virtual_base;
         uint64_t kp = kernel_address_request.response->physical_base;
 
-        if (addr >= kv && addr < kv + 0x10000000ULL)
+        if (addr >= kv && addr < (uint64_t)__kernel_end)
             return addr - kv + kp;
     }
     if (hhdm_req.response) {

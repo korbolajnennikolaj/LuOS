@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "service_root_fs.h"
 
 #include "components/drivers.h"
@@ -125,6 +128,10 @@ const char *rootfs_cwd(void) {
 void rootfs_set_cwd(const char *path) {
     strncpy(g_cwd, path, sizeof(g_cwd) - 1);
     g_cwd[sizeof(g_cwd) - 1] = '\0';
+}
+
+void rootfs_normalize_path_from(const char *base, const char *input, char *out, size_t out_cap) {
+    fs_normalize_path(base && base[0] == '/' ? base : "/", (input && input[0]) ? input : ".", out, out_cap);
 }
 
 void rootfs_normalize_path(const char *input, char *out, size_t out_cap) {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef AUDIO_PLAYER_H
 #define AUDIO_PLAYER_H
 

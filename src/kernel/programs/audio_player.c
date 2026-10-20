@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "audio_player.h"
 
 #include "service_root_fs.h"
@@ -189,7 +192,7 @@ static enum player_track_result player_play_track(struct audio_core_driver *core
         fs_lock();
         if (rootfs_resolve(path, rel_check, sizeof(rel_check)) == fs) fs_close(&f);
         fs_unlock();
-        LOG_WARNING("player: audio%d refused %s (%d)", dev, path, r);
+        LOG_WARNING("player: %s refused %s (%d)", audio_route_target_name(dev), path, r);
         return (r == AUDIO_ERR_NODEV || r == AUDIO_ERR_BUSY) ? TRACK_FATAL : TRACK_SKIP;
     }
 
@@ -200,8 +203,8 @@ static enum player_track_result player_play_track(struct audio_core_driver *core
     player_index = idx;
     spin_unlock(&player_lock);
     if (player_state == AUDIO_PLAYER_IDLE) player_state = AUDIO_PLAYER_PLAYING;
-    LOG_DEBUG("player: audio%d <- %s (%u Hz %u ch %s)", dev, path, fmt.sample_rate, (unsigned)fmt.channels,
-              audio_format_name(fmt.format));
+    LOG_DEBUG("player: %s <- %s (%u Hz %u ch %s)", audio_route_target_name(dev), path, fmt.sample_rate,
+              (unsigned)fmt.channels, audio_format_name(fmt.format));
 
     uint32_t chunk_max = PLAYER_CHUNK - (PLAYER_CHUNK % fb);
     uint32_t left = data_bytes;
@@ -209,7 +212,6 @@ static enum player_track_result player_play_track(struct audio_core_driver *core
     uint32_t pending_off = 0;
     bool file_ok = true;
     enum player_track_result result = TRACK_DONE;
-    struct audio_device *adev = audio_get_device(dev);
 
     while (true) {
         if (player_interrupt(&result)) break;
@@ -243,7 +245,7 @@ static enum player_track_result player_play_track(struct audio_core_driver *core
         if (pending > 0) {
             int w = core->write(dev, player_buf + pending_off, pending);
             if (w < 0) {
-                LOG_WARNING("player: audio%d went away (%d)", dev, w);
+                LOG_WARNING("player: %s went away (%d)", audio_route_target_name(dev), w);
                 result = TRACK_FATAL;
                 break;
             }
@@ -252,14 +254,13 @@ static enum player_track_result player_play_track(struct audio_core_driver *core
             player_fed += (uint32_t)w;
         }
 
-        struct audio_stream *s = adev ? &adev->streams[AUDIO_DIR_PLAYBACK] : NULL;
         bool eof = (left == 0 && pending == 0);
-        if (core->get_state(dev, AUDIO_DIR_PLAYBACK) == AUDIO_STATE_STOPPED && s &&
-            (eof || audio_stream_fill(s) * 2 >= s->ring_size))
+        if (core->get_state(dev, AUDIO_DIR_PLAYBACK) == AUDIO_STATE_STOPPED &&
+            (eof || core->available(dev, AUDIO_DIR_PLAYBACK) * 2 <= AUDIO_RING_SIZE - AUDIO_RING_SIZE / 8))
             core->start(dev, AUDIO_DIR_PLAYBACK);
 
         if (eof) {
-            if (!s || audio_stream_fill(s) < fb) break;
+            if (core->available(dev, AUDIO_DIR_PLAYBACK) > (uint32_t)AUDIO_RING_SIZE - fb) break;
             scheduler_sleep_ms(PLAYER_IDLE_SLEEP_MS);
             continue;
         }
@@ -356,9 +357,13 @@ int audio_player_play(const char *path, int dev_idx) {
     if (!path || !path[0]) return AUDIO_PLAYER_ERR_PARAM;
     struct audio_core_driver *core = player_core();
     if (!core) return AUDIO_PLAYER_ERR_NODEV;
-    int dev = dev_idx >= 0 ? dev_idx : core->get_default_device();
-    struct audio_device *adev = audio_get_device(dev);
-    if (!adev || !adev->has_direction[AUDIO_DIR_PLAYBACK]) return AUDIO_PLAYER_ERR_NODEV;
+    int dev = dev_idx >= 0 ? dev_idx : AUDIO_ROUTE_DEFAULT;
+    if (dev >= 0) {
+        struct audio_device *adev = audio_get_device(dev);
+        if (!adev || !adev->has_direction[AUDIO_DIR_PLAYBACK]) return AUDIO_PLAYER_ERR_NODEV;
+    } else if (core->route_count() == 0) {
+        return AUDIO_PLAYER_ERR_NODEV;
+    }
     if (!rootfs_is_mounted()) return AUDIO_PLAYER_ERR_NOENT;
 
     audio_player_stop();
@@ -456,8 +461,20 @@ void audio_player_get_status(struct audio_player_status *out) {
     uint32_t total = player_data_bytes;
     spin_unlock(&player_lock);
 
-    struct audio_device *d = audio_get_device(out->device);
-    uint32_t queued = (d && d->streams[AUDIO_DIR_PLAYBACK].opened) ? audio_stream_fill(&d->streams[AUDIO_DIR_PLAYBACK]) : 0;
+    uint32_t queued = 0;
+    if (out->device >= 0) {
+        struct audio_device *d = audio_get_device(out->device);
+        queued = (d && d->streams[AUDIO_DIR_PLAYBACK].opened) ? audio_stream_fill(&d->streams[AUDIO_DIR_PLAYBACK]) : 0;
+    } else {
+        uint32_t mask = audio_route_mask_get();
+        for (int i = 0; i < AUDIO_ROUTE_MAX_DEVICES && mask; i++, mask >>= 1) {
+            if (!(mask & 1u)) continue;
+            struct audio_device *d = audio_get_device(i);
+            if (!d || !d->streams[AUDIO_DIR_PLAYBACK].opened) continue;
+            uint32_t fill = audio_stream_fill(&d->streams[AUDIO_DIR_PLAYBACK]);
+            if (fill > queued) queued = fill;
+        }
+    }
     uint64_t played = fed > queued ? fed - queued : 0;
     if (bps) {
         out->elapsed_ms = (uint32_t)((played * 1000) / bps);

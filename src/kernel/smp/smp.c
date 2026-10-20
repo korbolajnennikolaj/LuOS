@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "kernel/smp/smp.h"
 
 #include "kernel/limine.h"
@@ -9,6 +12,8 @@
 #include "drivers/Timer/apic_driver.h"
 #include "drivers/Timer/timer.h"
 #include "kernel/scheduler/scheduler.h"
+#include "kernel/smp/tlb.h"
+#include "components/Memory/pat.h"
 #include <math.h>
 
 #include <stdint.h>
@@ -38,10 +43,13 @@ void ap_main(struct limine_smp_info *info) {
         for (;;) asm volatile("cli; hlt");
     }
 
+    pat_init_ap();
     fpu_init();
     apic_enable_this_core();
+    tlb_cpu_online();
 
     uint32_t logical = __atomic_fetch_add(&next_logical_id, 1, __ATOMIC_SEQ_CST);
+    gdt_init_cpu((int)logical);
     scheduler_register_core(apic_get_lapic_id(), (int)logical);
     LOG_DEBUG("AP with LAPIC %u online as core %u", (unsigned)apic_get_lapic_id(), logical);
     __atomic_store_n(&ap_ready[info->lapic_id & 0xFF], 1, __ATOMIC_SEQ_CST);

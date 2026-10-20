@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "gop_font.h"
 
 const uint8_t gop_font_bitmap[128][16] = {

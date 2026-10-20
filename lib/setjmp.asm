@@ -1,3 +1,6 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) 2026 korbolajnennikolaj
+
 [BITS 64]
 section .text
 

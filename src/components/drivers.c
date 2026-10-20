@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "drivers.h"
 
 #include "components/ACPI/acpi.h"
@@ -12,6 +15,8 @@
 #include "drivers/Audio/audio_core.h"
 #include "drivers/Audio/hda.h"
 #include "drivers/Audio/usb_audio.h"
+#include "drivers/GPU/gpu_core.h"
+#include "drivers/GPU/intel_legacy.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Input/mouse_driver.h"
 #include "drivers/Serial/uart_driver.h"
@@ -154,6 +159,9 @@ void init_drivers() {
     register_driver(return_meta_ac97_driver());
     register_driver(return_meta_usb_audio_driver());
 
+    register_driver(return_meta_gpu_core_driver());
+
+    register_driver(return_meta_intel_legacy_driver());
     {
         uint32_t disk_count = get_device_count();
         LOG_INFO("Scanning %u block device(s) for partitions", disk_count);
@@ -173,3 +181,4 @@ void init_drivers() {
         uart->set_sync_mode();
     }
 }
+

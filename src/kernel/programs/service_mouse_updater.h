@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef SERVICE_MOUSE_UPDATER_H
 #define SERVICE_MOUSE_UPDATER_H
 

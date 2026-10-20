@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // modfile.c — the built-in `file` object type for MicroPython on LuOS,
 // and the global open() function that creates it.
 //

@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 korbolajnennikolaj
+
+# lkadd PATH... -- takes more files verbatim from a Linux tree (LINUX_SRC, default ~/linux-src) of the release
+# in ../VERSION, adds them to upstream.list and refreshes MANIFEST.sha256.
+L=$(cd "$(dirname "$0")/.." && pwd)
+SRC=${LINUX_SRC:-$HOME/linux-src}
+for f in "$@"; do
+    grep -qx "$f" "$L/upstream.list" || echo "$f" >> "$L/upstream.list"
+done
+exec python3 "$L/sync-upstream.py" "$SRC"

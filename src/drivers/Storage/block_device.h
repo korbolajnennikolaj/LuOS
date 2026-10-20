@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef BLOCK_DEVICE_H
 #define BLOCK_DEVICE_H
 

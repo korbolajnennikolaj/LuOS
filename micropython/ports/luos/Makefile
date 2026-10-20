@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 korbolajnennikolaj
+
 include ../../py/mkenv.mk
 
 # qstr definitions (must come before including py.mk)
@@ -33,6 +36,9 @@ SRC_C = \
 	mphalport.c \
 	modluos.c \
 	modkernel.c \
+	modgpu.c \
+	modgl.c \
+	modvk.c \
 	modrandom.c \
 	modtime.c \
 	modos.c \
@@ -41,7 +47,7 @@ SRC_C = \
 	shared/runtime/pyexec.c \
 	shared/runtime/interrupt_char.c \
 
-SRC_QSTR += main.c modluos.c modkernel.c modrandom.c modtime.c modos.c modfile.c mphalport.c
+SRC_QSTR += main.c modluos.c modkernel.c modgpu.c modgl.c modvk.c modrandom.c modtime.c modos.c modfile.c mphalport.c
 SRC_QSTR += shared/readline/readline.c shared/runtime/pyexec.c
 
 include $(TOP)/py/py.mk

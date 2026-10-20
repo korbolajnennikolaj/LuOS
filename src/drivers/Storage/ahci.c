@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "ahci.h"
 
 #include "kernel/scheduler/scheduler.h"
@@ -42,6 +45,7 @@ static void ahci_lock(spinlock_t *l)
 }
 
 static void (*delay_ms)(uint64_t);
+static void (*delay_us)(uint64_t);
 
 static void port_stop(volatile hba_port_t *port)
 {
@@ -147,10 +151,16 @@ static int port_issue_cmd(ahci_port_t *ap, bool write, uint64_t lba, uint32_t se
 
     AHCI_TRACE("%s: %c slot=%d lba=0x%llx n=%u", ap->blkdev.name, write ? 'W' : 'R', slot, (unsigned long long)lba, sectors);
 
-    t = AHCI_TIMEOUT_MS * 10;
-    while (--t > 0) {
-        delay_ms(1);
-        if (!(port->ci & (1u << slot))) break;
+    uint64_t waited_us = 0;
+    t = 1;
+    while (port->ci & (1u << slot)) {
+        if (waited_us >= (uint64_t)AHCI_TIMEOUT_MS * 10 * 1000) {
+            t = 0;
+            break;
+        }
+        uint64_t step = waited_us < 2000 ? 2 : 100;
+        delay_us(step);
+        waited_us += step;
         if (port->is & HBA_IS_TFES) {
             LOG_ERROR("%s: %s lba=%llu n=%u task file error IS=0x%08x TFD=0x%08x SERR=0x%08x", ap->blkdev.name,
                       write ? "write" : "read", (unsigned long long)lba, sectors, port->is, port->tfd, port->serr);
@@ -447,13 +457,14 @@ static struct ahci_driver drv_ahci = {
 
 struct ahci_driver *return_ahci_driver(void)
 {
-    
+
     pci_init();
 
     struct tsc_driver *tsc = get_self_driver(TIMER_DRIVER, TSC_TIMER);
     if (!tsc) { LOG_ERROR("no TSC driver, AHCI disabled"); return NULL; }
 
     delay_ms = tsc->sleep_tsc_ms;
+    delay_us = tsc->sleep_tsc_us;
 
     int disk_idx = 0;
     int pci_count = pci_get_device_count();

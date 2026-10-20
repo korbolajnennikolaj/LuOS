@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef AUDIO_CORE_H
 #define AUDIO_CORE_H
 
@@ -29,6 +32,12 @@ enum AUDIO_TYPE
 #define AUDIO_STATE_STOPPED 0
 #define AUDIO_STATE_PLAYING 1
 #define AUDIO_STATE_PAUSED 2
+
+#define AUDIO_ROUTE_DEFAULT (-1)
+#define AUDIO_ROUTE_MAX_DEVICES 32
+
+#define AUDIO_OUT_MODE_AUTO 0
+#define AUDIO_OUT_MODE_ALL 1
 
 #define AUDIO_FMT_U8 0x00
 #define AUDIO_FMT_S16_LE 0x01
@@ -179,6 +188,10 @@ typedef struct audio_device_ops {
 
     void (*describe)(struct audio_device *dev, void (*out)(const char *line));
 
+    int (*set_output_mode)(struct audio_device *dev, int mode);
+
+    int (*get_output_mode)(struct audio_device *dev);
+
     void (*remove)(struct audio_device *dev);
 } audio_device_ops;
 
@@ -256,6 +269,15 @@ typedef struct audio_core_driver {
     int (*set_default_device)(int dev_idx);
     int (*get_default_device)(void);
 
+    int (*route_add)(int dev_idx);
+    int (*route_remove)(int dev_idx);
+    void (*route_reset)(void);
+    uint32_t (*route_get)(void);
+    int (*route_count)(void);
+
+    int (*set_output_mode)(int dev_idx, int mode);
+    int (*get_output_mode)(int dev_idx);
+
     void (*poll)(void);
 
     int (*write_blocking)(int dev_idx, const void *data, uint32_t len, uint32_t timeout_ms);
@@ -269,6 +291,16 @@ struct driver *return_meta_audio_core_driver(void);
 
 int audio_get_device_count(void);
 struct audio_device *audio_get_device(int idx);
+
+int audio_route_add_device(int dev_idx);
+int audio_route_remove_device(int dev_idx);
+void audio_route_reset(void);
+uint32_t audio_route_mask_get(void);
+int audio_route_device_count(void);
+const char *audio_route_target_name(int dev_idx);
+
+int audio_set_output_mode(int dev_idx, int mode);
+int audio_get_output_mode(int dev_idx);
 
 int audio_core_add_device(struct audio_device *dev);
 void audio_core_remove_device(struct audio_device *dev);

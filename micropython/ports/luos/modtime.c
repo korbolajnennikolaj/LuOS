@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // modtime.c — the "time" module for MicroPython on LuOS.
 //
 // Implemented in the style of MicroPython's standard time module

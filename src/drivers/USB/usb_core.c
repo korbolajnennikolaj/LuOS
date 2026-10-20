@@ -1,3 +1,51 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
+/*
+ *                                              USB STACK
+ *
+ *  +---------------------+  +------------------+  +---------------+  +----------------+  +-----------+
+ *  | usb_keyboard_driver |  | usb_mouse_driver |  |  usb_audio.c  |  | usb_msc_driver |  | usb_hub.c |
+ *  | HID boot            |  | HID boot         |  | UAC1 + UAC2   |  | CBW / CSW      |  | ext hubs  |
+ *  | -> vkbd_input       |  | -> vmouse        |  | -> audio_core |  | -> Storage     |  | any depth |
+ *  +---------------------+  +------------------+  +---------------+  +----------------+  +-----------+
+ *             |                       |                   |                   |                |
+ *             +-----------------------+-------------------+-------------------+----------------+
+ *                                                   |
+ *                      +=========================================================+
+ *                      |                   u s b _ c o r e . c                   |
+ *                      +---------------------------------------------------------+
+ *                      | pump    claim(ms) -> transfer -> release, one at a time |
+ *                      | ctrl    EP0 setup / data / status                       |
+ *                      | intr    poll + IRQ driven, per-device endpoints         |
+ *                      | bulk    slot reserve + data toggle reset                |
+ *                      | iso     open / submit / poll, lens[] actual[] errors    |
+ *                      | enum    reset -> address -> descriptors -> functions    |
+ *                      | events  usb_event.c rings + handlers                    |
+ *                      +=========================================================+
+ *                                                   |
+ *                  +-------------------------+------+--------------+--------------------+
+ *                  |                         |                     |                    |
+ *       +---------------------+   +--------------------+   +---------------+   +----------------+
+ *       |         xhci        |   |        ehci        |   |      uhci     |   |      ohci      |
+ *       | USB 3.0             |   | USB 2.0            |   | USB 1.1       |   | USB 1.1        |
+ *       | TRB ring + doorbell |   | qH + qTD, iTD/siTD |   | TD frame list |   | ED / TD + HCCA |
+ *       +---------------------+   +--------------------+   +---------------+   +----------------+
+ *                  |                         |                     |                    |
+ *                  +-------------------------+---------------------+--------------------+
+ *                                                   |
+ *                             +------------------------------------------+
+ *                             | PCI class 0c03: ECAM scan / BARs / MSI-X |
+ *                             +------------------------------------------+
+ *
+ *   intr xfer:  claim pump -> arm EP -> doorbell -> MSI IRQ -> poll -> event -> HID
+ *   iso stream: open -> submit n packets -> IRQ -> iso_poll(actual[]) -> audio
+ *   bulk MSC:   CBW (31 B) -> data EP -> CSW (13 B) -> fs sector cache
+ *   hotplug:    port change -> survey 25 ticks -> topology -> enum pipeline
+ *   root hubs:  root_hub.c per controller, port poll on the 20 ms tick
+ *   scan:       service_usb_hotplug (20 ms) + shell usb-* -> usb_scan_all
+ */
+
 #include "drivers/USB/usb_core.h"
 
 #include "components/drivers.h"

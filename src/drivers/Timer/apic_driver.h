@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef APIC_DRIVER_H
 #define APIC_DRIVER_H
 
@@ -36,6 +39,7 @@ void apic_send_eoi(void);
 uint8_t apic_get_lapic_id(void);
 void apic_timer_handler(void);
 void apic_enable_this_core(void);
+void apic_send_ipi(uint8_t lapic_id, uint8_t vector);
 
 struct apic_driver *return_apic_driver(void);
 struct driver *return_meta_apic_driver(void);

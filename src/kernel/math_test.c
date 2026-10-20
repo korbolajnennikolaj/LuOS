@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "math_test.h"
 
 #include "drivers/Video/limine_video_driver.h"

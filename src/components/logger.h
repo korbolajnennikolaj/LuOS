@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef LOGGER_H
 #define LOGGER_H
 
@@ -49,6 +52,7 @@ struct logger_message_t {
 
 void logger_init(void);
 void logger_log(struct logger_message_t *message);
+void logger_console_mirror(const char *s);
 
 void logger_printf(enum logger_level_t level, const char *caller, const char *format, ...)
     __attribute__((format(printf, 3, 4)));

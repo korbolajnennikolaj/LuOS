@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 korbolajnennikolaj
+
 NPROC := $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
 ifeq ($(filter -j%,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(NPROC)
 endif
-MAKEFLAGS += --output-sync=target
 
 PROJECT_NAME = LuOS
 KERNEL = kernel.bin
@@ -12,6 +14,7 @@ INITRD ?=
 
 CC = gcc
 LD = ld
+OBJCOPY = objcopy
 AS = nasm
 
 MPY_DIR = micropython
@@ -19,34 +22,34 @@ MPY_PORT = luos
 MPY_BUILD_DIR = $(MPY_DIR)/ports/$(MPY_PORT)/build
 MPY_FIRMWARE = $(MPY_BUILD_DIR)/firmware.o
 
-LIMINE_PATH = /usr/share/limine
-OVMF_PATH = /usr/share/edk2/x64/OVMF.4m.fd
+LIMINE_PATH ?= /usr/share/limine
+OVMF_PATH ?= /usr/share/edk2/x64/OVMF.4m.fd
 GCC_INCLUDE = $(shell $(CC) -print-file-name=include)
 
 DEPFLAGS = -MMD -MP
 
 CFLAGS_BASE = -m64 -ffreestanding -O2 -Wall -Wextra \
-	-nostdlib -nostdinc -fno-builtin \
-	-fno-stack-protector -fno-pie -fno-pic \
-	-mno-red-zone -mcmodel=kernel \
-	-fno-tree-loop-distribute-patterns \
-	-I./include -I./src -I./lib \
-	-I$(GCC_INCLUDE) \
-	-I./src/lua/include \
-	-I./src/lua/core \
-	-I./src/lua \
-	-I./micropython/ports/luos
+        -nostdlib -nostdinc -fno-builtin \
+        -fno-stack-protector -fno-pie -fno-pic \
+        -mno-red-zone -mcmodel=kernel \
+        -fno-tree-loop-distribute-patterns \
+        -I./include -I./src -I./lib \
+        -I$(GCC_INCLUDE) \
+        -I./src/lua/include \
+        -I./src/lua/core \
+        -I./src/lua \
+        -I./micropython/ports/luos
 
 CFLAGS = $(CFLAGS_BASE) \
-	-mno-sse -mno-sse2 -mno-mmx -mno-80387
+        -mno-sse -mno-sse2 -mno-mmx -mno-80387
 
 CFLAGS_MATH = $(CFLAGS_BASE) \
-	-msse -msse2 -mno-mmx
+        -msse -msse2 -mno-mmx
 
 CFLAGS_LUA = $(CFLAGS_BASE) \
-	-msse -msse2 -mno-mmx \
-	-DLUA_USE_LUOS \
-	-Wno-empty-body
+        -msse -msse2 -mno-mmx \
+        -DLUA_USE_LUOS \
+        -Wno-empty-body
 
 ASFLAGS = -f elf64
 
@@ -68,9 +71,13 @@ ASM_OBJECTS = $(patsubst %.asm, $(BUILD_DIR)/%.o, $(ASM_SOURCES))
 LUA_SOURCES = $(shell find src/lua -name '*.c')
 
 MATH_SOURCES = lib/math.c src/kernel/math_test.c \
-	src/drivers/Video/limine_video_driver.c \
-	lib/stdlib.c lib/time.c src/kernel/libc_test.c \
-	lib/dtoa.c lib/stdio.c src/kernel/games.c
+        src/drivers/Video/limine_video_driver.c \
+        src/drivers/GPU/gpu_core.c \
+        src/drivers/GPU/gpu_demo_gl.c \
+        src/drivers/GPU/gpu_demo_vk.c \
+        src/drivers/GPU/gfx_lib.c \
+        lib/stdlib.c lib/time.c src/kernel/libc_test.c \
+        lib/dtoa.c lib/stdio.c src/kernel/games.c
 
 LUA_OBJECTS    = $(patsubst %.c, $(BUILD_DIR)/%.o, $(LUA_SOURCES))
 MATH_OBJECTS   = $(patsubst %.c, $(BUILD_DIR)/%.o, $(MATH_SOURCES))
@@ -78,12 +85,13 @@ NORMAL_OBJECTS = $(filter-out $(MATH_OBJECTS) $(LUA_OBJECTS), $(C_OBJECTS))
 
 OBJECTS = $(NORMAL_OBJECTS) $(MATH_OBJECTS) $(LUA_OBJECTS) $(ASM_OBJECTS)
 
+.PHONY: initfs initfs-clean
 .PHONY: all clean run-uefi run-uefi-smp run-bios iso-limine help \
-	run-uhci-bios run-ehci-bios run-ohci-bios \
-	run-audio-hda run-audio-ac97 run-audio-usb run-audio-all \
-	run-xhci-bios run-xhci-uefi run-xhci-log \
-	run-uhci-log run-ehci-log run-ohci-log \
-	run-ata-log run-stress-log
+        run-uhci-bios run-ehci-bios run-ohci-bios \
+        run-audio-hda run-audio-ac97 run-audio-usb run-audio-all \
+        run-xhci-bios run-xhci-uefi run-xhci-log \
+        run-uhci-log run-ehci-log run-ohci-log \
+        run-ata-log run-stress-log
 
 AHCI_LOG       = ahci_trace.log
 AHCI_QEMU_LOG  = qemu_debug_ahci.log
@@ -168,9 +176,60 @@ $(NORMAL_OBJECTS): $(BUILD_DIR)/%.o: %.c
 
 -include $(OBJECTS:.o=.d)
 
-$(KERNEL): $(OBJECTS) $(MPY_FIRMWARE)
+include linux/linux.mk
+
+INITFS_PROFILE ?= tests
+INITFS_FIRMWARE ?= none
+INITFS_FW_TAG = $(subst $(eval) ,-,$(strip $(filter-out none,$(INITFS_FIRMWARE))))
+INITFS_DEFAULT = userspace/sysroot/build/luos-initfs-$(INITFS_PROFILE)$(if $(INITFS_FW_TAG),-$(INITFS_FW_TAG)).img
+INITFS ?= $(INITFS_DEFAULT)
+INITFS_OBJ = $(BUILD_DIR)/initfs_blob.o
+INITFS_EXTRA = $(if $(filter tests,$(INITFS_PROFILE)),--extra-bin userspace/tests/bin --extra-bin userspace/drm/bin --extra userspace/gfx)
+ifeq ($(INITFS),none)
+INITFS_BLOB = $(BUILD_DIR)/initfs/empty.img
+else
+INITFS_BLOB = $(INITFS)
+endif
+
+GPU_FIRMWARE_ROOT = userspace/sysroot/build/firmware
+GPU_FIRMWARE_ZIP = LuOS_gpu_firmware.zip
+
+$(GPU_FIRMWARE_ROOT): userspace/sysroot/mkfirmware.py
+	@echo "[FS]  GPU firmware directory (amdgpu, i915, nouveau) from Ubuntu 24.04 packages -> $@"
+	@python3 userspace/sysroot/mkfirmware.py $@
+
+gpu-firmware: $(GPU_FIRMWARE_ROOT)
+
+$(GPU_FIRMWARE_ZIP): $(GPU_FIRMWARE_ROOT)
+	@echo "[ZIP] $(GPU_FIRMWARE_ZIP): the whole firmware directory as ONE zip, read on the fly"
+	@cd $(GPU_FIRMWARE_ROOT) && rm -f "$(CURDIR)/$(GPU_FIRMWARE_ZIP)" && zip -r -q -6 "$(CURDIR)/$(GPU_FIRMWARE_ZIP)" lib/firmware
+	@unzip -l $(GPU_FIRMWARE_ZIP) | tail -1
+
+gpu-firmware-zip: $(GPU_FIRMWARE_ZIP)
+
+$(INITFS_DEFAULT): userspace/sysroot/mkinitfs.py userspace/sysroot/firmware.list userspace/mesa/mesa_host.c
+	@mkdir -p $(dir $@)
+	@echo "[FS]  Built-in filesystem ($(INITFS_PROFILE), firmware: $(or $(INITFS_FW_TAG),none)) from Ubuntu 24.04 packages -> $@"
+	@echo "[FS]  Firmware groups are packed into one compressed /lib/firmware.zip in the image, read on the fly"
+	@python3 userspace/sysroot/mkinitfs.py $@ --profile $(INITFS_PROFILE) --firmware "$(or $(strip $(filter-out none,$(INITFS_FIRMWARE))),none)" $(INITFS_EXTRA)
+
+$(BUILD_DIR)/initfs/empty.img:
+	@mkdir -p $(dir $@)
+	@: > $@
+
+$(INITFS_OBJ): $(INITFS_BLOB)
+	@echo "[AS]  Embedding $<..."
+	@printf 'section .initfs progbits alloc noexec nowrite align=4096\nincbin "%s"\nsection .note.GNU-stack noalloc noexec nowrite progbits\n' "$(abspath $<)" > $(BUILD_DIR)/initfs_blob.asm
+	@$(AS) $(ASFLAGS) $(BUILD_DIR)/initfs_blob.asm -o $@
+
+initfs: $(INITFS_BLOB)
+
+initfs-clean:
+	@rm -rf userspace/sysroot/build
+
+$(KERNEL): $(OBJECTS) $(LINUX_OBJ) $(MPY_FIRMWARE) $(INITFS_OBJ)
 	@echo "[LD]  Linking kernel with MicroPython..."
-	@$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(MPY_FIRMWARE) $(LIBGCC)
+	@$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(LINUX_OBJ) $(MPY_FIRMWARE) $(INITFS_OBJ) $(LIBGCC)
 	@echo "Kernel built: $(KERNEL)"
 
 run-uefi: iso-limine
@@ -188,7 +247,7 @@ run-uefi: iso-limine
 		-machine q35 \
 		-bios $(OVMF_PATH) \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-boot d \
 		-serial stdio \
 		-d guest_errors,unimp,int \
@@ -235,7 +294,7 @@ run-bios: iso-limine
 	qemu-system-x86_64 \
 		-rtc base=localtime,clock=host \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu qemu64,tsc-frequency=2000000000 \
 		-smp 1 \
 		-serial stdio \
@@ -257,7 +316,7 @@ run-xhci-uefi: iso-limine $(DISK_IMG)
 		-machine q35 \
 		-bios $(OVMF_PATH) \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu host \
 		-enable-kvm \
 		-device qemu-xhci,id=xhci \
@@ -280,7 +339,7 @@ run-xhci-bios: iso-limine $(DISK_IMG)
 	qemu-system-x86_64 \
 		-machine q35 \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu host \
 		-enable-kvm \
 		-device nec-usb-xhci,id=xhci,streams=on \
@@ -304,7 +363,7 @@ run-bios-2ghz: iso-limine
 	qemu-system-x86_64 \
 		-rtc base=localtime,clock=host \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu qemu64,tsc-frequency=2000000000 \
 		-accel tcg \
 		-smp 1 \
@@ -325,7 +384,7 @@ run-uhci-bios: iso-limine $(DISK_IMG)
 	qemu-system-x86_64 \
 		-machine pc,usb=on \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu host \
 		-enable-kvm \
 		-device piix4-usb-uhci,id=uhci2 \
@@ -349,7 +408,7 @@ run-ehci-bios: iso-limine $(DISK_IMG)
 	qemu-system-x86_64 \
 		-machine pc \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu host \
 		-enable-kvm \
 		-device usb-ehci,id=ehci \
@@ -373,7 +432,7 @@ run-ohci-bios: iso-limine $(DISK_IMG)
 	qemu-system-x86_64 \
 		-machine pc \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-cpu host \
 		-enable-kvm \
 		-device pci-ohci,id=ohci \
@@ -400,7 +459,7 @@ run-audio-hda: iso-limine
 	qemu-system-x86_64 \
 		-machine q35 \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 2 \
 		-boot d \
 		-serial stdio \
@@ -417,7 +476,7 @@ run-audio-ac97: iso-limine
 	qemu-system-x86_64 \
 		-machine pc \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 2 \
 		-boot d \
 		-serial stdio \
@@ -433,7 +492,7 @@ run-audio-usb: iso-limine
 	qemu-system-x86_64 \
 		-machine q35 \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 2 \
 		-boot d \
 		-serial stdio \
@@ -452,7 +511,7 @@ run-audio-all: iso-limine
 	qemu-system-x86_64 \
 		-machine q35 \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 2 \
 		-boot d \
 		-serial stdio \
@@ -482,7 +541,7 @@ run-ata-log: iso-limine $(DISK_IMG)
 	qemu-system-x86_64 \
 		-machine pc \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 1 \
 		-serial stdio \
 		-nodefaults \
@@ -497,7 +556,7 @@ run-ata-log: iso-limine $(DISK_IMG)
 	@echo "  QEMU : $(ATA_QEMU_LOG)"
 	@echo "  STDERR: $(ATA_LOG)"
 
-iso-limine: $(KERNEL)
+iso-limine: $(KERNEL) $(GPU_FIRMWARE_ZIP)
 	@echo "[ISO] Building Limine ISO..."
 	@if [ ! -d "$(LIMINE_PATH)" ]; then \
 		echo "[ERR] Limine files not found at $(LIMINE_PATH)!"; \
@@ -509,22 +568,37 @@ iso-limine: $(KERNEL)
 
 	@cp $(KERNEL) $(ISO_DIR_LIMINE)/
 
+	@echo "[ISO] Staging the compressed firmware directory into the ISO at /lib/firmware.zip (not linked into the kernel)..."
+	@mkdir -p $(ISO_DIR_LIMINE)/lib
+	@cp $(GPU_FIRMWARE_ZIP) $(ISO_DIR_LIMINE)/lib/firmware.zip
+	@echo "[ISO] $(shell du -h $(GPU_FIRMWARE_ZIP) | cut -f1) ONE /lib/firmware.zip ($(shell unzip -Z1 $(GPU_FIRMWARE_ZIP) | wc -l) entries, $(shell du -sh $(GPU_FIRMWARE_ROOT)/lib/firmware | cut -f1) loose), read on the fly at boot, never unpacked"
+
 	@echo "TIMEOUT:5" > $(ISO_DIR_LIMINE)/limine.conf
 	@echo "" >> $(ISO_DIR_LIMINE)/limine.conf
 	@echo "/LuOS" >> $(ISO_DIR_LIMINE)/limine.conf
 	@echo "    PROTOCOL:limine" >> $(ISO_DIR_LIMINE)/limine.conf
 	@echo "    KERNEL_PATH:boot():/kernel.bin" >> $(ISO_DIR_LIMINE)/limine.conf
+	@if [ -n "$(KERNEL_CMDLINE)" ]; then echo "    CMDLINE:$(KERNEL_CMDLINE)" >> $(ISO_DIR_LIMINE)/limine.conf; fi
 	@if [ -n "$(INITRD)" ]; then \
 		cp "$(INITRD)" $(ISO_DIR_LIMINE)/initrd; \
 		echo "    MODULE_PATH:boot():/initrd" >> $(ISO_DIR_LIMINE)/limine.conf; \
 		echo "[ISO] Added initrd module: $(INITRD)"; \
 	fi
+	@echo "" >> $(ISO_DIR_LIMINE)/limine.conf
+	@echo "/LuOS (no GPU drivers, firmware framebuffer)" >> $(ISO_DIR_LIMINE)/limine.conf
+	@echo "    PROTOCOL:limine" >> $(ISO_DIR_LIMINE)/limine.conf
+	@echo "    KERNEL_PATH:boot():/kernel.bin" >> $(ISO_DIR_LIMINE)/limine.conf
+	@echo "    CMDLINE:nomodeset $(KERNEL_CMDLINE)" >> $(ISO_DIR_LIMINE)/limine.conf
+	@if [ -n "$(INITRD)" ]; then echo "    MODULE_PATH:boot():/initrd" >> $(ISO_DIR_LIMINE)/limine.conf; fi
 
 	@cp $(LIMINE_PATH)/limine-bios.sys $(ISO_DIR_LIMINE)/
 	@cp $(LIMINE_PATH)/limine-bios-cd.bin $(ISO_DIR_LIMINE)/
 	@cp $(LIMINE_PATH)/limine-uefi-cd.bin $(ISO_DIR_LIMINE)/
 
 	@xorriso -as mkisofs -quiet \
+		-V ISOIMAGE \
+		-iso-level 3 \
+		-rock \
 		-b limine-bios-cd.bin \
 		-no-emul-boot -boot-load-size 4 -boot-info-table \
 		--efi-boot limine-uefi-cd.bin \
@@ -564,7 +638,7 @@ run-ahci-log: iso-limine $(DISK_IMG)
 		-machine q35 \
 		-bios $(OVMF_PATH) \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 1 \
 		-serial stdio \
 		-nodefaults \
@@ -601,7 +675,7 @@ else
 		-machine q35 \
 		-bios $(OVMF_PATH) \
 		-cdrom $(ISO_LIMINE) \
-		-m 512M \
+		-m 1024M \
 		-smp 1 \
 		-serial stdio \
 		-nodefaults \
@@ -624,7 +698,7 @@ STRESS_DBG_LOG = qemu_stress_debug.log
 
 ifeq ($(QEMU_HAS_NVME),yes)
 STRESS_NVME_ARGS = -drive file=$(NVME_DISK_IMG),if=none,format=raw,id=nvmedisk0 \
-	-device nvme,serial=deadbeef,drive=nvmedisk0
+        -device nvme,serial=deadbeef,drive=nvmedisk0
 else
 STRESS_NVME_ARGS =
 endif
@@ -687,97 +761,16 @@ endif
 	@echo "[STRESS UEFI] Done. Traces -> $(STRESS_LOG) | QEMU log (incl. int/cpu_reset) -> $(STRESS_DBG_LOG)"
 
 clean:
-	@echo "[CLEAN] Cleaning all build artifacts and logs..."
-	@rm -rf $(BUILD_DIR) $(KERNEL) $(ISO_LIMINE) $(ISO_DIR_LIMINE)
-	@$(MAKE) -C $(MPY_DIR)/ports/$(MPY_PORT) clean
-	@rm -rf $(BUILD_DIR) $(KERNEL) $(ISO_LIMINE) $(ISO_DIR_LIMINE)
+	@echo "[CLEAN] build outputs, binaries, images and logs..."
+	@rm -rf $(BUILD_DIR) $(KERNEL) $(ISO_LIMINE) $(ISO_DIR_LIMINE) LuOS_gpu_firmware.zip
+	@rm -rf userspace/sysroot/build userspace/drm/gen userspace/drm/bin userspace/tests/bin userspace/tests/lib
+	@$(MAKE) -C $(MPY_DIR)/ports/$(MPY_PORT) clean >/dev/null 2>&1 || true
 	@rm -f qemu_cpu_debug.log serial.log fullsource.txt qemu_debug.log \
-		$(XHCI_UEFI_LOG) $(XHCI_UEFI_DBG) \
-		$(XHCI_BIOS_LOG) $(XHCI_BIOS_DBG) \
-		$(UHCI_LOG) $(UHCI_DBG_LOG) \
-		$(EHCI_LOG) $(EHCI_DBG_LOG) \
-		$(OHCI_LOG) $(OHCI_DBG_LOG) \
-		$(DISK_IMG) \
-		$(NVME_DISK_IMG) \
-		$(STRESS_DISKS) \
-		$(AHCI_LOG) \
-		$(AHCI_QEMU_LOG) \
-		$(ATA_LOG) \
-		$(ATA_QEMU_LOG) \
-		$(NVME_LOG) \
-		$(NVME_QEMU_LOG) \
-		$(USB_DISK_LOG) \
-		$(USB_DISK_QEMU_LOG) \
-		$(STRESS_LOG) \
-		$(STRESS_DBG_LOG) \
-		$(SMP_LOG) \
-		$(SMP_DBG_LOG) \
-		$(AUDIO_LOG) \
+		$(XHCI_UEFI_LOG) $(XHCI_UEFI_DBG) $(XHCI_BIOS_LOG) $(XHCI_BIOS_DBG) \
+		$(UHCI_LOG) $(UHCI_DBG_LOG) $(EHCI_LOG) $(EHCI_DBG_LOG) \
+		$(OHCI_LOG) $(OHCI_DBG_LOG) $(DISK_IMG) $(NVME_DISK_IMG) $(STRESS_DISKS) \
+		$(AHCI_LOG) $(AHCI_QEMU_LOG) $(ATA_LOG) $(ATA_QEMU_LOG) \
+		$(NVME_LOG) $(NVME_QEMU_LOG) $(USB_DISK_LOG) $(USB_DISK_QEMU_LOG) \
+		$(STRESS_LOG) $(STRESS_DBG_LOG) $(SMP_LOG) $(SMP_DBG_LOG) $(AUDIO_LOG) \
 		usb_audio_trace.log
-	@echo "Cleanup complete."
-
-help:
-	@echo "================================================================="
-	@echo "LuOS Build System - Help"
-	@echo "================================================================="
-	@echo "BUILD:"
-	@echo "  make all                 - Compile the kernel (kernel.bin)"
-	@echo "  make iso-limine          - Create a bootable ISO"
-	@echo "  make iso-limine INITRD=f - Same, with file f loaded as initrd (rd0)"
-	@echo "  make clean               - Remove build artifacts and logs"
-	@echo ""
-	@echo "RUN (QEMU):"
-	@echo "  make run-uefi            - Run in QEMU (UEFI mode, 1 core)"
-	@echo "  make run-uefi-smp        - Run in QEMU (UEFI mode, 4 cores, KVM, 1024M RAM)"
-	@echo "  make run-bios            - Run in QEMU (BIOS mode)"
-	@echo "  make run-bios-2ghz       - Run in BIOS mode (TCG, 2GHz, no KVM)"
-	@echo ""
-	@echo "RUN (STORAGE):"
-	@echo "  make run-ahci-log        - Run QEMU with AHCI + disk.img + logging"
-	@echo ""
-	@echo "RUN (ATA - classic IDE):"
-	@echo "  make run-ata-log         - Run QEMU with PATA/IDE (legacy ATA mode)"
-	@echo ""
-	@echo "RUN (xHCI - USB 3.0):"
-	@echo "  make run-xhci-bios       - NEC xHCI + virtual kbd/mouse/disk (BIOS/SeaBIOS)"
-	@echo "  make run-xhci-uefi       - NEC xHCI + virtual kbd/mouse/disk (UEFI/OVMF)"
-	@echo "  make run-xhci-log        - alias for run-xhci-bios"
-	@echo ""
-	@echo "RUN (Legacy USB - with virtual kbd/mouse/disk):"
-	@echo "  make run-uhci-bios       - PIIX4 UHCI (USB 1.1)"
-	@echo "  make run-ehci-bios       - EHCI (USB 2.0) + companion UHCI"
-	@echo "  make run-ohci-bios       - PCI OHCI (USB 1.1)"
-	@echo ""
-	@echo "RUN (AUDIO - host sound via AUDIO_BACKEND=pa|pipewire|alsa|sdl|wav,path=out.wav):"
-	@echo "  make run-audio-hda       - Intel HDA (ICH9) + hda-duplex codec"
-	@echo "  make run-audio-ac97      - Intel ICH AC97 + STAC9700 codec"
-	@echo "  make run-audio-usb       - USB Audio Class 1 device on xHCI"
-	@echo "  make run-audio-all       - all three at once"
-	@echo ""
-	@echo "RUN (SMP TEST - 4 cores):"
-	@echo "  make run-uefi-smp        - Quick SMP test (UEFI, 4 cores, no extra devices)"
-	@echo ""
-	@echo "RUN (STRESS - SMP + heavy device load):"
-	@echo "  make run-stress-log      - SMP ($(SMP_STRESS_CORES) cores, override with SMP_STRESS_CORES=N)"
-	@echo "                             + AHCI + ATA/IDE + NVMe (if supported) + xHCI/EHCI/UHCI/OHCI."
-	@echo "                             Input is spread out, not duplicated on every controller:"
-	@echo "                             xHCI=mouse, EHCI=keyboard, UHCI/OHCI=storage only —"
-	@echo "                             one working kbd+mouse total, still real HW load per controller."
-	@echo "                             Each controller gets its own 32 MB FAT32 disk image."
-	@echo "                             Stresses the scheduler/SMP bring-up and every driver lock at once."
-	@echo "                             Logs -> $(STRESS_LOG) (stderr/trace) and $(STRESS_DBG_LOG) (QEMU -d incl. int/cpu_reset)"
-	@echo ""
-	@echo "DEBUG AND SOURCE:"
-	@echo "  make fullsource          - Gather all source files into one file (.c, .h, .asm)"
-	@echo "  make unpack              - Extract files from fullsource.txt"
-	@echo ""
-	@echo "DISKS:"
-	@echo "  disk.img / nvme_disk.img - automatically created (GPT, 3 partitions:"
-	@echo "                             p1=FAT32, p2=exFAT, p3=ext4) for AHCI,"
-	@echo "                             ATA, and USB (xHCI/EHCI/OHCI/UHCI) tests"
-	@echo "                             (requires sudo for losetup)"
-	@echo "  disk_ahci/xhci/ehci/uhci/ohci.img - 32 MB FAT32 per-controller images"
-	@echo "                             for the stress test (no sudo needed)"
-	@echo "  make clean               - removes all disk images and logs"
-	@echo ""
-	@echo "================================================================="
+	@echo "Cleanup complete - the tree is source-only again."

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef LIMINE_VIDEO_DRIVER_H
 #define LIMINE_VIDEO_DRIVER_H
 #include <stdbool.h>
@@ -47,6 +50,12 @@ typedef struct limine_video_driver {
 } limine_video_driver;
 
 struct limine_video_driver* return_limine_video_driver();
+bool limine_video_attach(void* pixels, uint64_t width, uint64_t height, uint64_t pitch);
+void limine_video_detach(void);
+void limine_video_panic_takeover(void);
+bool limine_video_take_damage(uint32_t rect[4]);
+bool limine_video_fb_info(uint8_t** pixels, uint32_t* width, uint32_t* height, uint32_t* pitch);
+void limine_video_announce_damage(void);
 struct driver* return_meta_limine_video_driver();
 
 #endif

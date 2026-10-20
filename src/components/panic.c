@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "panic.h"
 
 #include "components/drivers.h"
 #include "drivers/Video/gop_font.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "components/Memory/mm.h"
 #include "kernel/scheduler/scheduler.h"
 
 #include <stdarg.h>
@@ -55,6 +59,17 @@ static const char *panic_code_name(enum panic_code code) {
     }
 }
 
+static bool panic_mapped(uint64_t cr3, uint64_t va) {
+    uint64_t table = cr3 & 0x000FFFFFFFFFF000ULL;
+    for (int level = 0; level < 4; level++) {
+        uint64_t e = ((uint64_t *)mm_phys_to_virt(table))[(va >> (39 - 9 * level)) & 511];
+        if (!(e & 1)) return false;
+        if (level > 0 && level < 3 && (e & 0x80)) return true;
+        table = e & 0x000FFFFFFFFFF000ULL;
+    }
+    return true;
+}
+
 static void panic_log_report(struct panic_info *info) {
     struct task *t = current_task();
 
@@ -76,9 +91,44 @@ static void panic_log_report(struct panic_info *info) {
     panic_log("r12=0x%016llx r13=0x%016llx r14=0x%016llx r15=0x%016llx",
               (unsigned long long)r->r12, (unsigned long long)r->r13,
               (unsigned long long)r->r14, (unsigned long long)r->r15);
-    panic_log("rip=0x%016llx rflags=0x%016llx cr2=0x%016llx cr3=0x%016llx",
+    panic_log("rip=0x%016llx rflags=0x%016llx cr2=0x%016llx cr3=0x%016llx err=0x%llx",
               (unsigned long long)r->rip, (unsigned long long)r->rflags,
-              (unsigned long long)r->cr2, (unsigned long long)r->cr3);
+              (unsigned long long)r->cr2, (unsigned long long)r->cr3, (unsigned long long)r->err_code);
+
+    if (info->code == PANIC_CODE_PAGE_FAULT) {
+        uint64_t e[4] = { 0, 0, 0, 0 };
+        uint64_t table = r->cr3 & 0x000FFFFFFFFFF000ULL;
+        int level;
+        for (level = 0; level < 4; level++) {
+            uint64_t idx = (r->cr2 >> (39 - 9 * level)) & 511;
+            e[level] = ((uint64_t *)mm_phys_to_virt(table))[idx];
+            if (!(e[level] & 1) || (level > 0 && level < 3 && (e[level] & 0x80))) break;
+            table = e[level] & 0x000FFFFFFFFFF000ULL;
+        }
+        panic_log("walk of cr2: pml4e=%016llx pdpte=%016llx pde=%016llx pte=%016llx", (unsigned long long)e[0],
+                  (unsigned long long)e[1], (unsigned long long)e[2], (unsigned long long)e[3]);
+    }
+
+    extern char __text_end[];
+    uint64_t rsp = r->rsp;
+    if (rsp < 0xffff800000000000ULL) asm volatile("mov %%rsp, %0" : "=r"(rsp));
+    uint64_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t *sp = (uint64_t *)(rsp & ~7ULL);
+    char line[160];
+    int len = 0, found = 0;
+    for (int i = 0; i < 512 && found < 24; i++) {
+        if ((i == 0 || ((uint64_t)&sp[i] & 0xFFF) == 0) && !panic_mapped(cr3, (uint64_t)&sp[i])) break;
+        uint64_t v = sp[i];
+        if (v < 0xffffffff80000000ULL || v >= (uint64_t)__text_end) continue;
+        len += snprintf(line + len, sizeof(line) - (size_t)len, " %llx", (unsigned long long)v);
+        found++;
+        if (found % 6 == 0) {
+            panic_log("stack:%s", line);
+            len = 0;
+        }
+    }
+    if (len) panic_log("stack:%s", line);
 }
 
 static size_t panic_log_tail_lines(void) {
@@ -248,6 +298,8 @@ void panic(struct panic_info *info) {
     logger_dump_last_to_text(PANIC_MAX_LOG_PRINT_SIZE, panic_collect_log);
 
     panic_log_report(info);
+
+    limine_video_panic_takeover();
 
     struct limine_video_driver *video_driver =
         get_self_driver(LIMINE_VIDEO_DRIVER, 0);

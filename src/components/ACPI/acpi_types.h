@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef ACPI_TYPES_H
 #define ACPI_TYPES_H
 

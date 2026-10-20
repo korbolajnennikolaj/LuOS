@@ -1,24 +1,29 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include <string.h>
 
 void *memset(void *s, int c, size_t n)
 {
-    unsigned char *p = (unsigned char *)s;
-    unsigned char v = (unsigned char)c;
+    void *p = s;
+    uint64_t v = (unsigned char)c * 0x0101010101010101ULL;
+    size_t q = n >> 3;
 
-    while (n--)
-        *p++ = v;
-
+    asm volatile("rep stosq" : "+D"(p), "+c"(q) : "a"(v) : "memory");
+    q = n & 7;
+    asm volatile("rep stosb" : "+D"(p), "+c"(q) : "a"(v) : "memory");
     return s;
 }
 
 void *memcpy(void *__restrict dst, const void *__restrict src, size_t n)
 {
-    unsigned char *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
+    void *d = dst;
+    const void *s = src;
+    size_t q = n >> 3;
 
-    while (n--)
-        *d++ = *s++;
-
+    asm volatile("rep movsq" : "+D"(d), "+S"(s), "+c"(q) : : "memory");
+    q = n & 7;
+    asm volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(q) : : "memory");
     return dst;
 }
 
@@ -30,17 +35,13 @@ void *memmove(void *dst, const void *src, size_t n)
     if (d == s || n == 0)
         return dst;
 
-    if (d < s) {
+    if (d < s || d >= s + n)
+        return memcpy(dst, src, n);
 
-        while (n--)
-            *d++ = *s++;
-    } else {
-
-        d += n;
-        s += n;
-        while (n--)
-            *--d = *--s;
-    }
+    d += n;
+    s += n;
+    while (n--)
+        *--d = *--s;
 
     return dst;
 }

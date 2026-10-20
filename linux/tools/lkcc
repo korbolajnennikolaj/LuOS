@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 korbolajnennikolaj
+
+# lkcc FILE.c [extra gcc flags] -- compiles one file against the LinuxKPI (same flags as linux.mk), prints errors.
+# FILE is relative to linux/upstream (e.g. drivers/gpu/drm/drm_gem.c) or any path.
+L=$(cd "$(dirname "$0")/.." && pwd)
+F=$1; shift
+SRC=$L/upstream/$F; [ -f "$SRC" ] || SRC=$F
+MOD=$(basename "$F" .c)
+exec gcc -std=gnu11 -O2 -m64 -funsigned-char -fno-strict-aliasing -fno-common -fno-delete-null-pointer-checks \
+  -ffreestanding -fno-PIE -fno-pic -mcmodel=kernel -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -mno-3dnow -mno-avx \
+  -mno-80387 -fno-stack-protector -nostdinc -D__KERNEL__ -DKBUILD_MODNAME="\"$MOD\"" -DKBUILD_BASENAME="\"$MOD\"" \
+  -include "$L/kpi/include/lkpi/prelude.h" \
+  -I"$L/kpi/include" -I"$L/upstream/include" -I"$L/kpi/include/uapi" -I"$L/upstream/include/uapi" \
+  -I"$L/upstream/arch/x86/include/uapi" -I"$(dirname "$SRC")" \
+  -Wall -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-pointer-sign \
+  -Wno-unused-function -Wno-address-of-packed-member -Wno-format-truncation -Wno-format \
+  -Werror=implicit-function-declaration -Werror=incompatible-pointer-types -Werror=int-conversion \
+  -Werror=return-type -Werror=implicit-int -fmax-errors=${MAXERR:-30} -c "$SRC" -o /dev/null "$@"

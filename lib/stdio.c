@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -7,6 +10,7 @@
 
 #include "drivers/Video/limine_video_driver.h"
 #include "components/drivers.h"
+#include "components/logger.h"
 #include "kernel/scheduler/spinlock.h"
 
 static spinlock_t stdio_out_lock = SPINLOCK_INIT;
@@ -44,6 +48,7 @@ static void _video_write(const char *str, uint32_t color) {
     if (v && v->printf) {
         v->printf(str, color);
     }
+    logger_console_mirror(str);
 }
 
 void stdio_register_video_stream(void) {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include "fs/exfat.h"
 
 const uint16_t exfat_default_upcase[EXFAT_DEFAULT_UPCASE_LEN] = {

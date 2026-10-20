@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // main.c — MicroPython integration into the LuOS kernel.
 // The embedding model mirrors the official micropython/ports/embed port
 // (see ports/embed/port/embed_util.c): initialize the runtime once
@@ -21,7 +24,7 @@
 #include "components/Memory/heap.h" // For kmalloc
 #include "kernel/scheduler/scheduler.h"
 
-#define MP_LUOS_HEAP_SIZE (64 * 1024)
+#define MP_LUOS_HEAP_SIZE (1024 * 1024)
 
 static char *mp_heap = NULL;
 static char *mp_stack_top_ptr = NULL;

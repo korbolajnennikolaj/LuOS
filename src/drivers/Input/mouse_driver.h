@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef MOUSE_DRIVER_H
 #define MOUSE_DRIVER_H
 

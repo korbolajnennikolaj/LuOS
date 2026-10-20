@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 // mpconfigport.h — MicroPython port configuration for the LuOS kernel
 // (bare-metal x86_64, no filesystem, no libc)
 

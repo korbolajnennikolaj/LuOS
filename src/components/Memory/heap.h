@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef HEAP_H
 #define HEAP_H
 
@@ -10,6 +13,11 @@ void* kmalloc(size_t size);
 void kfree(void* ptr);
 void* krealloc(void* ptr, size_t size);
 void* kmalloc_aligned(size_t size, size_t align);
+
+void heap_enable_growth(uintptr_t limit);
+size_t heap_get_mapped(void);
+size_t heap_block_size(const void *ptr);
+uint64_t heap_get_grow_count(void);
 
 size_t heap_get_used(void);
 size_t heap_get_total(void);

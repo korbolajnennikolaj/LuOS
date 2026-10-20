@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef SCHEDULER_H
 #define SCHEDULER_H
 
@@ -26,7 +29,19 @@ void task_exit(void) __attribute__((noreturn));
 
 void scheduler_tick(struct registers *regs);
 void scheduler_yield(void);
+
+void scheduler_preempt_resume(void);
 void scheduler_sleep_ms(uint64_t ms);
+
+struct task *task_create_user(const char *name, void (*entry)(void *), void *arg, int priority,
+                              void *proc, uint64_t cr3, uint32_t stack_size, int start);
+void task_start(struct task *t);
+
+int scheduler_wait(void *channel, volatile int *flag, uint64_t timeout_ms);
+
+int scheduler_wake_matching(int (*pred)(struct task *, void *), void *ctx);
+
+void scheduler_for_each_task(void (*fn)(struct task *, void *), void *ctx);
 
 void scheduler_block(void *channel);
 void scheduler_wake(void *channel);

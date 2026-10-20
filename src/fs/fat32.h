@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef LUOS_FAT32_H
 #define LUOS_FAT32_H
 
@@ -117,6 +120,11 @@ typedef struct fat32_fs {
     char label[12];
 } fat32_fs_t;
 
+typedef struct fat32_run {
+    uint32_t first;
+    uint32_t count;
+} fat32_run_t;
+
 typedef struct fat32_file {
     fat32_fs_t *fs;
 
@@ -126,6 +134,11 @@ typedef struct fat32_file {
 
     uint32_t cache_index;
     uint32_t cache_cluster;
+
+    fat32_run_t *runs;
+    uint32_t run_count;
+    uint32_t run_cap;
+    bool runs_valid;
 
     uint8_t *iobuf;
 

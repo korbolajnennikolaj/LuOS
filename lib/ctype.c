@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #include <ctype.h>
 
 int _ctype_isdigit (int c) { return isdigit(c); }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef HPET_DRIVER_H
 #define HPET_DRIVER_H
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef PANIC_H
 #define PANIC_H
 
@@ -39,6 +42,7 @@ typedef struct cpu_regs{
 
     uint64_t cr2;
     uint64_t cr3;
+    uint64_t err_code;
 } cpu_regs_t;
 
 typedef struct panic_info {

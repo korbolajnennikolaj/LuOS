@@ -1,3 +1,49 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
+/*
+ *                                            KEYBOARD STACK
+ *
+ *          +-------------+   +------------------+   +---------------+   +-------------------+
+ *          |   console   |   |  service_shell   |   |    games.c    |   | lua + micropython |
+ *          | line editor |   | prompt / history |   | cube / tetris |   | getch / key state |
+ *          +-------------+   +------------------+   +---------------+   +-------------------+
+ *                 |                    |                    |                     |
+ *                 +--------------------+--------------------+---------------------+
+ *                                                   |
+ *                                                   |
+ *                        +=====================================================+
+ *                        |          k e y b o a r d _ d r i v e r . c          |
+ *                        +-----------------------------------------------------+
+ *                        | queue     vkbd_input(evt) -> get_key_event()        |
+ *                        | decode    scancode -> char (shift + layout)         |
+ *                        | extended  0xE0: arrows / F-keys / ins..pgdn         |
+ *                        | state     is_pressed / is_held per backend          |
+ *                        | repeat    500 ms delay -> every 30 ms               |
+ *                        | LEDs      caps / num / scroll (0xED | HID)          |
+ *                        | pump      updater service: claim -> poll -> release |
+ *                        +=====================================================+
+ *                                                   |
+ *                                     +-------------+-------------+
+ *                                     |                           |
+ *                          +---------------------+     +---------------------+
+ *                          | ps2_keyboard_driver |     | usb_keyboard_driver |
+ *                          | i8042 + IRQ1        |     | HID boot            |
+ *                          | sets 1 + 2          |     | EP1 IN, 8 ms        |
+ *                          | 0xE0 prefixes       |     | LED report          |
+ *                          +---------------------+     +---------------------+
+ *                                     |                           |
+ *                                     +---------------------------+
+ *                                                   |
+ *                         +--------------------------------------------------+
+ *                         | i8042 ports 0x60 / 0x64   |   USB HCD (usb_core) |
+ *                         +--------------------------------------------------+
+ *
+ *   press:  IRQ -> scancode(s) -> decode -> queue -> console -> shell
+ *   repeat: held 500 ms -> 30 ms period -> synthetic event
+ *   plug:   usb function claim -> register_backend -> active set
+ */
+
 #include "drivers/Input/keyboard_driver.h"
 
 #include "components/drivers.h"
@@ -818,12 +864,18 @@ static struct keyboard_driver vkbd = {
 };
 
 struct keyboard_driver *return_keyboard_driver(void) {
-    vkbd.backend_count = 0;
+    static void *last_ps2, *last_usb;
+    static bool registered;
     struct ps2_keyboard_driver *ps2 =
         (struct ps2_keyboard_driver *)get_self_driver(KEYBOARD_DRIVER, PS2_KEYBOARD);
-    if (ps2) vkbd.register_backend(PS2_KEYBOARD, ps2);
     struct usb_keyboard_driver *usb =
         (struct usb_keyboard_driver *)get_self_driver(KEYBOARD_DRIVER, USB_KEYBOARD);
+    if (registered && last_ps2 == (void *)ps2 && last_usb == (void *)usb) return &vkbd;
+    registered = true;
+    last_ps2 = ps2;
+    last_usb = usb;
+    vkbd.backend_count = 0;
+    if (ps2) vkbd.register_backend(PS2_KEYBOARD, ps2);
     if (usb) vkbd.register_backend(USB_KEYBOARD, usb);
     if (vkbd.backend_count == 0)
         LOG_WARNING("no keyboard backends available");

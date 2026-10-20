@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef DRIVERS_H
 #define DRIVERS_H
 
@@ -7,10 +10,10 @@
 #include <stdint.h>
 
 #define MAX_DRIVERS_PER_TYPE 64
-#define AMOUNT_DRIVERS_TYPE 8
+#define AMOUNT_DRIVERS_TYPE 9
 
 #define MAX_DEVICES_PER_TYPE 64
-#define AMOUNT_DEVICES_TYPE 4
+#define AMOUNT_DEVICES_TYPE 5
 
 #define MAX_DEPENDENCIES_PER_DRIVER 8
 
@@ -21,10 +24,11 @@ enum DRIVER_TYPE {
     TIMER_DRIVER = 1,
     KEYBOARD_DRIVER = 2,
     SERIAL_DRIVER = 3,
-    MOUSE_DRIVER = 5,
     USB_DRIVER = 4,
+    MOUSE_DRIVER = 5,
     STORAGE_DRIVER = 6,
     AUDIO_DRIVER = 7,
+    GPU_DRIVER = 8,
 };
 
 enum DEVICE_TYPE {
@@ -32,6 +36,7 @@ enum DEVICE_TYPE {
     USB_DEVICE = 1,
     STORAGE_DEVICE = 2,
     AUDIO_DEVICE = 3,
+    GPU_DEVICE = 4,
 };
 
 enum DRIVER_STATUS{

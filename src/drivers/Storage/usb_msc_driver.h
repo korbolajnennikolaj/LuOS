@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 korbolajnennikolaj
+
 #ifndef USB_MSC_DRIVER_H
 #define USB_MSC_DRIVER_H
 
