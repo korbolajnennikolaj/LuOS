@@ -110,6 +110,8 @@ void luos_irq_free(int vector);
 int luos_irq_attach(int vector, void (*fn)(void *ctx), void *ctx);
 void luos_irq_detach(int vector);
 int luos_irq_route_gsi(int gsi, int vector);
+int luos_pci_intx_vector(void *handle);
+int luos_intx_route(int vector, int enable);
 
 int luos_firmware_get(const char *name, const void **data, unsigned long *size, void **handle);
 void luos_firmware_put(void *handle);

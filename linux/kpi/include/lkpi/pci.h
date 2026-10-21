@@ -125,6 +125,8 @@ struct pci_dev {
 	int lkpi_irq_base;
 	int lkpi_irq_count;
 	int *lkpi_irqs;
+	int lkpi_intx_irq;
+	void *lkpi_rom_copy;
 };
 #define to_pci_dev(n) container_of(n, struct pci_dev, dev)
 #define dev_is_pci(d) lkpi_dev_is_pci(d)

@@ -11,9 +11,10 @@ loader and the ISO9660 driver do not follow links). This is what request_firmwar
 /lib/firmware on the mounted ISO at boot; nothing is linked into the kernel image or loaded
 through an initrd.
 
-radeon/ and xe/ are left out: those drivers are not part of the build.
+radeon/ and xe/ are left out: those drivers are not part of the build. AMD VBIOS images from
+--vbios directories (see vbios.py) go to vbios/ for APUs whose firmware hides theirs.
 
-usage: mkfirmware.py OUT_DIR [--cache DIR]
+usage: mkfirmware.py OUT_DIR [--cache DIR] [--vbios DIR]... [--host-vbios] [--zip OUT.zip]
 Works on any Linux host with python3 and zstd, like mkinitfs.py (the package comes from
 archive.ubuntu.com; questing is preferred because it still ships the unified package that
 contains every chip's GSP blob — the split noble graphics packages lack some).
@@ -23,9 +24,11 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mkinitfs import fetch
+import vbios
 
 MIRROR = "https://mirrors.aliyun.com/ubuntu"
 SUITES = ["questing", "plucky"]     # suites shipping the unified linux-firmware package
@@ -121,28 +124,19 @@ def unpack_zst(src, dst):
         f.write(data)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("out")
-    ap.add_argument("--cache", default=None)
-    args = ap.parse_args()
-
-    out_root = os.path.join(args.out, "lib", "firmware")
-    cache = args.cache or os.path.join(os.path.dirname(os.path.abspath(args.out)), "debs")
-    os.makedirs(cache, exist_ok=True)
-    os.makedirs(out_root, exist_ok=True)
-
-    entry = find_package(cache)
+def fetch_package(entry, cache):
     deb = os.path.join(cache, os.path.basename(entry["Filename"]))
     if not os.path.exists(deb):
         print("fetch %s (%s)" % (os.path.basename(deb), entry["Version"]))
         with open(deb + ".part", "wb") as f:
             f.write(fetch(MIRROR + "/" + entry["Filename"]))
         os.rename(deb + ".part", deb)
+    return deb
 
-    raw = os.path.join(os.path.dirname(os.path.abspath(args.out)), "fw-unpack")
-    if os.path.exists(raw):
-        shutil.rmtree(raw)
+
+def stage_gpu_dirs(deb, work, out_root):
+    raw = os.path.join(work, "fw-unpack")
+    shutil.rmtree(raw, ignore_errors=True)
     os.makedirs(raw)
     print("extracting %s" % os.path.basename(deb))
     extract_deb(deb, raw)
@@ -153,15 +147,13 @@ def main():
             break
     if not src_root:
         sys.exit("the package ships no lib/firmware")
-
-    count = 0
-    total = 0
     for d in GPU_DIRS:
         top = os.path.join(src_root, d)
         if not os.path.isdir(top):
             sys.exit("no %s/ below %s" % (d, src_root))
         files = []
         scan(top, "", 0, files)
+        kept = 0
         for rel, real in files:
             if rel in SKIP_NAMES or rel.endswith(".txt") or rel.endswith(".txt.zst"):
                 continue
@@ -175,14 +167,90 @@ def main():
             else:
                 shutil.copyfile(real, dst)
             os.chmod(dst, 0o644)
-            count += 1
-            total += os.path.getsize(dst)
-        print("firmware: %s/ -> %s/%s (%d files)" % (d, out_root, d, len([r for r, _ in files if not r.endswith('.txt')])))
-
-    with open(os.path.join(cache, "firmware-package.txt"), "w") as f:
-        f.write("linux-firmware %s (%s)\n" % (entry["Version"], os.path.basename(entry["Filename"])))
+            kept += 1
+        print("firmware: %s/ -> %d files" % (d, kept))
     shutil.rmtree(raw, ignore_errors=True)
-    print("firmware: %d files, %.1f MiB for amdgpu, i915, nouveau -> %s" % (count, total / 1048576, out_root))
+
+
+def stage_vbios(dirs, host, out_root):
+    target = os.path.join(out_root, "vbios")
+    shutil.rmtree(target, ignore_errors=True)
+    files, origin = vbios.collect(dirs, host)
+    for name in sorted(files):
+        dst = os.path.join(out_root, name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as f:
+            f.write(files[name])
+        os.chmod(dst, 0o644)
+        print("firmware: %s (%d KiB) from %s" % (name, len(files[name]) // 1024, origin[name]))
+    if not files:
+        print("firmware: no AMD VBIOS images (drop them into %s or run make vbios-dump)" % ", ".join(dirs))
+    return len(files)
+
+
+def write_zip(tree, out_zip):
+    entries = []
+    for root, dirs, names in os.walk(os.path.join(tree, "lib", "firmware")):
+        dirs.sort()
+        for n in sorted(names):
+            path = os.path.join(root, n)
+            entries.append((os.path.relpath(path, tree).replace(os.sep, "/"), path))
+    entries.sort()
+    tmp = out_zip + ".part"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for arc, path in entries:
+            info = zipfile.ZipInfo(arc, date_time=(2026, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            with open(path, "rb") as f:
+                z.writestr(info, f.read(), compresslevel=6)
+    os.replace(tmp, out_zip)
+    print("firmware: %s, %d entries, %.1f MiB" % (out_zip, len(entries), os.path.getsize(out_zip) / 1048576))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out")
+    ap.add_argument("--cache", default=None)
+    ap.add_argument("--vbios", action="append", default=[])
+    ap.add_argument("--host-vbios", action="store_true")
+    ap.add_argument("--zip", default=None)
+    args = ap.parse_args()
+
+    base = os.path.dirname(os.path.abspath(args.out))
+    cache = args.cache or os.path.join(base, "debs")
+    os.makedirs(cache, exist_ok=True)
+    out_root = os.path.join(args.out, "lib", "firmware")
+    marker = os.path.join(args.out, ".package")
+
+    entry = find_package(cache)
+    stamp = "linux-firmware %s (%s)" % (entry["Version"], os.path.basename(entry["Filename"]))
+    have = open(marker).read().strip() if os.path.exists(marker) else ""
+    if have != stamp or not all(os.path.isdir(os.path.join(out_root, d)) for d in GPU_DIRS):
+        deb = fetch_package(entry, cache)
+        staging = args.out + ".new"
+        shutil.rmtree(staging, ignore_errors=True)
+        stage_gpu_dirs(deb, base, os.path.join(staging, "lib", "firmware"))
+        with open(os.path.join(staging, ".package"), "w") as f:
+            f.write(stamp + "\n")
+        shutil.rmtree(args.out, ignore_errors=True)
+        os.replace(staging, args.out)
+    else:
+        print("firmware: %s already staged" % stamp)
+
+    stage_vbios(args.vbios, args.host_vbios, out_root)
+
+    count = 0
+    total = 0
+    for root, _, names in os.walk(out_root):
+        for n in names:
+            count += 1
+            total += os.path.getsize(os.path.join(root, n))
+    with open(os.path.join(cache, "firmware-package.txt"), "w") as f:
+        f.write(stamp + "\n")
+    print("firmware: %d files, %.1f MiB (%s, vbios) -> %s" % (count, total / 1048576, ", ".join(GPU_DIRS), out_root))
+    if args.zip:
+        write_zip(args.out, args.zip)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,16 @@ static void *fs_lock_identity(void) {
     return (void *)(uintptr_t)(current_core() + 1);
 }
 
+static volatile uint32_t fs_gen_seq;
+
+uint32_t fs_new_gen(void) {
+    uint32_t g;
+    do {
+        g = __atomic_add_fetch(&fs_gen_seq, 1, __ATOMIC_ACQ_REL);
+    } while (!g);
+    return g;
+}
+
 void fs_volume_lock_init(fs_t *fs) {
     spin_lock_init(&fs->vlock.spin);
     fs->vlock.owner = NULL;

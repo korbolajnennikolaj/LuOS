@@ -24,6 +24,7 @@
 #define MESA_CALL_PIX 1
 #define MESA_CALL_TRACK_PIX 2
 #define MESA_CALL_TRACK_POKE 3
+#define MESA_CALL_FNPTR 4
 #define MESA_CALL_ARGS 20
 #define MESA_PIX_CHUNK (28 * 1024)
 #define MESA_PIX_CAP (32 * 1024 * 1024)
@@ -46,6 +47,16 @@ struct gpu_pix_xfer {
 };
 
 #define GPU_IOC_PIX_GPU GPU_IOW(0x10, struct gpu_pix_xfer)
+
+struct gpu_pix_ptr {
+    uint32_t seq;
+    uint32_t off;
+    uint32_t len;
+    uint32_t rsv;
+    uint64_t ptr;
+} __attribute__((packed));
+
+#define GPU_IOC_PIX_PTR_GPU GPU_IOW(0x12, struct gpu_pix_ptr)
 #define GPU_IOC_ATTACH_GPU GPU_IOC(1, 'G', 0x00, 4)
 #define GPU_IOC_API_GPU GPU_IOC(2, 'G', 0x04, 256)
 
@@ -271,7 +282,15 @@ static void *resolve(const char *name) {
     return fn;
 }
 
+static int pix_ptr_ok = 1;
+
 static int pix_send(uint32_t seq, uint32_t off, const uint8_t *data, uint32_t len) {
+    if (pix_ptr_ok) {
+        struct gpu_pix_ptr p = {.seq = seq, .off = off, .len = len, .rsv = 0, .ptr = (uint64_t)(uintptr_t)data};
+        if (ioctl(gpu_fd, GPU_IOC_PIX_PTR_GPU, &p) == 0) return 0;
+        if (errno != ENOTTY && errno != EINVAL) return -1;
+        pix_ptr_ok = 0;
+    }
     while (len) {
         uint32_t chunk = len > MESA_PIX_CHUNK ? MESA_PIX_CHUNK : len;
         struct gpu_pix_xfer x;
@@ -405,11 +424,11 @@ int main(void) {
                 continue;
             }
 
-            const char *name = (const char *)(blob + c->name_off);
+            const char *name = c->kind == MESA_CALL_FNPTR ? "(fnptr)" : (const char *)(blob + c->name_off);
             if (mesa_trace_all)
                 dprintf(2, "mesa-pre %s argc=%u fmask=%08x kind=%u plen=%u\n",
                          name, c->argc, c->fmask, c->kind, hdr->pix_len);
-            void *fn = resolve(name);
+            void *fn = c->kind == MESA_CALL_FNPTR ? (void *)1 : resolve(name);
             if (!fn) {
                 dprintf(2, "mesa-trace %s -> UNRESOLVED\n", name);
                 rets[retcount++] = (uint64_t)-1;
@@ -458,7 +477,13 @@ int main(void) {
             }
             fixbase += c->nfix;
 
-            fn_t call = tramp_build(fn, argv, c->argc, c->fmask);
+            fn_t call;
+            if (c->kind == MESA_CALL_FNPTR) {
+                fn = (void *)(uintptr_t)argv[0];
+                call = fn ? tramp_build(fn, argv + 1, c->argc - 1, c->fmask >> 2) : NULL;
+            } else {
+                call = tramp_build(fn, argv, c->argc, c->fmask);
+            }
             if (!call) {
                 dprintf(2, "mesa-trace %s -> TRAMP-FAIL argc=%u fmask=%08x\n",
                         name, c->argc, c->fmask);
@@ -487,7 +512,7 @@ int main(void) {
             if (mesa_trace_all && strstr(name, "Enumerate") && argc_ge(c, 2) && argv[1])
                 dprintf(2, "mesa-vk-count post *a1=%llu\n",
                         (unsigned long long)*(uint32_t *)(uintptr_t)argv[1]);
-            if (name[0] == 'o' && name[1] == 'p' && name[2] == 'e' && name[3] == 'n' &&
+            if (c->kind != MESA_CALL_FNPTR && name[0] == 'o' && name[1] == 'p' && name[2] == 'e' && name[3] == 'n' &&
                 name[4] == '\0' && (long)r >= 0 && (long)r < 4096)
                 ioctl((int)r, 0x641F);
             rets[retcount++] = (uint64_t)r;

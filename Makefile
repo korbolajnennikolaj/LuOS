@@ -85,7 +85,7 @@ NORMAL_OBJECTS = $(filter-out $(MATH_OBJECTS) $(LUA_OBJECTS), $(C_OBJECTS))
 
 OBJECTS = $(NORMAL_OBJECTS) $(MATH_OBJECTS) $(LUA_OBJECTS) $(ASM_OBJECTS)
 
-.PHONY: initfs initfs-clean
+.PHONY: initfs initfs-clean gpu-firmware gpu-firmware-zip vbios-dump vbios-list
 .PHONY: all clean run-uefi run-uefi-smp run-bios iso-limine help \
         run-uhci-bios run-ehci-bios run-ohci-bios \
         run-audio-hda run-audio-ac97 run-audio-usb run-audio-all \
@@ -193,25 +193,29 @@ endif
 
 GPU_FIRMWARE_ROOT = userspace/sysroot/build/firmware
 GPU_FIRMWARE_ZIP = LuOS_gpu_firmware.zip
+VBIOS_DIR ?= userspace/sysroot/vbios
+VBIOS_FILES = $(wildcard $(VBIOS_DIR)/*.rom $(VBIOS_DIR)/*.bin $(VBIOS_DIR)/*.vbios)
+GPU_FIRMWARE_DEPS = userspace/sysroot/mkfirmware.py userspace/sysroot/vbios.py $(VBIOS_FILES)
 
-$(GPU_FIRMWARE_ROOT): userspace/sysroot/mkfirmware.py
-	@echo "[FS]  GPU firmware directory (amdgpu, i915, nouveau) from Ubuntu 24.04 packages -> $@"
-	@python3 userspace/sysroot/mkfirmware.py $@
+$(GPU_FIRMWARE_ZIP): $(GPU_FIRMWARE_DEPS)
+	@echo "[FS]  GPU firmware (amdgpu, i915, nvidia from Ubuntu's linux-firmware + $(words $(VBIOS_FILES)) AMD VBIOS file(s)) -> $(GPU_FIRMWARE_ROOT)"
+	@python3 userspace/sysroot/mkfirmware.py $(GPU_FIRMWARE_ROOT) --vbios $(VBIOS_DIR) --zip $@
 
-gpu-firmware: $(GPU_FIRMWARE_ROOT)
+gpu-firmware gpu-firmware-zip: $(GPU_FIRMWARE_ZIP)
 
-$(GPU_FIRMWARE_ZIP): $(GPU_FIRMWARE_ROOT)
-	@echo "[ZIP] $(GPU_FIRMWARE_ZIP): the whole firmware directory as ONE zip, read on the fly"
-	@cd $(GPU_FIRMWARE_ROOT) && rm -f "$(CURDIR)/$(GPU_FIRMWARE_ZIP)" && zip -r -q -6 "$(CURDIR)/$(GPU_FIRMWARE_ZIP)" lib/firmware
-	@unzip -l $(GPU_FIRMWARE_ZIP) | tail -1
+vbios-dump:
+	@echo "[FS]  Saving this machine's AMD VBIOS (ACPI VFCT, amdgpu debugfs) into $(VBIOS_DIR)"
+	@sudo python3 userspace/sysroot/vbios.py dump $(VBIOS_DIR)
+	@sudo chown -R $(shell id -u):$(shell id -g) $(VBIOS_DIR)
 
-gpu-firmware-zip: $(GPU_FIRMWARE_ZIP)
+vbios-list:
+	@python3 userspace/sysroot/vbios.py list $(VBIOS_DIR)
 
-$(INITFS_DEFAULT): userspace/sysroot/mkinitfs.py userspace/sysroot/firmware.list userspace/mesa/mesa_host.c
+$(INITFS_DEFAULT): userspace/sysroot/mkinitfs.py userspace/sysroot/vbios.py userspace/sysroot/firmware.list userspace/mesa/mesa_host.c $(VBIOS_FILES)
 	@mkdir -p $(dir $@)
-	@echo "[FS]  Built-in filesystem ($(INITFS_PROFILE), firmware: $(or $(INITFS_FW_TAG),none)) from Ubuntu 24.04 packages -> $@"
+	@echo "[FS]  Built-in filesystem ($(INITFS_PROFILE), firmware: $(or $(INITFS_FW_TAG),none)) from Ubuntu packages -> $@"
 	@echo "[FS]  Firmware groups are packed into one compressed /lib/firmware.zip in the image, read on the fly"
-	@python3 userspace/sysroot/mkinitfs.py $@ --profile $(INITFS_PROFILE) --firmware "$(or $(strip $(filter-out none,$(INITFS_FIRMWARE))),none)" $(INITFS_EXTRA)
+	@python3 userspace/sysroot/mkinitfs.py $@ --profile $(INITFS_PROFILE) --firmware "$(or $(strip $(filter-out none,$(INITFS_FIRMWARE))),none)" --vbios $(VBIOS_DIR) $(INITFS_EXTRA)
 
 $(BUILD_DIR)/initfs/empty.img:
 	@mkdir -p $(dir $@)

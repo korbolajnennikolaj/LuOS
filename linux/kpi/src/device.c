@@ -977,6 +977,7 @@ struct irq_desc_lkpi {
 	atomic_t running;
 	int depth;
 	bool attached;
+	struct task_struct *poller;
 };
 
 static struct irq_desc_lkpi irq_descs[256];
@@ -1020,6 +1021,20 @@ static void irq_dispatch(void *ctx)
 	atomic_dec(&desc->running);
 }
 
+static int irq_poll_fn(void *data)
+{
+	struct irq_desc_lkpi *desc = data;
+	while (!kthread_should_stop()) {
+		unsigned long f;
+		msleep(4);
+		if (kthread_should_stop()) break;
+		local_irq_save(f);
+		irq_dispatch(desc);
+		local_irq_restore(f);
+	}
+	return 0;
+}
+
 int request_threaded_irq(unsigned int irq, irq_handler_t handler, irq_handler_t thread_fn, unsigned long flags,
 			 const char *name, void *dev)
 {
@@ -1059,6 +1074,10 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler, irq_handler_t 
 			return -EBUSY;
 		}
 		desc->attached = true;
+		if (luos_intx_route(irq, 1) == 0 && !desc->poller) {
+			struct task_struct *p = kthread_run(irq_poll_fn, desc, "irq/%u-poll", irq);
+			desc->poller = IS_ERR(p) ? NULL : p;
+		}
 	}
 	mutex_unlock(&irq_mutex);
 	return 0;
@@ -1081,12 +1100,17 @@ const void *free_irq(unsigned int irq, void *dev_id)
 	}
 	bool empty = list_empty(&desc->actions);
 	raw_spin_unlock_irqrestore(&desc->lock, f);
+	struct task_struct *poller = NULL;
 	if (empty && desc->attached) {
+		luos_intx_route(irq, 0);
 		luos_irq_detach(irq);
 		desc->attached = false;
 		desc->depth = 0;
+		poller = desc->poller;
+		desc->poller = NULL;
 	}
 	mutex_unlock(&irq_mutex);
+	if (poller) kthread_stop(poller);
 	if (!found) return NULL;
 	while (atomic_read(&desc->running)) cpu_relax();
 	if (found->thread) kthread_stop(found->thread);

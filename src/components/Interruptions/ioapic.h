@@ -17,6 +17,7 @@ void ioapic_map_irq(uint8_t irq, uint8_t vector, uint8_t lapic_id);
 void ioapic_map_pci_irq(uint8_t irq_line, uint8_t vector, uint8_t lapic_id);
 
 void ioapic_mask_irq(uint8_t irq);
+int ioapic_pin_vector(uint8_t irq);
 void ioapic_unmask_irq(uint8_t irq);
 
 void ioapic_apply_isa_overrides(void);

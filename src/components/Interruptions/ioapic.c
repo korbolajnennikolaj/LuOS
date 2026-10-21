@@ -56,6 +56,13 @@ void ioapic_map_irq(uint8_t irq, uint8_t vector, uint8_t lapic_id) {
     ioapic_write(reg_lo, lo);
 }
 
+int ioapic_pin_vector(uint8_t irq) {
+    if (irq >= IOAPIC_MAX_IRQ) return -1;
+    uint32_t lo = ioapic_read((uint8_t)(IOAPIC_REDTBL_BASE + irq * 2));
+    if (lo & IOAPIC_MASKED) return -1;
+    return (lo & 0xFF) >= 32 ? (int)(lo & 0xFF) : -1;
+}
+
 void ioapic_mask_irq(uint8_t irq) {
     uint8_t reg_lo = (uint8_t)(IOAPIC_REDTBL_BASE + irq * 2);
     uint32_t lo = ioapic_read(reg_lo);

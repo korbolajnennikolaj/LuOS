@@ -25,6 +25,7 @@
 #define FS_ERR_NOTMOUNTED -11
 #define FS_ERR_NOTEMPTY -12
 #define FS_ERR_EOF -13
+#define FS_ERR_BUSY -14
 
 #define FS_MAX_NAME 255
 #define FS_MAX_PATH 512
@@ -63,11 +64,13 @@ typedef struct fs_file {
     uint64_t size;
     uint64_t pos;
     bool writable;
+    uint32_t gen;
 } fs_file_t;
 
 typedef struct fs_dir {
     struct fs *fs;
     void *priv;
+    uint32_t gen;
 } fs_dir_t;
 
 typedef struct fs_ops {
@@ -103,9 +106,12 @@ typedef struct fs {
     char label[32];
     void *priv;
     fs_lock_t vlock;
+    volatile uint32_t gen;
+    volatile int opens;
 } fs_t;
 
 void fs_volume_lock_init(fs_t *fs);
+uint32_t fs_new_gen(void);
 void fs_volume_lock(fs_t *fs);
 void fs_volume_unlock(fs_t *fs);
 
@@ -178,6 +184,18 @@ static inline int fs_split_path(const char *path, fs_path_parts_t *out) {
     return FS_OK;
 }
 
+static inline bool fs_live(const fs_t *fs) {
+    return fs && fs->ops && fs->gen;
+}
+
+static inline bool fs_file_live(const fs_file_t *f) {
+    return f && f->fs && f->gen && f->gen == f->fs->gen && f->fs->ops;
+}
+
+static inline bool fs_dir_live(const fs_dir_t *d) {
+    return d && d->fs && d->gen && d->gen == d->fs->gen && d->fs->ops;
+}
+
 static inline int fs_open(fs_t *fs, const char *path, bool create, bool truncate, fs_file_t *out) {
     if (!fs || !fs->ops || !fs->ops->open || !out) return FS_ERR_NOSUPP;
     out->fs = fs;
@@ -185,48 +203,64 @@ static inline int fs_open(fs_t *fs, const char *path, bool create, bool truncate
     out->size = 0;
     out->pos = 0;
     out->writable = false;
+    out->gen = 0;
     fs_volume_lock(fs);
+    if (!fs_live(fs)) {
+        fs_volume_unlock(fs);
+        return FS_ERR_NOTMOUNTED;
+    }
     int r = fs->ops->open(fs, path, create, truncate, out);
+    if (r == FS_OK) {
+        out->fs = fs;
+        out->gen = fs->gen;
+        fs->opens++;
+    }
     fs_volume_unlock(fs);
     return r;
 }
 
 static inline int fs_close(fs_file_t *f) {
-    if (!f || !f->fs || !f->fs->ops->close) return FS_ERR_NOSUPP;
-    fs_volume_lock(f->fs);
-    int r = f->fs->ops->close(f);
-    fs_volume_unlock(f->fs);
+    if (!f || !f->fs) return FS_ERR_NOSUPP;
+    fs_t *fs = f->fs;
+    fs_volume_lock(fs);
+    int r = FS_OK;
+    if (fs_file_live(f)) {
+        if (fs->ops->close) r = fs->ops->close(f);
+        if (fs->opens > 0) fs->opens--;
+    }
+    f->gen = 0;
+    fs_volume_unlock(fs);
     return r;
 }
 
 static inline int64_t fs_read(fs_file_t *f, void *buf, uint64_t size) {
-    if (!f || !f->fs || !f->fs->ops->read) return FS_ERR_NOSUPP;
+    if (!f || !f->fs || !f->fs->ops || !f->fs->ops->read) return FS_ERR_NOSUPP;
     fs_volume_lock(f->fs);
-    int64_t r = f->fs->ops->read(f, buf, size);
+    int64_t r = fs_file_live(f) ? f->fs->ops->read(f, buf, size) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(f->fs);
     return r;
 }
 
 static inline int64_t fs_write(fs_file_t *f, const void *buf, uint64_t size) {
-    if (!f || !f->fs || !f->fs->ops->write) return FS_ERR_NOSUPP;
+    if (!f || !f->fs || !f->fs->ops || !f->fs->ops->write) return FS_ERR_NOSUPP;
     fs_volume_lock(f->fs);
-    int64_t r = f->fs->ops->write(f, buf, size);
+    int64_t r = fs_file_live(f) ? f->fs->ops->write(f, buf, size) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(f->fs);
     return r;
 }
 
 static inline int fs_seek(fs_file_t *f, uint64_t pos) {
-    if (!f || !f->fs || !f->fs->ops->seek) return FS_ERR_NOSUPP;
+    if (!f || !f->fs || !f->fs->ops || !f->fs->ops->seek) return FS_ERR_NOSUPP;
     fs_volume_lock(f->fs);
-    int r = f->fs->ops->seek(f, pos);
+    int r = fs_file_live(f) ? f->fs->ops->seek(f, pos) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(f->fs);
     return r;
 }
 
 static inline int fs_truncate(fs_file_t *f, uint64_t size) {
-    if (!f || !f->fs || !f->fs->ops->truncate) return FS_ERR_NOSUPP;
+    if (!f || !f->fs || !f->fs->ops || !f->fs->ops->truncate) return FS_ERR_NOSUPP;
     fs_volume_lock(f->fs);
-    int r = f->fs->ops->truncate(f, size);
+    int r = fs_file_live(f) ? f->fs->ops->truncate(f, size) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(f->fs);
     return r;
 }
@@ -235,32 +269,48 @@ static inline int fs_opendir(fs_t *fs, const char *path, fs_dir_t *out) {
     if (!fs || !fs->ops || !fs->ops->opendir || !out) return FS_ERR_NOSUPP;
     out->fs = fs;
     out->priv = NULL;
+    out->gen = 0;
     fs_volume_lock(fs);
+    if (!fs_live(fs)) {
+        fs_volume_unlock(fs);
+        return FS_ERR_NOTMOUNTED;
+    }
     int r = fs->ops->opendir(fs, path, out);
+    if (r == FS_OK) {
+        out->fs = fs;
+        out->gen = fs->gen;
+        fs->opens++;
+    }
     fs_volume_unlock(fs);
     return r;
 }
 
 static inline int fs_readdir(fs_dir_t *dir, fs_dirent_t *out) {
-    if (!dir || !dir->fs || !dir->fs->ops->readdir) return FS_ERR_NOSUPP;
+    if (!dir || !dir->fs || !dir->fs->ops || !dir->fs->ops->readdir) return FS_ERR_NOSUPP;
     fs_volume_lock(dir->fs);
-    int r = dir->fs->ops->readdir(dir, out);
+    int r = fs_dir_live(dir) ? dir->fs->ops->readdir(dir, out) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(dir->fs);
     return r;
 }
 
 static inline int fs_closedir(fs_dir_t *dir) {
-    if (!dir || !dir->fs || !dir->fs->ops->closedir) return FS_ERR_NOSUPP;
-    fs_volume_lock(dir->fs);
-    int r = dir->fs->ops->closedir(dir);
-    fs_volume_unlock(dir->fs);
+    if (!dir || !dir->fs) return FS_ERR_NOSUPP;
+    fs_t *fs = dir->fs;
+    fs_volume_lock(fs);
+    int r = FS_OK;
+    if (fs_dir_live(dir)) {
+        if (fs->ops->closedir) r = fs->ops->closedir(dir);
+        if (fs->opens > 0) fs->opens--;
+    }
+    dir->gen = 0;
+    fs_volume_unlock(fs);
     return r;
 }
 
 static inline int fs_mkdir(fs_t *fs, const char *path) {
     if (!fs || !fs->ops || !fs->ops->mkdir) return FS_ERR_NOSUPP;
     fs_volume_lock(fs);
-    int r = fs->ops->mkdir(fs, path);
+    int r = fs_live(fs) ? fs->ops->mkdir(fs, path) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(fs);
     return r;
 }
@@ -268,7 +318,7 @@ static inline int fs_mkdir(fs_t *fs, const char *path) {
 static inline int fs_unlink(fs_t *fs, const char *path) {
     if (!fs || !fs->ops || !fs->ops->unlink) return FS_ERR_NOSUPP;
     fs_volume_lock(fs);
-    int r = fs->ops->unlink(fs, path);
+    int r = fs_live(fs) ? fs->ops->unlink(fs, path) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(fs);
     return r;
 }
@@ -276,7 +326,7 @@ static inline int fs_unlink(fs_t *fs, const char *path) {
 static inline int fs_rmdir(fs_t *fs, const char *path) {
     if (!fs || !fs->ops || !fs->ops->rmdir) return FS_ERR_NOSUPP;
     fs_volume_lock(fs);
-    int r = fs->ops->rmdir(fs, path);
+    int r = fs_live(fs) ? fs->ops->rmdir(fs, path) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(fs);
     return r;
 }
@@ -284,7 +334,7 @@ static inline int fs_rmdir(fs_t *fs, const char *path) {
 static inline int fs_stat(fs_t *fs, const char *path, fs_dirent_t *out) {
     if (!fs || !fs->ops || !fs->ops->stat) return FS_ERR_NOSUPP;
     fs_volume_lock(fs);
-    int r = fs->ops->stat(fs, path, out);
+    int r = fs_live(fs) ? fs->ops->stat(fs, path, out) : FS_ERR_NOTMOUNTED;
     fs_volume_unlock(fs);
     return r;
 }
@@ -293,10 +343,29 @@ static inline int fs_unmount(fs_t *fs) {
     if (!fs || !fs->ops || !fs->ops->unmount) return FS_ERR_NOSUPP;
     fs_lock();
     fs_volume_lock(fs);
+    if (!fs->gen) {
+        fs_volume_unlock(fs);
+        fs_unlock();
+        return FS_ERR_NOTMOUNTED;
+    }
+    if (fs->opens > 0) {
+        fs_volume_unlock(fs);
+        fs_unlock();
+        return FS_ERR_BUSY;
+    }
     int r = fs->ops->unmount(fs);
+    fs->gen = 0;
     fs_volume_unlock(fs);
     fs_unlock();
     return r;
+}
+
+static inline void fs_invalidate(fs_t *fs) {
+    if (!fs) return;
+    fs_volume_lock(fs);
+    fs->gen = 0;
+    fs->opens = 0;
+    fs_volume_unlock(fs);
 }
 
 #endif

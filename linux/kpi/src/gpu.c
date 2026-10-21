@@ -229,40 +229,60 @@ int lkpi_backlight_count(void)
 	return lkpi_backlight_count_v;
 }
 
+static struct backlight_device *lkpi_backlight_ref(int idx, char *name, int name_cap)
+{
+	struct backlight_device *bd = NULL;
+	mutex_lock(&lkpi_backlight_lock);
+	if (idx >= 0 && idx < lkpi_backlight_count_v && lkpi_backlights[idx]) {
+		bd = lkpi_backlights[idx];
+		get_device(&bd->dev);
+		if (name && name_cap > 0) strscpy(name, lkpi_backlight_names[idx], name_cap);
+	}
+	mutex_unlock(&lkpi_backlight_lock);
+	return bd;
+}
+
 int lkpi_backlight_get(int idx, char *name, int name_cap, unsigned int *cur, unsigned int *max)
 {
-	struct backlight_device *bd;
-	if (idx < 0 || idx >= lkpi_backlight_count_v) return -ENOENT;
-	bd = lkpi_backlights[idx];
+	struct backlight_device *bd = lkpi_backlight_ref(idx, name, name_cap);
+	int now;
 	if (!bd) return -ENOENT;
-	if (name && name_cap > 0) {
-		strscpy(name, lkpi_backlight_names[idx], name_cap);
+	mutex_lock(&bd->ops_lock);
+	now = bd->props.brightness;
+	if (bd->ops && bd->ops->get_brightness) {
+		int hw = bd->ops->get_brightness(bd);
+		if (hw >= 0 && hw <= bd->props.max_brightness) now = hw;
 	}
-	if (cur) *cur = (unsigned int)bd->props.brightness;
+	mutex_unlock(&bd->ops_lock);
+	if (cur) *cur = (unsigned int)now;
 	if (max) *max = (unsigned int)bd->props.max_brightness;
+	put_device(&bd->dev);
 	return 0;
 }
 
 int lkpi_backlight_set(int idx, unsigned int value)
 {
-	struct backlight_device *bd;
+	struct backlight_device *bd = lkpi_backlight_ref(idx, NULL, 0);
 	const struct backlight_ops *ops;
 	int ret = 0;
-	if (idx < 0 || idx >= lkpi_backlight_count_v) return -ENOENT;
-	bd = lkpi_backlights[idx];
 	if (!bd) return -ENOENT;
-	if (!bd->props.max_brightness) return -EIO;
+	if (!bd->props.max_brightness) {
+		put_device(&bd->dev);
+		return -EIO;
+	}
 	if (value > (unsigned int)bd->props.max_brightness) value = (unsigned int)bd->props.max_brightness;
 	mutex_lock(&bd->update_lock);
 	mutex_lock(&bd->ops_lock);
 	ops = bd->ops;
 	if (ops && ops->update_status) {
 		bd->props.brightness = (int)value;
+		bd->props.power = BACKLIGHT_POWER_ON;
 		ret = ops->update_status(bd);
 	} else {
 		ret = -EIO;
 	}
 	mutex_unlock(&bd->ops_lock);
 	mutex_unlock(&bd->update_lock);
+	put_device(&bd->dev);
 	return ret;
 }

@@ -250,19 +250,26 @@ static struct gpu_device *core_dev(int dev_idx) {
     return &gpu_devices[dev_idx];
 }
 
-static void *gpu_stale_handles[GPU_DEVICE_MAX * 2];
-static int gpu_stale_count;
+typedef struct gpu_enum_stash {
+    void *handles[GPU_DEVICE_MAX * 2];
+    int count;
+    bool reset[GPU_DEVICE_MAX];
+    uint32_t old_devt[GPU_DEVICE_MAX];
+} gpu_enum_stash;
 
-static void gpu_reset_ctx(gpu_devctx *ctx) {
-    if (ctx->lx_card && gpu_stale_count < (int)(sizeof(gpu_stale_handles) / sizeof(gpu_stale_handles[0])))
-        gpu_stale_handles[gpu_stale_count++] = ctx->lx_card;
-    if (ctx->lx_render && gpu_stale_count < (int)(sizeof(gpu_stale_handles) / sizeof(gpu_stale_handles[0])))
-        gpu_stale_handles[gpu_stale_count++] = ctx->lx_render;
+static void gpu_mons_forget(int dev_idx, uint32_t old_devt);
+
+static void gpu_reset_ctx(gpu_devctx *ctx, gpu_enum_stash *st, int n) {
+    int cap = (int)(sizeof(st->handles) / sizeof(st->handles[0]));
+    if (ctx->lx_card && st->count < cap) st->handles[st->count++] = ctx->lx_card;
+    if (ctx->lx_render && st->count < cap) st->handles[st->count++] = ctx->lx_render;
+    st->reset[n] = true;
+    st->old_devt[n] = ctx->primary_devt;
     memset(ctx, 0, sizeof(*ctx));
 }
 
 
-static void gpu_merge_row(const struct lkpi_gpu_devinfo *row, int n) {
+static void gpu_merge_row(const struct lkpi_gpu_devinfo *row, int n, gpu_enum_stash *st) {
     struct gpu_device *d = &gpu_devices[n];
     uint8_t flags = 0;
 
@@ -304,7 +311,7 @@ static void gpu_merge_row(const struct lkpi_gpu_devinfo *row, int n) {
 
     gpu_devctx *ctx = &gpu_ctx[n];
     if (identity_changed || strcmp(ctx->pci_name, row->pci_name) != 0 || ctx->primary_devt != row->primary_devt) {
-        gpu_reset_ctx(ctx);
+        gpu_reset_ctx(ctx, st, n);
         strncpy(ctx->pci_name, row->pci_name, sizeof(ctx->pci_name) - 1);
         ctx->primary_devt = row->primary_devt;
     }
@@ -343,27 +350,33 @@ static void gpu_enum_task(void *arg) {
     struct lkpi_gpu_devinfo rows[GPU_DEVICE_MAX];
     LOG_DEBUG("gpu-enum: enter");
     int n = lkpi_gpu_enumerate(rows, GPU_DEVICE_MAX);
+    gpu_enum_stash st;
+    memset(&st, 0, sizeof(st));
 
-    gpu_stale_count = 0;
     uint64_t flags = spin_lock_irqsave(&gpu_registry_lock);
     gpu_generation++;
     if (n < 0) n = 0;
     if (n > GPU_DEVICE_MAX) n = GPU_DEVICE_MAX;
 
+    int old_count = gpu_device_count;
     for (int i = 0; i < gpu_device_count; i++) gpu_devices[i].valid = 0;
-    for (int i = 0; i < n; i++) gpu_merge_row(&rows[i], i);
+    for (int i = 0; i < n; i++) gpu_merge_row(&rows[i], i, &st);
+    for (int i = n; i < old_count && i < GPU_DEVICE_MAX; i++) {
+        gpu_reset_ctx(&gpu_ctx[i], &st, i);
+        memset(&gpu_devices[i], 0, sizeof(gpu_devices[i]));
+    }
     gpu_device_count = n;
     spin_unlock_irqrestore(&gpu_registry_lock, flags);
 
-    for (int i = 0; i < gpu_stale_count; i++) {
-        lkpi_gpu_close_dev(gpu_stale_handles[i]);
-        gpu_stale_handles[i] = NULL;
-    }
-    gpu_stale_count = 0;
+    for (int i = 0; i < GPU_DEVICE_MAX; i++)
+        if (st.reset[i]) gpu_mons_forget(i, st.old_devt[i]);
+    for (int i = 0; i < st.count; i++) lkpi_gpu_close_dev(st.handles[i]);
+    bool on = false;
     for (int i = 0; i < gpu_device_count; i++) {
         gpu_query_drm_identity(&gpu_devices[i]);
-        if (gpu_devices[i].flags & GPU_DEV_FLAG_BOUND) gpu_stack_on = true;
+        if ((gpu_devices[i].flags & GPU_DEV_FLAG_BOUND) && strcmp(gpu_devices[i].driver, "simpledrm") != 0) on = true;
     }
+    gpu_stack_on = on;
 
     LOG_INFO("gpu core: %d device(s), generation %u", gpu_device_count, gpu_generation);
     __atomic_store_n(&gpu_enum_done, 1, __ATOMIC_RELEASE);
@@ -507,16 +520,30 @@ static int gpu_mon_count;
 int gpu_drm_close(int dev_idx) {
     gpu_devctx *ctx = gpu_dev_ctx(dev_idx);
     if (!ctx) return GPU_ERR_NODEV;
+    for (int i = 0; i < gpu_mon_count; i++) {
+        gpu_monitor *m = &gpu_mons[i];
+        if (m->dev_idx != dev_idx) continue;
+        if (m->map_token) lkpi_gpu_gem_vunmap(m->map_token);
+        m->map_token = NULL;
+        m->pixels = NULL;
+        m->map_size = 0;
+        m->fb_id = 0;
+        m->gem_handle = 0;
+        m->enabled = 0;
+        m->mode_current = -1;
+        m->crtc_id = 0;
+    }
     if (ctx->lx_card) lkpi_gpu_close_dev(ctx->lx_card);
     if (ctx->lx_render) lkpi_gpu_close_dev(ctx->lx_render);
     ctx->lx_card = NULL;
     ctx->lx_render = NULL;
-    for (int i = 0; i < gpu_mon_count; i++) {
-        if (gpu_mons[i].dev_idx != dev_idx) continue;
-        gpu_mons[i].fb_id = 0;
-        gpu_mons[i].gem_handle = 0;
-    }
     return GPU_OK;
+}
+
+static bool kms_dev_has_enabled(int dev_idx) {
+    for (int i = 0; i < gpu_mon_count; i++)
+        if (gpu_mons[i].dev_idx == dev_idx && gpu_mons[i].enabled) return true;
+    return false;
 }
 
 static uint32_t kms_crtcs[GPU_DEVICE_MAX][8];
@@ -544,26 +571,26 @@ static int kms_drop_master(int dev_idx) {
 
 static const char *kms_conn_type_name(uint32_t type) {
     switch (type) {
-        case 0: return "VGA";
-        case 1: return "DVI-I";
-        case 2: return "DVI-D";
-        case 3: return "DVI-A";
-        case 4: return "Composite";
-        case 5: return "SVIDEO";
-        case 6: return "LVDS";
-        case 7: return "Component";
-        case 8: return "9PinDIN";
-        case 9: return "DP";
-        case 10: return "HDMI-A";
-        case 11: return "HDMI-B";
-        case 12: return "TV";
-        case 13: return "eDP";
-        case 14: return "Virtual";
-        case 15: return "DSI";
-        case 16: return "DPI";
-        case 17: return "Writeback";
-        case 18: return "SPI";
-        case 19: return "USB";
+        case 1: return "VGA";
+        case 2: return "DVI-I";
+        case 3: return "DVI-D";
+        case 4: return "DVI-A";
+        case 5: return "Composite";
+        case 6: return "SVIDEO";
+        case 7: return "LVDS";
+        case 8: return "Component";
+        case 9: return "9PinDIN";
+        case 10: return "DP";
+        case 11: return "HDMI-A";
+        case 12: return "HDMI-B";
+        case 13: return "TV";
+        case 14: return "eDP";
+        case 15: return "Virtual";
+        case 16: return "DSI";
+        case 17: return "DPI";
+        case 18: return "Writeback";
+        case 19: return "SPI";
+        case 20: return "USB";
         default: return "UNK";
     }
 }
@@ -663,6 +690,51 @@ static uint32_t kms_pick_crtc(int dev_idx, gpu_monitor *mon) {
     return best;
 }
 
+static struct {
+    char name[GPU_MON_NAME];
+    uint8_t brightness;
+} gpu_mon_mem[GPU_MON_MAX];
+
+static void gpu_mon_remember(const gpu_monitor *m) {
+    int slot = -1, same_type = -1, same_hits = 0;
+    const char *dash = strrchr(m->name, '-');
+    size_t type_len = dash ? (size_t)(dash - m->name) + 1 : strlen(m->name);
+    for (int i = 0; i < GPU_MON_MAX; i++) {
+        if (strcmp(gpu_mon_mem[i].name, m->name) == 0) { slot = i; break; }
+        if (gpu_mon_mem[i].name[0] && strncmp(gpu_mon_mem[i].name, m->name, type_len) == 0) {
+            bool live = false;
+            for (int k = 0; k < gpu_mon_count; k++)
+                if (&gpu_mons[k] != m && strcmp(gpu_mons[k].name, gpu_mon_mem[i].name) == 0) live = true;
+            if (!live) {
+                same_type = i;
+                same_hits++;
+            }
+        }
+    }
+    if (slot < 0 && same_hits == 1) slot = same_type;
+    for (int i = 0; slot < 0 && i < GPU_MON_MAX; i++)
+        if (!gpu_mon_mem[i].name[0]) slot = i;
+    if (slot < 0) slot = 0;
+    strncpy(gpu_mon_mem[slot].name, m->name, sizeof(gpu_mon_mem[slot].name) - 1);
+    gpu_mon_mem[slot].brightness = m->brightness;
+}
+
+static int gpu_mon_recall(const char *name) {
+    for (int i = 0; i < GPU_MON_MAX; i++)
+        if (gpu_mon_mem[i].name[0] && strcmp(gpu_mon_mem[i].name, name) == 0) return gpu_mon_mem[i].brightness;
+    const char *dash = strrchr(name, '-');
+    size_t type_len = dash ? (size_t)(dash - name) + 1 : strlen(name);
+    int found = -1, hits = 0;
+    for (int i = 0; i < GPU_MON_MAX; i++) {
+        if (!gpu_mon_mem[i].name[0] || strncmp(gpu_mon_mem[i].name, name, type_len) != 0) continue;
+        found = gpu_mon_mem[i].brightness;
+        hits++;
+    }
+    return hits == 1 ? found : -1;
+}
+
+static int kms_apply_light(int idx);
+
 int gpu_monitor_probe(int dev_idx) {
     if (!gpu_stack_on) return GPU_ERR_NOT_STARTED;
     struct gpu_device *d = core_dev(dev_idx);
@@ -684,6 +756,7 @@ int gpu_monitor_probe(int dev_idx) {
         for (int c = 0; c < n_conns; c++) if (conns[c] == m->connector_id) still = true;
         if (still) continue;
         if (m->enabled) gpu_monitor_disable(i);
+        gpu_mon_remember(m);
         lkpi_console_hold_connector(d->primary_devt, m->connector_id, 0);
         if (i < gpu_mon_count - 1)
             memmove(&gpu_mons[i], &gpu_mons[i + 1], (size_t)(gpu_mon_count - i - 1) * sizeof(gpu_monitor));
@@ -693,10 +766,12 @@ int gpu_monitor_probe(int dev_idx) {
     int added = 0;
     for (int c = 0; c < n_conns; c++) {
         int slot = -1;
+        bool fresh = false;
         for (int i = 0; i < gpu_mon_count; i++)
             if (gpu_mons[i].dev_idx == dev_idx && gpu_mons[i].connector_id == conns[c]) slot = i;
         if (slot < 0) {
             if (gpu_mon_count >= GPU_MON_MAX) continue;
+            fresh = true;
             slot = gpu_mon_count++;
             memset(&gpu_mons[slot], 0, sizeof(gpu_mons[slot]));
             gpu_mons[slot].dev_idx = dev_idx;
@@ -718,11 +793,33 @@ int gpu_monitor_probe(int dev_idx) {
         m->mode_count = modes_got;
         memcpy(m->modes, modes, sizeof(gpu_drm_modeinfo_uapi) * (size_t)modes_got);
         kms_conn_name(&conn, m->name, sizeof(m->name));
+        if (fresh) {
+            int b = gpu_mon_recall(m->name);
+            if (b >= 0 && b != 100) {
+                m->brightness = (uint8_t)b;
+                if (m->connected) kms_apply_light(slot);
+            }
+        }
         added++;
     }
     kfree(modes);
     LOG_INFO("gpu core: %d connector(s) read on %s", added, d->card);
     return GPU_OK;
+}
+
+static void gpu_mons_forget(int dev_idx, uint32_t old_devt) {
+    for (int i = 0; i < gpu_mon_count; i++) {
+        gpu_monitor *m = &gpu_mons[i];
+        if (m->dev_idx != dev_idx) continue;
+        if (m->map_token) lkpi_gpu_gem_vunmap(m->map_token);
+        if (old_devt) lkpi_console_hold_connector(old_devt, m->connector_id, 0);
+        if (m->name[0]) gpu_mon_remember(m);
+        if (i < gpu_mon_count - 1)
+            memmove(&gpu_mons[i], &gpu_mons[i + 1], (size_t)(gpu_mon_count - i - 1) * sizeof(gpu_monitor));
+        gpu_mon_count--;
+        i--;
+    }
+    if (dev_idx >= 0 && dev_idx < GPU_DEVICE_MAX) kms_crtc_count[dev_idx] = 0;
 }
 
 int gpu_monitor_count(void) { return gpu_mon_count; }
@@ -749,6 +846,8 @@ static uint32_t kms_dim_k(uint32_t percent) {
 }
 
 #define GPU_DRM_ERR_BUSY (-16)
+
+enum { GPU_LIGHT_NONE = 0, GPU_LIGHT_BACKLIGHT, GPU_LIGHT_GAMMA, GPU_LIGHT_SOFT };
 
 static void kms_draw_text(uint32_t *px, uint32_t pitch, uint32_t w, uint32_t h,
                           uint32_t x, uint32_t y, const char *s, uint32_t fg, uint32_t scale) {
@@ -967,12 +1066,17 @@ int gpu_monitor_enable(int idx, int mode_idx) {
     kms_monitor_fb_put(m, &fb);
     m->crtc_id = crtc_id;
     m->mode_current = mode_idx;
+    bool origin_taken = false;
+    for (int i = 0; i < gpu_mon_count; i++)
+        if (i != idx && gpu_mons[i].enabled && !gpu_mons[i].cloned && gpu_mons[i].x == 0 && gpu_mons[i].y == 0)
+            origin_taken = true;
+    if (m->x == 0 && m->y == 0 && origin_taken) m->x = gpu_monitor_desktop_width();
     m->enabled = 1;
-    if (m->x == 0 && m->y == 0) m->x = gpu_monitor_desktop_width();
     if (m->pixels) kms_mode_screen(m->pixels, mode->hdisplay, mode->vdisplay, m->pitch,
-                                   m->name, mode, kms_dim_k(m->brightness));
+                                   m->name, mode, m->light_kind == GPU_LIGHT_SOFT ? kms_dim_k(m->brightness) : 256);
     lkpi_console_hold_connector(gpu_devices[dev].primary_devt, m->connector_id, 1);
     kms_drop_master(dev);
+    if (m->brightness != 100 || m->light_kind == GPU_LIGHT_GAMMA) kms_apply_light(idx);
     LOG_INFO("gpu core: %s on %s: %ux%u@%u", m->name, gpu_devices[dev].card,
              mode->hdisplay, mode->vdisplay, mode->vrefresh);
     return GPU_OK;
@@ -995,15 +1099,14 @@ int gpu_monitor_disable(int idx) {
     kms_fb fb;
     kms_monitor_fb_get(m, &fb);
     kms_fb_destroy(dev, &fb);
+    kms_monitor_fb_put(m, &fb);
     m->enabled = 0;
     m->mode_current = -1;
     m->cloned = 0;
     m->crtc_id = 0;
     lkpi_console_hold_connector(gpu_devices[dev].primary_devt, m->connector_id, 1);
     kms_drop_master(dev);
-    bool any = false;
-    for (int i = 0; i < gpu_mon_count; i++) if (gpu_mons[i].enabled) any = true;
-    if (!any) gpu_drm_close(dev);
+    if (!kms_dev_has_enabled(dev)) gpu_drm_close(dev);
     return GPU_OK;
 }
 
@@ -1048,18 +1151,101 @@ int gpu_monitor_set_mode_wh(int idx, uint32_t width, uint32_t height, uint32_t v
     return gpu_monitor_set_mode(idx, mode_idx);
 }
 
+static bool kms_conn_internal(const gpu_monitor *m) {
+    return strncmp(m->name, "eDP", 3) == 0 || strncmp(m->name, "LVDS", 4) == 0 || strncmp(m->name, "DSI", 3) == 0;
+}
+
+static uint32_t kms_monitor_crtc(int dev, const gpu_monitor *m) {
+    if (m->enabled && m->crtc_id) return m->crtc_id;
+    gpu_drm_modeinfo_uapi one;
+    gpu_drm_get_connector_uapi c;
+    memset(&c, 0, sizeof(c));
+    c.connector_id = m->connector_id;
+    c.modes_ptr = (uint64_t)(uintptr_t)&one;
+    c.count_modes = 1;
+    if (kms_ioctl(dev, GPU_DRM_IOC_GETCONNECTOR, &c, sizeof(c)) || !c.encoder_id) return 0;
+    gpu_drm_get_encoder_uapi enc;
+    if (kms_get_encoder(dev, c.encoder_id, &enc)) return 0;
+    return enc.crtc_id;
+}
+
+static int kms_set_gamma(int dev, uint32_t crtc_id, uint32_t percent) {
+    gpu_drm_crtc_uapi c;
+    memset(&c, 0, sizeof(c));
+    c.crtc_id = crtc_id;
+    if (kms_ioctl(dev, GPU_DRM_IOC_GETCRTC, &c, sizeof(c))) return GPU_ERR_DRM;
+    uint32_t n = c.gamma_size;
+    if (n < 2 || n > 4096) return GPU_ERR_STATE;
+    uint16_t *lut = kmalloc((size_t)n * 3 * sizeof(uint16_t));
+    if (!lut) return GPU_ERR_NOMEM;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v = (uint32_t)(((uint64_t)i * 65535u * percent) / ((uint64_t)(n - 1) * 100u));
+        lut[i] = lut[n + i] = lut[2 * n + i] = (uint16_t)v;
+    }
+    gpu_drm_crtc_lut_uapi lu;
+    memset(&lu, 0, sizeof(lu));
+    lu.crtc_id = crtc_id;
+    lu.gamma_size = n;
+    lu.red = (uint64_t)(uintptr_t)lut;
+    lu.green = (uint64_t)(uintptr_t)(lut + n);
+    lu.blue = (uint64_t)(uintptr_t)(lut + 2 * n);
+    kms_set_master(dev);
+    long r = kms_ioctl(dev, GPU_DRM_IOC_SETGAMMA, &lu, sizeof(lu));
+    kms_drop_master(dev);
+    kfree(lut);
+    return r ? GPU_ERR_DRM : GPU_OK;
+}
+
+static int kms_backlight_percent(uint32_t percent) {
+    if (lkpi_backlight_count() <= 0) return GPU_ERR_NODEV;
+    uint32_t cur = 0, max = 0;
+    if (lkpi_backlight_get(0, NULL, 0, &cur, &max) || !max) return GPU_ERR_DRM;
+    uint32_t v = (uint32_t)(((uint64_t)max * percent * percent + 5000) / 10000);
+    if (percent && !v) v = 1;
+    return lkpi_backlight_set(0, v) ? GPU_ERR_DRM : GPU_OK;
+}
+
+static const char *kms_light_name(int kind) {
+    switch (kind) {
+        case GPU_LIGHT_BACKLIGHT: return "panel backlight";
+        case GPU_LIGHT_GAMMA: return "CRTC gamma";
+        default: return "software dim of the LuOS test screen";
+    }
+}
+
+static int kms_apply_light(int idx) {
+    gpu_monitor *m = &gpu_mons[idx];
+    int dev = m->dev_idx;
+    int kind = GPU_LIGHT_SOFT;
+    if (kms_conn_internal(m) && kms_backlight_percent(m->brightness) == GPU_OK) {
+        kind = GPU_LIGHT_BACKLIGHT;
+    } else {
+        uint32_t crtc = kms_monitor_crtc(dev, m);
+        if (crtc && kms_set_gamma(dev, crtc, m->brightness) == GPU_OK) kind = GPU_LIGHT_GAMMA;
+    }
+    m->light_kind = (uint8_t)kind;
+    if (m->enabled && m->pixels && m->mode_current >= 0 && m->pitch) {
+        gpu_drm_modeinfo_uapi *mode = &m->modes[m->mode_current];
+        kms_mode_screen(m->pixels, mode->hdisplay, mode->vdisplay, m->pitch, m->name, mode,
+                        kind == GPU_LIGHT_SOFT ? kms_dim_k(m->brightness) : 256);
+    }
+    return kind;
+}
+
 int gpu_monitor_set_brightness(int idx, uint32_t percent) {
     if (idx < 0 || idx >= gpu_mon_count) return GPU_ERR_PARAM;
     if (percent > 100) percent = 100;
     gpu_monitor *m = &gpu_mons[idx];
     m->brightness = (uint8_t)percent;
-    if (m->enabled && m->pixels && m->mode_current >= 0 && m->pitch) {
-        gpu_drm_modeinfo_uapi *mode = &m->modes[m->mode_current];
-        kms_mode_screen(m->pixels, mode->hdisplay, mode->vdisplay, m->pitch,
-                        m->name, mode, kms_dim_k(percent));
-    }
-    LOG_INFO("gpu core: %s brightness %u%%", m->name, percent);
+    int kind = kms_apply_light(idx);
+    gpu_mon_remember(m);
+    LOG_INFO("gpu core: %s brightness %u%% (%s)", m->name, percent, kms_light_name(kind));
     return GPU_OK;
+}
+
+const char *gpu_monitor_light_name(int idx) {
+    if (idx < 0 || idx >= gpu_mon_count) return "";
+    return kms_light_name(gpu_mons[idx].light_kind);
 }
 
 int gpu_backlight_count(void) {
@@ -1218,15 +1404,22 @@ int gpu_present_open(gpu_present *p, const gpu_cube_opts *opts, uint32_t want_w,
     if (mon < 0 || mon >= gpu_monitor_count()) return GPU_ERR_NODEV;
     p->mon_idx = mon;
     gpu_monitor *m = &gpu_mons[mon];
-    const gpu_drm_modeinfo_uapi *mode = &m->modes[0];
+    if (!m->mode_count) return GPU_ERR_NODEV;
+    bool keep = m->enabled && m->mode_current >= 0 && m->fb_id && m->crtc_id;
+    const gpu_drm_modeinfo_uapi *mode = keep ? &m->modes[m->mode_current] : &m->modes[0];
+    bool asked = false;
     if (opts->width && opts->height) {
         int mi = gpu_monitor_find_mode(mon, opts->width, opts->height, 0);
-        if (mi >= 0) mode = &m->modes[mi];
+        if (mi >= 0) {
+            mode = &m->modes[mi];
+            asked = true;
+        }
     }
-    if (mode->hdisplay > 1920 || mode->vdisplay > 1080) {
+    if (!keep && !asked && (mode->hdisplay > 1920 || mode->vdisplay > 1080)) {
         const gpu_drm_modeinfo_uapi *fit = kms_mode_fit(m, 1920, 1080);
         if (fit && (fit->hdisplay < mode->hdisplay || fit->vdisplay < mode->vdisplay)) mode = fit;
     }
+    p->restore_mon = keep;
     uint32_t w = want_w ? want_w : mode->hdisplay;
     uint32_t h = want_h ? want_h : mode->vdisplay;
     if (w > mode->hdisplay) w = mode->hdisplay;
@@ -1258,9 +1451,16 @@ int gpu_present_open(gpu_present *p, const gpu_cube_opts *opts, uint32_t want_w,
     p->map_size[0] = fbs[0].map_size;
     p->map_size[1] = fbs[1].map_size;
     p->pitch = fbs[0].pitch;
-    p->pixels = fbs[0].pixels;
-    p->pix[0] = fbs[0].pixels;
-    p->pix[1] = fbs[1].pixels;
+    p->fb_w = mode->hdisplay;
+    p->fb_h = mode->vdisplay;
+    uint32_t off_x = (mode->hdisplay - w) / 2, off_y = (mode->vdisplay - h) / 2;
+    for (int i = 0; i < 2; i++) {
+        if (off_x || off_y)
+            for (uint32_t y = 0; y < mode->vdisplay; y++)
+                memset((uint8_t *)fbs[i].pixels + (size_t)y * fbs[i].pitch, 0, (size_t)mode->hdisplay * 4);
+        p->pix[i] = (uint32_t *)((uint8_t *)fbs[i].pixels + (size_t)off_y * fbs[i].pitch) + off_x;
+    }
+    p->pixels = p->pix[0];
     p->cur = 0;
 
     uint32_t crtc = m->crtc_id;
@@ -1306,19 +1506,22 @@ int gpu_present_open(gpu_present *p, const gpu_cube_opts *opts, uint32_t want_w,
     return GPU_OK;
 }
 
-static void kms_blit_rgba_to_bgra32(uint32_t *dst, const uint32_t *src, uint32_t px, uint32_t stride_px) {
+static void kms_blit_frame_row(uint32_t *dst, const uint32_t *src, uint32_t px, bool bgra) {
+    if (bgra) {
+        memcpy(dst, src, (size_t)px * 4);
+        return;
+    }
     for (uint32_t i = 0; i < px; i++) {
         uint32_t c = src[i];
         dst[i] = (c & 0xFF000000u) | ((c & 0x000000FFu) << 16) | (c & 0x0000FF00u) | ((c & 0x00FF0000u) >> 16);
     }
-    (void)stride_px;
 }
 
 int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t h) {
     if (!p->kms) {
         uint32_t *dst = p->pixels;
         for (uint32_t y = 0; y < h; y++)
-            kms_blit_rgba_to_bgra32(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->pitch / 4);
+            kms_blit_frame_row(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->src_bgra);
         limine_video_announce_damage();
         return GPU_OK;
     }
@@ -1326,7 +1529,7 @@ int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t
         uint32_t back = p->cur ^ 1;
         uint32_t *bdst = p->pix[back];
         for (uint32_t y = 0; y < h; y++)
-            kms_blit_rgba_to_bgra32(bdst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->pitch / 4);
+            kms_blit_frame_row(bdst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->src_bgra);
         uint32_t busy = 0;
         gpu_drm_page_flip_uapi flip;
         memset(&flip, 0, sizeof(flip));
@@ -1350,7 +1553,7 @@ int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t
     }
     uint32_t *dst = p->pix[p->cur];
     for (uint32_t y = 0; y < h; y++)
-        kms_blit_rgba_to_bgra32(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->pitch / 4);
+        kms_blit_frame_row(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->src_bgra);
     {
         gpu_drm_fb_dirty_uapi dirty;
         memset(&dirty, 0, sizeof(dirty));
@@ -1359,6 +1562,86 @@ int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t
         scheduler_sleep_ms((uint64_t)(p->period_ms > 0 ? p->period_ms : 16));
     }
     return GPU_OK;
+}
+
+int gpu_present_zc_add(gpu_present *p, void *host_file, uint32_t host_gem, uint32_t pitch) {
+    if (!p->kms || p->zc_count >= GPU_ZC_MAX || !host_file || !pitch) return GPU_ERR_PARAM;
+    gpu_devctx *ctx = gpu_dev_ctx(p->dev_idx);
+    if (!ctx || !ctx->lx_card) return GPU_ERR_NODEV;
+    unsigned int gem = 0;
+    long r = lkpi_gpu_gem_share(ctx->lx_card, host_file, host_gem, &gem);
+    if (r) {
+        LOG_WARNING("present: cannot take the renderer's buffer %u (%ld)", host_gem, r);
+        return GPU_ERR_DRM;
+    }
+    gpu_drm_fb_cmd_uapi fb;
+    memset(&fb, 0, sizeof(fb));
+    fb.width = p->fb_w;
+    fb.height = p->fb_h;
+    fb.pitch = pitch;
+    fb.bpp = 32;
+    fb.depth = 24;
+    fb.handle = gem;
+    r = kms_ioctl(p->dev_idx, GPU_DRM_IOC_ADDFB, &fb, sizeof(fb));
+    if (r) {
+        gpu_drm_gem_close_uapi gc = { .handle = gem, .pad = 0 };
+        kms_ioctl(p->dev_idx, GPU_DRM_IOW(0x09, gpu_drm_gem_close_uapi), &gc, sizeof(gc));
+        LOG_WARNING("present: ADDFB %ux%u pitch %u of the renderer's buffer failed (%ld)", p->fb_w, p->fb_h,
+                    pitch, r);
+        return GPU_ERR_DRM;
+    }
+    p->zc_fb[p->zc_count] = fb.fb_id;
+    p->zc_gem[p->zc_count] = gem;
+    return p->zc_count++;
+}
+
+int gpu_present_zc_show(gpu_present *p, int slot) {
+    if (!p->kms || slot < 0 || slot >= p->zc_count) return GPU_ERR_PARAM;
+    if (p->can_flip) {
+        gpu_drm_page_flip_uapi flip;
+        memset(&flip, 0, sizeof(flip));
+        flip.crtc_id = p->crtc_id;
+        flip.fb_id = p->zc_fb[slot];
+        for (uint32_t busy = 0;; busy++) {
+            long r = kms_ioctl(p->dev_idx, GPU_DRM_IOC_PAGE_FLIP, &flip, sizeof(flip));
+            if (r == 0) return GPU_OK;
+            if (r != GPU_DRM_ERR_BUSY || busy >= 1500) {
+                LOG_WARNING("present: page flip to the renderer's buffer failed (%ld) - using SETCRTC", r);
+                p->can_flip = false;
+                break;
+            }
+            scheduler_sleep_ms(1);
+        }
+    }
+    gpu_drm_crtc_uapi set;
+    memset(&set, 0, sizeof(set));
+    set.crtc_id = p->crtc_id;
+    set.fb_id = p->zc_fb[slot];
+    set.set_connectors_ptr = (uint64_t)(uintptr_t)&p->connector_id;
+    set.count_connectors = 1;
+    gpu_drm_crtc_uapi cur;
+    memset(&cur, 0, sizeof(cur));
+    cur.crtc_id = p->crtc_id;
+    if (kms_ioctl(p->dev_idx, GPU_DRM_IOC_GETCRTC, &cur, sizeof(cur)) || !cur.mode_valid) return GPU_ERR_DRM;
+    set.mode_valid = 1;
+    set.mode = cur.mode;
+    return kms_ioctl(p->dev_idx, GPU_DRM_IOC_SETCRTC, &set, sizeof(set)) ? GPU_ERR_DRM : GPU_OK;
+}
+
+static void kms_zc_release(gpu_present *p) {
+    for (int i = 0; i < p->zc_count; i++) {
+        uint32_t fb_id = p->zc_fb[i];
+        if (fb_id) kms_ioctl(p->dev_idx, GPU_DRM_IOC_RMFB, &fb_id, sizeof(fb_id));
+        gpu_drm_gem_close_uapi gc = { .handle = p->zc_gem[i], .pad = 0 };
+        if (gc.handle) kms_ioctl(p->dev_idx, GPU_DRM_IOW(0x09, gpu_drm_gem_close_uapi), &gc, sizeof(gc));
+        p->zc_fb[i] = 0;
+        p->zc_gem[i] = 0;
+    }
+    p->zc_count = 0;
+}
+
+void gpu_present_zc_reset(gpu_present *p) {
+    if (p->kms) kms_zc_release(p);
 }
 
 void gpu_present_close(gpu_present *p) {
@@ -1373,7 +1656,29 @@ void gpu_present_close(gpu_present *p) {
         }
         return;
     }
-    lkpi_console_hold_connector(gpu_devices[p->dev_idx].primary_devt, p->connector_id, 0);
+    int dev = p->dev_idx;
+    gpu_monitor *m = NULL;
+    if (p->restore_mon && p->mon_idx >= 0 && p->mon_idx < gpu_mon_count) {
+        m = &gpu_mons[p->mon_idx];
+        if (!m->enabled || !m->fb_id || !m->crtc_id || m->mode_current < 0 || m->dev_idx != dev) m = NULL;
+    }
+    if (m) {
+        gpu_drm_crtc_uapi set;
+        memset(&set, 0, sizeof(set));
+        set.crtc_id = m->crtc_id;
+        set.fb_id = m->fb_id;
+        set.set_connectors_ptr = (uint64_t)(uintptr_t)&m->connector_id;
+        set.count_connectors = 1;
+        set.mode_valid = 1;
+        set.mode = m->modes[m->mode_current];
+        kms_set_master(dev);
+        long r = kms_ioctl(dev, GPU_DRM_IOC_SETCRTC, &set, sizeof(set));
+        if (r) LOG_WARNING("present: restoring %s %ux%u failed (%ld)", m->name, set.mode.hdisplay,
+                           set.mode.vdisplay, r);
+    } else {
+        lkpi_console_hold_connector(gpu_devices[dev].primary_devt, p->connector_id, 0);
+    }
+    kms_zc_release(p);
     for (int i = 0; i < 2; i++) {
         if (!p->fb_id[i]) continue;
         kms_fb f = {.fb_id = p->fb_id[i],
@@ -1382,11 +1687,11 @@ void gpu_present_close(gpu_present *p) {
                     .map_token = p->map_token[i],
                     .pixels = NULL,
                     .map_size = p->map_size[i]};
-        kms_fb_destroy(p->dev_idx, &f);
+        kms_fb_destroy(dev, &f);
     }
-    kms_drop_master(p->dev_idx);
-    gpu_drm_close(p->dev_idx);
-    lkpi_console_restore(gpu_devices[p->dev_idx].primary_devt);
+    kms_drop_master(dev);
+    if (!kms_dev_has_enabled(dev)) gpu_drm_close(dev);
+    lkpi_console_restore(gpu_devices[dev].primary_devt);
 }
 
 int gpu_kmscube_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fps_out) {

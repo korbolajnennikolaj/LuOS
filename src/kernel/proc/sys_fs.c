@@ -293,7 +293,8 @@ static long poll_fds(struct process *p, struct lx_pollfd *fds, uint64_t nfds, in
             ready = -LX_EINTR;
             break;
         }
-        scheduler_sleep_ms(2);
+        volatile int never = 0;
+        scheduler_wait(vfs_poll_channel(), &never, 2);
     }
     return ready;
 }

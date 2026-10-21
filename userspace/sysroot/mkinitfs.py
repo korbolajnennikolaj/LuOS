@@ -268,7 +268,7 @@ def firmware_list(groups):
 RAW_STORE = set()
 
 
-def add_firmware(groups, index, cache, work, tree):
+def add_firmware(groups, index, cache, work, tree, vbios_dirs=()):
     unknown = [g for g in groups if g not in FIRMWARE_PACKAGES]
     if unknown:
         sys.exit("unknown firmware group: " + ", ".join(unknown))
@@ -295,6 +295,14 @@ def add_firmware(groups, index, cache, work, tree):
                 continue
             files.append((name, data))
             total += len(data)
+        if group == "amd":
+            import vbios
+            roms, _ = vbios.collect(list(vbios_dirs))
+            for name in sorted(roms):
+                files.append((name, roms[name]))
+                total += len(roms[name])
+            if roms:
+                print("initfs: %d AMD VBIOS image(s) from %s" % (len(roms), ", ".join(vbios_dirs)))
         doc = os.path.join(raw, "usr/share/doc", pkg, "copyright")
         if os.path.exists(doc):
             os.makedirs(os.path.join(tree, "usr/share/doc", pkg), exist_ok=True)
@@ -462,6 +470,7 @@ def main():
     ap.add_argument("--extra", action="append", default=[])
     ap.add_argument("--extra-bin", action="append", default=[])
     ap.add_argument("--cache", default=None)
+    ap.add_argument("--vbios", action="append", default=[])
     ap.add_argument("--level", type=int, default=19)
     args = ap.parse_args()
     cache = args.cache or os.path.join(os.path.dirname(os.path.abspath(args.out)), "debs")
@@ -480,7 +489,7 @@ def main():
     prune(raw, tree, args.profile)
     groups = [g for g in args.firmware.replace(",", " ").split() if g != "none"]
     if groups:
-        pkgs = pkgs + add_firmware(groups, index, cache, work, tree)
+        pkgs = pkgs + add_firmware(groups, index, cache, work, tree, args.vbios)
     build_mesa_host(cache, index, work, tree)
     for extra in args.extra:
         if os.path.isdir(extra):

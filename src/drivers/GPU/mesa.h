@@ -37,7 +37,11 @@ enum mesa_call_kind {
     MESA_CALL_PIX = 1,
     MESA_CALL_TRACK_PIX = 2,
     MESA_CALL_TRACK_POKE = 3,
+    MESA_CALL_FNPTR = 4,
 };
+
+#define MESA_DIRECT_SEQ 0xFFFFFFFDu
+#define MESA_DC_OUTS_MAX 8192
 
 struct mesa_fixup {
     uint32_t where;
@@ -103,6 +107,16 @@ struct mesa_host_info {
 #define GPU_IOC_PIX GPU_IOW(0x10, struct gpu_pix_xfer)
 #define GPU_IOC_HOSTINFO GPU_IOR(0x11, struct mesa_host_info)
 
+struct gpu_pix_ptr {
+    uint32_t seq;
+    uint32_t off;
+    uint32_t len;
+    uint32_t rsv;
+    uint64_t ptr;
+} __attribute__((packed));
+
+#define GPU_IOC_PIX_PTR GPU_IOW(0x12, struct gpu_pix_ptr)
+
 struct gpu_pix_xfer {
     uint32_t seq;
     uint32_t off;
@@ -131,11 +145,35 @@ bool mesa_frame_pending(int dev_idx);
 int mesa_frame_drain(int dev_idx, uint8_t *buf, uint32_t cap, uint32_t *out_len);
 int mesa_frame_complete(int dev_idx, uint32_t slot_seq, uint32_t seq, const uint8_t *data, uint32_t len);
 int mesa_pix_write(uint32_t pix_seq, uint32_t off, const void *data, uint32_t len);
+uint8_t *mesa_pix_target(uint32_t pix_seq, uint32_t off, uint32_t len);
+void mesa_pix_account(uint32_t len);
 int mesa_host_info(struct mesa_host_info *out);
 uint32_t mesa_pix_seq(void);
 uint8_t *mesa_pix_data(void);
 uint32_t mesa_pix_len(void);
 bool mesa_boot_ok(void);
+
+struct mesa_dc;
+struct mesa_dc *mesa_dc_new(void);
+void mesa_dc_free(struct mesa_dc *d);
+int mesa_dc_call(struct mesa_dc *d, const char *name, uint8_t argc, const uint64_t *args, uint32_t ptr_mask,
+                 uint32_t ret_mask);
+int mesa_dc_fnptr(struct mesa_dc *d, uint8_t argc, const uint64_t *args, uint32_t ptr_mask, uint32_t ret_mask);
+uint32_t mesa_dc_in(struct mesa_dc *d, const void *data, uint32_t len);
+uint32_t mesa_dc_out(struct mesa_dc *d, uint32_t len);
+void mesa_dc_fix(struct mesa_dc *d, uint32_t where, uint32_t target);
+int mesa_dc_run(struct mesa_dc *d, uint64_t *rets, int max_rets, void *outs, uint32_t outs_cap,
+                uint32_t timeout_ms);
+
+struct mesa_card_ctx {
+    int dev_idx;
+    int drm_fd;
+    uint64_t gbm;
+    uint64_t dpy;
+    uint64_t ctx;
+};
+bool mesa_card_context(struct mesa_card_ctx *out);
+void *mesa_host_drm_file(int fd);
 const char *mesa_renderer(void);
 
 #endif

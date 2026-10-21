@@ -60,6 +60,8 @@ long lkpi_gpu_drm_version(void *handle, int *major, int *minor, int *patch,
 long lkpi_gpu_gem_vmap(void *handle, unsigned int gem_handle, void **map_token,
                        unsigned long *kaddr, unsigned long long *size);
 long lkpi_gpu_gem_vunmap(void *map_token);
+void lkpi_file_put(void *lx);
+long lkpi_gpu_gem_share(void *dst_handle, void *src_file, unsigned int src_gem, unsigned int *dst_gem);
 
 int lkpi_backlight_count(void);
 int lkpi_backlight_get(int idx, char *name, int name_cap, unsigned int *cur, unsigned int *max);

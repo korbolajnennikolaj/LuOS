@@ -12,6 +12,7 @@
 #include "components/Memory/heap.h"
 #include "components/logger.h"
 #include "drivers/Input/keyboard_driver.h"
+#include "kernel/lkpi/lkpi.h"
 #include "kernel/proc/syscall.h"
 #include "kernel/scheduler/scheduler.h"
 
@@ -223,6 +224,297 @@ static int vk_make_image(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, uint64_t
     return 0;
 }
 
+#define VKZ_BUFS 3
+#define VKZ_TIMEOUT_MS 20000
+
+#define VKZ_FAIL(what)                                                        \
+    do {                                                                      \
+        if (!v->err[0]) snprintf(v->err, sizeof(v->err), "%s", what);         \
+        goto fail;                                                            \
+    } while (0)
+
+struct vkzc {
+    int n;
+    int cur;
+    uint32_t w, h;
+    uint64_t pass;
+    uint64_t image[VKZ_BUFS], mem[VKZ_BUFS], view[VKZ_BUFS], fb[VKZ_BUFS];
+    int slot[VKZ_BUFS];
+};
+
+static void vkz_destroy(struct vks *v, uint64_t dev, struct vkzc *z) {
+    for (int i = 0; i < VKZ_BUFS; i++) {
+        if (z->fb[i]) vks_one(v, GPU_CMD_VK_DESTROY_FRAMEBUFFER, 2, (uint64_t[]){dev, z->fb[i]}, NULL, 0, 0);
+        if (z->view[i]) vks_one(v, GPU_CMD_VK_DESTROY_IMAGE_VIEW, 2, (uint64_t[]){dev, z->view[i]}, NULL, 0, 0);
+        if (z->image[i]) vks_one(v, GPU_CMD_VK_DESTROY_IMAGE, 2, (uint64_t[]){dev, z->image[i]}, NULL, 0, 0);
+        if (z->mem[i]) vks_one(v, GPU_CMD_VK_FREE_MEMORY, 2, (uint64_t[]){dev, z->mem[i]}, NULL, 0, 0);
+    }
+    if (z->pass) vks_one(v, GPU_CMD_VK_DESTROY_RENDER_PASS, 2, (uint64_t[]){dev, z->pass}, NULL, 0, 0);
+    memset(z, 0, sizeof(*z));
+}
+
+static int vkz_export(struct vks *v, const struct mesa_card_ctx *mc, uint64_t dev, uint64_t mem, uint64_t *getfd,
+                      uint32_t *gem) {
+    uint64_t rets[2];
+    struct mesa_dc *d;
+    if (!*getfd) {
+        d = mesa_dc_new();
+        if (!d) return 1;
+        uint32_t name = mesa_dc_in(d, "vkGetMemoryFdKHR", 17);
+        mesa_dc_call(d, "vkGetDeviceProcAddr", 2, (uint64_t[]){dev, name}, 1u << 1, 0);
+        int r = mesa_dc_run(d, rets, 1, NULL, 0, VKZ_TIMEOUT_MS);
+        mesa_dc_free(d);
+        if (r || !rets[0]) {
+            snprintf(v->err, sizeof(v->err), "no vkGetMemoryFdKHR");
+            return 1;
+        }
+        *getfd = rets[0];
+    }
+    struct VkMemoryGetFdInfoKHR info;
+    memset(&info, 0, sizeof(info));
+    info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    info.memory = mem;
+    info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    d = mesa_dc_new();
+    if (!d) return 1;
+    uint32_t info_off = mesa_dc_in(d, &info, sizeof(info));
+    uint32_t fd_off = mesa_dc_out(d, 8);
+    mesa_dc_fnptr(d, 4, (uint64_t[]){*getfd, dev, info_off, fd_off}, (1u << 2) | (1u << 3), 0);
+    int32_t fd_out[2] = {-1, 0};
+    int r = mesa_dc_run(d, rets, 1, fd_out, sizeof(fd_out), VKZ_TIMEOUT_MS);
+    mesa_dc_free(d);
+    if (r || rets[0] || fd_out[0] < 0) {
+        snprintf(v->err, sizeof(v->err), "vkGetMemoryFdKHR failed (%d)", (int)rets[0]);
+        return 1;
+    }
+    d = mesa_dc_new();
+    if (!d) return 1;
+    uint32_t h_off = mesa_dc_out(d, 8);
+    mesa_dc_call(d, "drmPrimeFDToHandle", 3, (uint64_t[]){(uint64_t)mc->drm_fd, (uint64_t)fd_out[0], h_off},
+                 1u << 2, 0);
+    mesa_dc_call(d, "close", 1, (uint64_t[]){(uint64_t)fd_out[0]}, 0, 0);
+    uint32_t h_out[2] = {0, 0};
+    r = mesa_dc_run(d, rets, 2, h_out, sizeof(h_out), VKZ_TIMEOUT_MS);
+    mesa_dc_free(d);
+    if (r || rets[0] || !h_out[0]) {
+        snprintf(v->err, sizeof(v->err), "drmPrimeFDToHandle failed (%d)", (int)rets[0]);
+        return 1;
+    }
+    *gem = h_out[0];
+    return 0;
+}
+
+static int vkz_images(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, const struct mesa_card_ctx *mc, uint64_t dev,
+                      const VkPhysicalDeviceMemoryProperties *mp, gpu_present *pt, struct vkzc *z) {
+    struct vkp pk;
+    uint64_t getfd = 0;
+    void *host = NULL;
+    z->w = pt->fb_w;
+    z->h = pt->fb_h;
+    for (int i = 0; i < VKZ_BUFS; i++) {
+        z->slot[i] = -1;
+        vkp_init(&pk, pkbuf, pkcap);
+        uint32_t ext_off, imci_off;
+        struct VkExternalMemoryImageCreateInfo *ext = vkp_alloc(&pk, VK_S_VKEXTERNALMEMORYIMAGECREATEINFO,
+                                                                sizeof(*ext), &ext_off);
+        ext->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        ext->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkImageCreateInfo *imci = vkp_alloc(&pk, VK_S_VKIMAGECREATEINFO, sizeof(VkImageCreateInfo), &imci_off);
+        imci->sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imci->pNext = (const void *)(uint64_t)ext_off;
+        imci->imageType = VK_IMAGE_TYPE_2D;
+        imci->format = VK_FORMAT_B8G8R8A8_UNORM;
+        imci->extent.width = z->w;
+        imci->extent.height = z->h;
+        imci->extent.depth = 1;
+        imci->mipLevels = 1;
+        imci->arrayLayers = 1;
+        imci->samples = VK_SAMPLE_COUNT_1_BIT;
+        imci->tiling = VK_IMAGE_TILING_LINEAR;
+        imci->usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        imci->sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imci->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        uint32_t len = vkp_finish(&pk);
+        if (vks_one(v, GPU_CMD_VK_CREATE_IMAGE, 3, (uint64_t[]){dev, imci_off, 0xFFFE}, pkbuf, len, 8)) VKZ_FAIL("vkCreateImage");
+        z->image[i] = vks_r64(v);
+        if (!z->image[i]) VKZ_FAIL("linear external image");
+
+        VkMemoryRequirements reqs;
+        if (vks_one(v, GPU_CMD_VK_GET_IMAGE_MEMORY_REQUIREMENTS, 3, (uint64_t[]){dev, z->image[i], 0}, NULL, 0,
+                    sizeof(reqs)))
+            VKZ_FAIL("image memory requirements");
+        memcpy(&reqs, v->rbuf, sizeof(reqs));
+        uint32_t type = vk_pick_mem(mp, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+        if (type == 0xFFFFFFFFu) VKZ_FAIL("device-local memory type");
+        vkp_init(&pk, pkbuf, pkcap);
+        uint32_t ded_off, exp_off, mai_off;
+        struct VkMemoryDedicatedAllocateInfo *ded = vkp_alloc(&pk, VK_S_VKMEMORYDEDICATEDALLOCATEINFO,
+                                                              sizeof(*ded), &ded_off);
+        ded->sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        ded->image = z->image[i];
+        struct VkExportMemoryAllocateInfo *exp = vkp_alloc(&pk, VK_S_VKEXPORTMEMORYALLOCATEINFO, sizeof(*exp),
+                                                           &exp_off);
+        exp->sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+        exp->pNext = (const void *)(uint64_t)ded_off;
+        exp->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkMemoryAllocateInfo *mai = vkp_alloc(&pk, VK_S_VKMEMORYALLOCATEINFO, sizeof(VkMemoryAllocateInfo),
+                                              &mai_off);
+        mai->sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai->pNext = (const void *)(uint64_t)exp_off;
+        mai->allocationSize = reqs.size;
+        mai->memoryTypeIndex = type;
+        len = vkp_finish(&pk);
+        if (vks_one(v, GPU_CMD_VK_ALLOCATE_MEMORY, 3, (uint64_t[]){dev, mai_off, 0xFFFE}, pkbuf, len, 16))
+            VKZ_FAIL("vkAllocateMemory");
+        z->mem[i] = vks_r64(v);
+        if (!z->mem[i]) {
+            int32_t res = 0;
+            memcpy(&res, v->rbuf + 8, 4);
+            snprintf(v->err, sizeof(v->err), "exportable memory (VkResult %d)", res);
+            goto fail;
+        }
+        if (vks_one(v, GPU_CMD_VK_BIND_IMAGE_MEMORY, 4, (uint64_t[]){dev, z->image[i], z->mem[i], 0}, NULL, 0, 0))
+            VKZ_FAIL("vkBindImageMemory");
+
+        vkp_init(&pk, pkbuf, pkcap);
+        uint32_t sub_off;
+        struct VkImageSubresource *sub = vkp_alloc(&pk, VK_S_VKIMAGESUBRESOURCE, sizeof(*sub), &sub_off);
+        sub->aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        len = vkp_finish(&pk);
+        struct VkSubresourceLayout lay;
+        if (vks_one(v, GPU_CMD_VK_GET_IMAGE_SUBRESOURCE_LAYOUT, 4, (uint64_t[]){dev, z->image[i], sub_off, 0}, pkbuf,
+                    len, sizeof(lay)))
+            VKZ_FAIL("subresource layout");
+        memcpy(&lay, v->rbuf, sizeof(lay));
+        if (!lay.rowPitch || lay.offset) VKZ_FAIL("row pitch");
+
+        vkp_init(&pk, pkbuf, pkcap);
+        uint32_t ivci_off;
+        VkImageViewCreateInfo *ivci = vkp_alloc(&pk, VK_S_VKIMAGEVIEWCREATEINFO, sizeof(VkImageViewCreateInfo),
+                                                &ivci_off);
+        ivci->sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci->image = z->image[i];
+        ivci->viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci->format = VK_FORMAT_B8G8R8A8_UNORM;
+        ivci->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivci->subresourceRange.levelCount = 1;
+        ivci->subresourceRange.layerCount = 1;
+        len = vkp_finish(&pk);
+        if (vks_one(v, GPU_CMD_VK_CREATE_IMAGE_VIEW, 3, (uint64_t[]){dev, ivci_off, 0xFFFE}, pkbuf, len, 8))
+            VKZ_FAIL("vkCreateImageView");
+        z->view[i] = vks_r64(v);
+        if (!z->view[i]) VKZ_FAIL("image view");
+
+        uint32_t gem = 0;
+        if (vkz_export(v, mc, dev, z->mem[i], &getfd, &gem)) goto fail;
+        if (!host) host = mesa_host_drm_file(mc->drm_fd);
+        if (!host) VKZ_FAIL("renderer DRM file");
+        z->slot[i] = gpu_present_zc_add(pt, host, gem, (uint32_t)lay.rowPitch);
+        struct mesa_dc *d = mesa_dc_new();
+        if (d) {
+            uint8_t gc[8] = {0};
+            memcpy(gc, &gem, 4);
+            uint32_t gc_off = mesa_dc_in(d, gc, sizeof(gc));
+            mesa_dc_call(d, "drmIoctl", 3, (uint64_t[]){(uint64_t)mc->drm_fd, 0x40086409u, gc_off}, 1u << 2, 0);
+            mesa_dc_run(d, NULL, 0, NULL, 0, VKZ_TIMEOUT_MS);
+            mesa_dc_free(d);
+        }
+        if (z->slot[i] < 0) VKZ_FAIL("KMS framebuffer");
+    }
+    if (host) lkpi_file_put(host);
+    return 0;
+
+fail:
+    if (host) lkpi_file_put(host);
+    return 1;
+}
+
+static int vkz_pass_fbs(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, uint64_t dev, uint64_t dview,
+                        struct vkzc *z) {
+    struct vkp pk;
+    vkp_init(&pk, pkbuf, pkcap);
+    uint32_t att_off;
+    VkAttachmentDescription *att = vkp_alloc(&pk, VK_S_VKATTACHMENTDESCRIPTION,
+                                             2 * sizeof(VkAttachmentDescription), &att_off);
+    att[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+    att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    att[1].format = VKKMV_DEPTH_FORMAT;
+    att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    uint32_t aref_off, dref_off;
+    VkAttachmentReference *aref = vkp_alloc(&pk, VK_S_VKATTACHMENTREFERENCE, sizeof(VkAttachmentReference),
+                                            &aref_off);
+    aref->attachment = 0;
+    aref->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference *dref = vkp_alloc(&pk, VK_S_VKATTACHMENTREFERENCE, sizeof(VkAttachmentReference),
+                                            &dref_off);
+    dref->attachment = 1;
+    dref->layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    uint32_t sub_off;
+    VkSubpassDescription *sub = vkp_alloc(&pk, VK_S_VKSUBPASSDESCRIPTION, sizeof(VkSubpassDescription), &sub_off);
+    sub->pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub->colorAttachmentCount = 1;
+    sub->pColorAttachments = (const void *)(uint64_t)aref_off;
+    sub->pDepthStencilAttachment = (const void *)(uint64_t)dref_off;
+    uint32_t dep_off;
+    VkSubpassDependency *dep = vkp_alloc(&pk, VK_S_VKSUBPASSDEPENDENCY, 2 * sizeof(VkSubpassDependency), &dep_off);
+    dep[0].srcSubpass = 0xFFFFFFFFu;
+    dep[0].dstSubpass = 0;
+    dep[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep[1].srcSubpass = 0;
+    dep[1].dstSubpass = 0xFFFFFFFFu;
+    dep[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep[1].dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    dep[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    uint32_t rpci_off;
+    VkRenderPassCreateInfo *rpci = vkp_alloc(&pk, VK_S_VKRENDERPASSCREATEINFO, sizeof(VkRenderPassCreateInfo),
+                                             &rpci_off);
+    rpci->sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci->attachmentCount = 2;
+    rpci->pAttachments = (const void *)(uint64_t)att_off;
+    rpci->subpassCount = 1;
+    rpci->pSubpasses = (const void *)(uint64_t)sub_off;
+    rpci->dependencyCount = 2;
+    rpci->pDependencies = (const void *)(uint64_t)dep_off;
+    uint32_t len = vkp_finish(&pk);
+    if (vks_one(v, GPU_CMD_VK_CREATE_RENDER_PASS, 3, (uint64_t[]){dev, rpci_off, 0xFFFE}, pkbuf, len, 8)) return 1;
+    z->pass = vks_r64(v);
+    if (!z->pass) return 1;
+    for (int i = 0; i < VKZ_BUFS; i++) {
+        vkp_init(&pk, pkbuf, pkcap);
+        uint32_t fci_off;
+        VkFramebufferCreateInfo *fci = vkp_alloc(&pk, VK_S_VKFRAMEBUFFERCREATEINFO, sizeof(VkFramebufferCreateInfo),
+                                                 &fci_off);
+        fci->sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fci->renderPass = z->pass;
+        fci->attachmentCount = 2;
+        uint64_t views[2] = {z->view[i], dview};
+        fci->pAttachments = (const void *)(uint64_t)vkp_put(&pk, views, sizeof(views));
+        fci->width = z->w;
+        fci->height = z->h;
+        fci->layers = 1;
+        len = vkp_finish(&pk);
+        if (vks_one(v, GPU_CMD_VK_CREATE_FRAMEBUFFER, 3, (uint64_t[]){dev, fci_off, 0xFFFE}, pkbuf, len, 8)) return 1;
+        z->fb[i] = vks_r64(v);
+        if (!z->fb[i]) return 1;
+    }
+    z->n = VKZ_BUFS;
+    return 0;
+}
+
 int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fps_out,
                    uint32_t *crc_out) {
     int ms = mesa_start();
@@ -237,13 +529,20 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         gpu_client_close(v.cl);
         return GPU_ERR_NOT_STARTED;
     }
+    pt.src_bgra = true;
+    struct mesa_card_ctx mc;
+    bool zc_try = !crc_out && pt.kms && mesa_card_context(&mc) && mc.dev_idx == pt.dev_idx;
+    struct vkzc z;
+    memset(&z, 0, sizeof(z));
 
     struct vkres r;
     memset(&r, 0, sizeof(r));
     uint32_t frames = 0;
     int rc = 0;
     uint8_t pkbuf[GPU_BATCH_PAYLOAD];
+    uint8_t spkbuf[1024];
     struct vkp pk;
+    struct vkp spk;
 
     float verts[DEMO_CUBE_FLOATS];
     dm_cube_build(verts);
@@ -311,7 +610,8 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         }
     }
 
-    if (!rc) {
+    for (int attempt = 0; !rc && attempt < 2 && !r.dev; attempt++) {
+        if (attempt) zc_try = false;
         vkp_init(&pk, pkbuf, sizeof(pkbuf));
         float prio = 1.0f;
         uint32_t prio_off = vkp_put(&pk, &prio, 4);
@@ -328,11 +628,17 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         dci->sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci->queueCreateInfoCount = 1;
         dci->pQueueCreateInfos = (const void *)(uint64_t)qi_off;
+        if (zc_try) {
+            static const char *const exts[] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"};
+            dci->enabledExtensionCount = 2;
+            dci->ppEnabledExtensionNames = (const void *)(uint64_t)vkp_strv(&pk, exts, 2);
+        }
         uint32_t dlen = vkp_finish(&pk);
         if (vks_one(&v, GPU_CMD_VK_CREATE_DEVICE, 3, (uint64_t[]){r.pdev, dci_off, 0xFFFE}, pkbuf, dlen, 8))
             rc = 1;
         else
             r.dev = vks_r64(&v);
+        if (!rc && !r.dev && zc_try) LOG_INFO("vkkmv: no dma-buf export on this Vulkan device, using the CPU copy path");
     }
 
     if (!rc) {
@@ -435,8 +741,20 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
             rc = 1;
     }
 
+    uint32_t saved_w = pt.width, saved_h = pt.height;
+    if (!rc && zc_try) {
+        if (vkz_images(&v, pkbuf, sizeof(pkbuf), &mc, r.dev, &mprops, &pt, &z)) {
+            LOG_WARNING("vkkmv: scanout images unavailable (%s), using the CPU copy path", v.err);
+            vkz_destroy(&v, r.dev, &z);
+            gpu_present_zc_reset(&pt);
+            v.err[0] = '\0';
+        } else {
+            pt.width = z.w;
+            pt.height = z.h;
+        }
+    }
     if (!rc && vk_make_image(&v, pkbuf, sizeof(pkbuf), r.dev, &mprops, pt.width, pt.height,
-                             VK_FORMAT_R8G8B8A8_UNORM,
+                             VK_FORMAT_B8G8R8A8_UNORM,
                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                              VK_IMAGE_ASPECT_COLOR_BIT, &r.image, &r.imem, &r.iview))
         rc = 1;
@@ -444,13 +762,25 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
                              VKKMV_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                              VK_IMAGE_ASPECT_DEPTH_BIT, &r.dimage, &r.dmem, &r.dview))
         rc = 1;
+    if (!rc && z.w) {
+        if (vkz_pass_fbs(&v, pkbuf, sizeof(pkbuf), r.dev, r.dview, &z)) {
+            LOG_WARNING("vkkmv: scanout framebuffers unavailable (%s), using the CPU copy path", v.err);
+            vkz_destroy(&v, r.dev, &z);
+            gpu_present_zc_reset(&pt);
+            v.err[0] = '\0';
+            pt.width = saved_w;
+            pt.height = saved_h;
+        } else {
+            LOG_INFO("present: Vulkan renders straight into %d scanout images %ux%u, no CPU copy", z.n, z.w, z.h);
+        }
+    }
 
     if (!rc) {
         vkp_init(&pk, pkbuf, sizeof(pkbuf));
         uint32_t att_off;
         VkAttachmentDescription *att = vkp_alloc(&pk, VK_S_VKATTACHMENTDESCRIPTION,
                                                  2 * sizeof(VkAttachmentDescription), &att_off);
-        att[0].format = VK_FORMAT_R8G8B8A8_UNORM;
+        att[0].format = VK_FORMAT_B8G8R8A8_UNORM;
         att[0].samples = VK_SAMPLE_COUNT_1_BIT;
         att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -735,7 +1065,8 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
     if (!rc && !r.pipeline) { snprintf(v.err, sizeof(v.err), "pipeline creation failed"); rc = 1; }
 
     VkMemoryRequirements creqs;
-    if (!rc) {
+    bool cmem_coherent = true;
+    if (!rc && !z.n) {
         vkp_init(&pk, pkbuf, sizeof(pkbuf));
         uint32_t bci_off;
         VkBufferCreateInfo *bci = vkp_alloc(&pk, VK_S_VKBUFFERCREATEINFO,
@@ -750,21 +1081,28 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         else
             r.cbuf = vks_r64(&v);
     }
-    if (!rc) {
+    if (!rc && !z.n) {
         if (vks_one(&v, GPU_CMD_VK_GET_BUFFER_MEMORY_REQUIREMENTS, 3,
                     (uint64_t[]){r.dev, r.cbuf, 0}, NULL, 0, sizeof(creqs)))
             rc = 1;
         else
             memcpy(&creqs, v.rbuf, sizeof(creqs));
     }
-    if (!rc) {
+    if (!rc && !z.n) {
         vkp_init(&pk, pkbuf, sizeof(pkbuf));
         uint32_t mai_off;
         VkMemoryAllocateInfo *mai = vkp_alloc(&pk, VK_S_VKMEMORYALLOCATEINFO,
                                                 sizeof(VkMemoryAllocateInfo), &mai_off);
         mai->sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai->allocationSize = creqs.size;
-        mai->memoryTypeIndex = vk_pick_mem(&mprops, creqs.memoryTypeBits, host_flags, host_flags);
+        mai->memoryTypeIndex = vk_pick_mem(&mprops, creqs.memoryTypeBits,
+                                           host_flags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (mai->memoryTypeIndex == 0xFFFFFFFFu)
+            mai->memoryTypeIndex = vk_pick_mem(&mprops, creqs.memoryTypeBits, host_flags, host_flags);
+        if (mai->memoryTypeIndex != 0xFFFFFFFFu)
+            cmem_coherent = (mprops.memoryTypes[mai->memoryTypeIndex].propertyFlags &
+                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
         uint32_t mlen = vkp_finish(&pk);
         if (mai->memoryTypeIndex == 0xFFFFFFFFu) {
             snprintf(v.err, sizeof(v.err), "no host memory for the readback buffer");
@@ -774,12 +1112,12 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         else
             r.cmem = vks_r64(&v);
     }
-    if (!rc) {
+    if (!rc && !z.n) {
         if (vks_one(&v, GPU_CMD_VK_BIND_BUFFER_MEMORY, 4,
                     (uint64_t[]){r.dev, r.cbuf, r.cmem, 0}, NULL, 0, 0))
             rc = 1;
     }
-    if (!rc) {
+    if (!rc && !z.n) {
         if (vks_one(&v, GPU_CMD_VK_MAP_MEMORY, 6,
                     (uint64_t[]){r.dev, r.cmem, 0, creqs.size, 0, 0}, NULL, 0, 8))
             rc = 1;
@@ -797,9 +1135,6 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
             float mvp[16];
             dm_cube_mvp(mvp, t, pt.width, pt.height, 1);
 
-            if (vks_one(&v, GPU_CMD_VK_RESET_COMMAND_BUFFER, 3,
-                        (uint64_t[]){r.cmdbuf, 0, 0}, NULL, 0, 0))
-                break;
 
             vkp_init(&pk, pkbuf, sizeof(pkbuf));
             uint32_t binfo_off;
@@ -824,15 +1159,35 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
             VkRenderPassBeginInfo *rpbi = vkp_alloc(&pk, VK_S_VKRENDERPASSBEGININFO,
                                                     sizeof(VkRenderPassBeginInfo), &rp_off);
             rpbi->sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            rpbi->renderPass = r.pass;
-            rpbi->framebuffer = r.fb;
+            rpbi->renderPass = z.n ? z.pass : r.pass;
+            rpbi->framebuffer = z.n ? z.fb[z.cur] : r.fb;
             rpbi->renderArea.extent.width = pt.width;
             rpbi->renderArea.extent.height = pt.height;
             rpbi->clearValueCount = 2;
             rpbi->pClearValues = (const void *)(uint64_t)cv_off;
             uint32_t plen = vkp_finish(&pk);
 
+            vkp_init(&spk, spkbuf, sizeof(spkbuf));
+            uint32_t cbarr = vkp_put(&spk, &r.cmdbuf, 8);
+            uint32_t si_off;
+            VkSubmitInfo *si = vkp_alloc(&spk, VK_S_VKSUBMITINFO, sizeof(VkSubmitInfo), &si_off);
+            si->sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si->commandBufferCount = 1;
+            si->pCommandBuffers = (const void *)(uint64_t)cbarr;
+            uint32_t inv_off = 0;
+            if (!cmem_coherent) {
+                VkMappedMemoryRange *mr = vkp_alloc(&spk, VK_S_VKMAPPEDMEMORYRANGE, sizeof(VkMappedMemoryRange),
+                                                    &inv_off);
+                mr->sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                mr->memory = r.cmem;
+                mr->offset = 0;
+                mr->size = ~0ULL;
+            }
+            uint32_t slen = vkp_finish(&spk);
+
             if (gpu_cmd_begin(v.cl)) break;
+            gpu_cmd_vk(v.cl, GPU_CMD_VK_RESET_COMMAND_BUFFER, 3,
+                       (uint64_t[]){r.cmdbuf, 0, 0}, NULL, 0, 0);
             gpu_cmd_vk(v.cl, GPU_CMD_VK_BEGIN_COMMAND_BUFFER, 2,
                        (uint64_t[]){r.cmdbuf, binfo_off}, pkbuf, plen, 0);
             gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_BEGIN_RENDER_PASS, 3,
@@ -849,28 +1204,32 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
             gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_END_RENDER_PASS, 1,
                        (uint64_t[]){r.cmdbuf}, NULL, 0, 0);
 
-            gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_COPY_IMAGE_TO_BUFFER, 6,
+            if (!z.n)
+                gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_COPY_IMAGE_TO_BUFFER, 6,
                        (uint64_t[]){r.cmdbuf, r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.cbuf, 1, copy_off}, pkbuf, plen, 0);
             gpu_cmd_vk(v.cl, GPU_CMD_VK_END_COMMAND_BUFFER, 1,
                        (uint64_t[]){r.cmdbuf}, NULL, 0, 0);
+            gpu_cmd_vk(v.cl, GPU_CMD_VK_QUEUE_SUBMIT, 4,
+                       (uint64_t[]){r.queue, 1, si_off, 0}, spkbuf, slen, 0);
+            gpu_cmd_vk(v.cl, GPU_CMD_VK_QUEUE_WAIT_IDLE, 1, (uint64_t[]){r.queue}, NULL, 0, 0);
+            if (!cmem_coherent && !z.n)
+                gpu_cmd_vk(v.cl, GPU_CMD_VK_INVALIDATE_MAPPED_MEMORY_RANGES, 3,
+                           (uint64_t[]){r.dev, 1, inv_off}, spkbuf, slen, 0);
+            if (!z.n && gpu_cmd_gl(v.cl, GPU_CMD_MESA_TRACK_PIX, 3,
+                                   (uint64_t[]){0, 0, (uint64_t)pt.width * pt.height * 4}, NULL, 0, 0)) {
+                snprintf(v.err, sizeof(v.err), "frame batch overflow");
+                break;
+            }
             if (vks_flush(&v, 180000)) break;
-
-            vkp_init(&pk, pkbuf, sizeof(pkbuf));
-            uint32_t cbarr = vkp_put(&pk, &r.cmdbuf, 8);
-            uint32_t si_off;
-            VkSubmitInfo *si = vkp_alloc(&pk, VK_S_VKSUBMITINFO, sizeof(VkSubmitInfo), &si_off);
-            si->sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            si->commandBufferCount = 1;
-            si->pCommandBuffers = (const void *)(uint64_t)cbarr;
-            uint32_t slen = vkp_finish(&pk);
-            if (vks_one(&v, GPU_CMD_VK_QUEUE_SUBMIT, 4,
-                        (uint64_t[]){r.queue, 1, si_off, 0}, pkbuf, slen, 0))
-                break;
-            if (vks_one(&v, GPU_CMD_VK_QUEUE_WAIT_IDLE, 1, (uint64_t[]){r.queue}, NULL, 0, 0))
-                break;
-            if (vks_one(&v, GPU_CMD_MESA_TRACK_PIX, 3,
-                        (uint64_t[]){0, 0, (uint64_t)pt.width * pt.height * 4}, NULL, 0, 0))
-                break;
+            if (z.n) {
+                if (gpu_present_zc_show(&pt, z.slot[z.cur])) {
+                    snprintf(v.err, sizeof(v.err), "scanout flip");
+                    break;
+                }
+                z.cur = (z.cur + 1) % z.n;
+                frames++;
+                continue;
+            }
 
             if (crc_out) {
                 *crc_out = vk_crc32(mesa_pix_data(), pt.width * pt.height * 4);
@@ -886,6 +1245,7 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         LOG_WARNING("vkkmv(Vulkan): frame %u failed: %s", frames, v.err);
         if (!frames) rc = 1;
     }
+    vkz_destroy(&v, r.dev, &z);
     vk_destroy(&v, &r);
     gpu_present_close(&pt);
     if (frames_out) *frames_out = frames;

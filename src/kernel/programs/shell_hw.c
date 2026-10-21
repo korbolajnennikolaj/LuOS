@@ -1030,7 +1030,8 @@ static void cmd_gpu_mon_bright(const char *arg) {
     unsigned pct = (unsigned)strtoul(arg, NULL, 0);
     int r = gpu_monitor_set_brightness(idx, pct);
     if (r) printf_color(C_BAD, "failed: %s (%d)\n", gpu_err_name(r), r);
-    else printf_color(C_OK, "monitor %d brightness %u%%\n", idx, pct);
+    else printf_color(C_OK, "monitor %d brightness %u%% (%s)\n", idx, pct > 100 ? 100 : pct,
+                      gpu_monitor_light_name(idx));
 }
 
 static void cmd_gpu_bright(const char *arg) {
@@ -1050,15 +1051,28 @@ static void cmd_gpu_bright(const char *arg) {
             printf_color(C_VAL, "  [%d] ", i);
             printf_color(C_TXT, "%-16s %u/%u\n", name, cur, max);
         }
-        printf_color(C_TXT, "  gpu-bright N VALUE sets one (hardware backlight)\n");
+        printf_color(C_TXT, "  gpu-bright N VALUE or N PERCENT%% sets one (hardware backlight, percent is perceptual)\n");
         return;
     }
     char *end = NULL;
     const char *rest = NULL;
     long idx = strtol(arg, &end, 0);
     rest = hw_skip(end);
-    if (idx < 0 || idx >= n || !*rest) { printf_color(C_BAD, "usage: gpu-bright N VALUE (0..max)\n"); return; }
-    long val = strtol(rest, NULL, 0);
+    if (idx < 0 || idx >= n || !*rest) { printf_color(C_BAD, "usage: gpu-bright N VALUE (0..max) or N PERCENT%%\n"); return; }
+    char *vend = NULL;
+    long val = strtol(rest, &vend, 0);
+    if (val < 0) val = 0;
+    if (vend && *vend == '%') {
+        char bname[32];
+        uint32_t bcur = 0, bmax = 0;
+        if (gpu_backlight_get((int)idx, bname, sizeof(bname), &bcur, &bmax) || !bmax) {
+            printf_color(C_BAD, "failed: backlight %d has no range\n", (int)idx);
+            return;
+        }
+        if (val > 100) val = 100;
+        long scaled = (long)(((uint64_t)bmax * (uint64_t)val * (uint64_t)val + 5000) / 10000);
+        val = (val && !scaled) ? 1 : scaled;
+    }
     int r = gpu_backlight_set((int)idx, (uint32_t)val);
     if (r) printf_color(C_BAD, "failed: backlight %d not set (%d)\n", (int)idx, r);
     else {

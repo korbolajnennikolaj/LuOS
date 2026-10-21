@@ -53,6 +53,8 @@ void fd_close_all(struct process *p);
 
 int vfs_abs_path(struct process *p, int dirfd, const char *path, char *abs, size_t cap);
 int vfs_open(const char *abs, uint32_t flags, uint32_t mode, struct ufile **out);
+void vfs_poll_wake(void);
+void *vfs_poll_channel(void);
 int vfs_stat(const char *abs, struct lx_stat *st);
 int vfs_lstat(const char *abs, struct lx_stat *st);
 long vfs_readlink(const char *abs, char *buf, size_t cap);

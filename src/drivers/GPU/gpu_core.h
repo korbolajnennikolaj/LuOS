@@ -434,6 +434,14 @@ typedef struct gpu_drm_crtc_uapi {
     gpu_drm_modeinfo_uapi mode;
 } gpu_drm_crtc_uapi;
 
+typedef struct gpu_drm_crtc_lut_uapi {
+    uint32_t crtc_id;
+    uint32_t gamma_size;
+    uint64_t red;
+    uint64_t green;
+    uint64_t blue;
+} gpu_drm_crtc_lut_uapi;
+
 typedef struct gpu_drm_get_encoder_uapi {
     uint32_t encoder_id;
     uint32_t encoder_type;
@@ -489,6 +497,7 @@ typedef struct gpu_drm_destroy_dumb_uapi {
 } gpu_drm_destroy_dumb_uapi;
 #define GPU_DRM_IOC_GETCRTC       GPU_DRM_IOWR(0xA1, gpu_drm_crtc_uapi)
 #define GPU_DRM_IOC_SETCRTC       GPU_DRM_IOWR(0xA2, gpu_drm_crtc_uapi)
+#define GPU_DRM_IOC_SETGAMMA      GPU_DRM_IOWR(0xA5, gpu_drm_crtc_lut_uapi)
 #define GPU_DRM_IOC_GETENCODER    GPU_DRM_IOWR(0xA6, gpu_drm_get_encoder_uapi)
 #define GPU_DRM_IOC_GETCONNECTOR  GPU_DRM_IOWR(0xA7, gpu_drm_get_connector_uapi)
 #define GPU_DRM_IOC_ADDFB         GPU_DRM_IOWR(0xAE, gpu_drm_fb_cmd_uapi)
@@ -523,11 +532,13 @@ typedef struct gpu_monitor {
     uint64_t map_size;
     uint32_t pitch;
     uint8_t brightness;
+    uint8_t light_kind;
 } gpu_monitor;
 
 int gpu_monitor_count(void);
 const gpu_monitor *gpu_monitor_get(int idx);
 int gpu_monitor_probe(int dev_idx);
+const char *gpu_monitor_light_name(int idx);
 int gpu_monitor_enable(int idx, int mode_idx);
 int gpu_monitor_disable(int idx);
 int gpu_monitor_set_mode(int idx, int mode_idx);
@@ -564,6 +575,8 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
 int gpu_shader_test_gl(uint32_t *crc_out, char *note, int note_cap);
 int gpu_shader_test_vk(uint32_t *crc_out, char *note, int note_cap);
 
+#define GPU_ZC_MAX 4
+
 typedef struct gpu_present {
     bool kms;
     int dev_idx;
@@ -575,15 +588,24 @@ typedef struct gpu_present {
     void *map_token[2];
     uint64_t map_size[2];
     uint32_t crtc_id, connector_id;
+    uint32_t fb_w, fb_h;
+    bool restore_mon;
+    bool src_bgra;
     bool can_flip;
     uint32_t cur;
     int64_t period_ms;
     uint8_t *snapshot;
+    int zc_count;
+    uint32_t zc_fb[GPU_ZC_MAX];
+    uint32_t zc_gem[GPU_ZC_MAX];
 } gpu_present;
 
 int gpu_present_open(gpu_present *p, const gpu_cube_opts *opts, uint32_t want_w, uint32_t want_h);
 int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t h);
 void gpu_present_close(gpu_present *p);
+int gpu_present_zc_add(gpu_present *p, void *host_file, uint32_t host_gem, uint32_t pitch);
+int gpu_present_zc_show(gpu_present *p, int slot);
+void gpu_present_zc_reset(gpu_present *p);
 #define GPU_RESULT_HDR 4
 
 #define GPU_CMD_GL_FIRST 0x1000

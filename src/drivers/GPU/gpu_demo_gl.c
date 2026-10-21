@@ -11,6 +11,7 @@
 #include "components/logger.h"
 #include "drivers/Input/keyboard_driver.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "kernel/lkpi/lkpi.h"
 #include "kernel/proc/syscall.h"
 #include "kernel/scheduler/scheduler.h"
 
@@ -303,13 +304,144 @@ static void gls_free_fbo(struct gls *g, struct gls_fbo *f) {
 
 static int gls_readback(struct gls *g, uint32_t w, uint32_t h) {
     uint64_t marker = 0xFFFF;
-    if (gls_put(g, GPU_CMD_GL_READ_PIXELS, GLS_A(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, 0xFFFF),
+    if (gls_put(g, GPU_CMD_GL_READ_PIXELS, GLS_A(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, 0xFFFF),
                 &marker, 8))
         return GLS_ERR;
-    if (gls_flush(g, GLS_FRAME_TIMEOUT_MS)) return GLS_ERR;
-    if (gpu_cmd_begin(g->cl)) return GLS_ERR;
     if (gls_put(g, GPU_CMD_MESA_PIX, GLS_A((uint64_t)w * h * 4), NULL, 0)) return GLS_ERR;
-    return gls_flush(g, GLS_PIX_TIMEOUT_MS);
+    return gls_flush(g, GLS_FRAME_TIMEOUT_MS > GLS_PIX_TIMEOUT_MS ? GLS_FRAME_TIMEOUT_MS : GLS_PIX_TIMEOUT_MS);
+}
+
+#define GLS_ZC_BUFS 3
+#define GLS_ZC_TIMEOUT_MS 20000
+
+struct gls_zc {
+    int n;
+    int cur;
+    uint32_t w, h;
+    uint64_t dpy;
+    uint64_t bo[GLS_ZC_BUFS];
+    uint64_t img[GLS_ZC_BUFS];
+    uint32_t rb[GLS_ZC_BUFS];
+    uint32_t fbo[GLS_ZC_BUFS];
+    int slot[GLS_ZC_BUFS];
+    uint32_t depth;
+};
+
+static void gls_zc_free(struct gls *g, struct gls_zc *z) {
+    if (!z->dpy) return;
+    gls_one(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_FRAMEBUFFER, 0));
+    for (int i = 0; i < GLS_ZC_BUFS; i++) {
+        gls_delete(g, GPU_CMD_GL_DELETE_FRAMEBUFFERS, &z->fbo[i]);
+        gls_delete(g, GPU_CMD_GL_DELETE_RENDERBUFFERS, &z->rb[i]);
+    }
+    gls_delete(g, GPU_CMD_GL_DELETE_RENDERBUFFERS, &z->depth);
+    struct mesa_dc *d = mesa_dc_new();
+    if (d) {
+        int calls = 0;
+        for (int i = 0; i < GLS_ZC_BUFS; i++) {
+            if (z->img[i] && mesa_dc_call(d, "eglDestroyImageKHR", 2, (uint64_t[]){z->dpy, z->img[i]}, 0, 0) >= 0)
+                calls++;
+            if (z->bo[i] && mesa_dc_call(d, "gbm_bo_destroy", 1, (uint64_t[]){z->bo[i]}, 0, 0) >= 0) calls++;
+        }
+        if (calls) mesa_dc_run(d, NULL, 0, NULL, 0, GLS_ZC_TIMEOUT_MS);
+        mesa_dc_free(d);
+    }
+    memset(z, 0, sizeof(*z));
+}
+
+static int gls_zc_setup(struct gls *g, gpu_present *pt, struct gls_zc *z) {
+    memset(z, 0, sizeof(*z));
+    struct mesa_card_ctx mc;
+    if (!pt->kms || !mesa_card_context(&mc) || mc.dev_idx != pt->dev_idx) return GLS_ERR;
+    z->w = pt->fb_w;
+    z->h = pt->fb_h;
+    z->dpy = mc.dpy;
+    struct mesa_dc *d = mesa_dc_new();
+    if (!d) return GLS_ERR;
+    uint64_t rets[4 * GLS_ZC_BUFS];
+    for (int i = 0; i < GLS_ZC_BUFS; i++)
+        mesa_dc_call(d, "gbm_bo_create", 5, (uint64_t[]){mc.gbm, z->w, z->h, 0x34325258u, 1u | 4u | 16u}, 0, 0);
+    int r = mesa_dc_run(d, rets, GLS_ZC_BUFS, NULL, 0, GLS_ZC_TIMEOUT_MS);
+    mesa_dc_free(d);
+    for (int i = 0; i < GLS_ZC_BUFS; i++) z->bo[i] = r ? 0 : rets[i];
+    for (int i = 0; i < GLS_ZC_BUFS; i++)
+        if (!z->bo[i]) goto fail;
+
+    d = mesa_dc_new();
+    if (!d) goto fail;
+    for (int i = 0; i < GLS_ZC_BUFS; i++) {
+        mesa_dc_call(d, "gbm_bo_get_handle", 1, (uint64_t[]){z->bo[i]}, 0, 0);
+        mesa_dc_call(d, "gbm_bo_get_stride", 1, (uint64_t[]){z->bo[i]}, 0, 0);
+        mesa_dc_call(d, "eglCreateImageKHR", 5, (uint64_t[]){mc.dpy, 0, 0x30B0, z->bo[i], 0}, 0, 0);
+    }
+    r = mesa_dc_run(d, rets, 3 * GLS_ZC_BUFS, NULL, 0, GLS_ZC_TIMEOUT_MS);
+    mesa_dc_free(d);
+    if (r) goto fail;
+    for (int i = 0; i < GLS_ZC_BUFS; i++) z->img[i] = rets[3 * i + 2];
+
+    void *host = mesa_host_drm_file(mc.drm_fd);
+    if (!host) goto fail;
+    for (int i = 0; i < GLS_ZC_BUFS; i++) {
+        z->slot[i] = -1;
+        if (!z->img[i]) continue;
+        z->slot[i] = gpu_present_zc_add(pt, host, (uint32_t)rets[3 * i], (uint32_t)rets[3 * i + 1]);
+    }
+    lkpi_file_put(host);
+    for (int i = 0; i < GLS_ZC_BUFS; i++)
+        if (!z->img[i] || z->slot[i] < 0) goto fail;
+
+    if (gls_gen(g, GPU_CMD_GL_GEN_RENDERBUFFERS, &z->depth)) goto fail;
+    if (gls_one(g, GPU_CMD_GL_BIND_RENDERBUFFER, GLS_A(GL_RENDERBUFFER, z->depth))) goto fail;
+    if (gls_one(g, GPU_CMD_GL_RENDERBUFFER_STORAGE, GLS_A(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, z->w, z->h)))
+        goto fail;
+    for (int i = 0; i < GLS_ZC_BUFS; i++) {
+        if (gls_gen(g, GPU_CMD_GL_GEN_RENDERBUFFERS, &z->rb[i])) goto fail;
+        if (gls_one(g, GPU_CMD_GL_BIND_RENDERBUFFER, GLS_A(GL_RENDERBUFFER, z->rb[i]))) goto fail;
+        d = mesa_dc_new();
+        if (!d) goto fail;
+        mesa_dc_call(d, "glEGLImageTargetRenderbufferStorageOES", 2, (uint64_t[]){GL_RENDERBUFFER, z->img[i]}, 0,
+                     0);
+        r = mesa_dc_run(d, NULL, 0, NULL, 0, GLS_ZC_TIMEOUT_MS);
+        mesa_dc_free(d);
+        if (r) goto fail;
+        if (gls_gen(g, GPU_CMD_GL_GEN_FRAMEBUFFERS, &z->fbo[i])) goto fail;
+        if (gls_one(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_FRAMEBUFFER, z->fbo[i]))) goto fail;
+        if (gls_one(g, GPU_CMD_GL_FRAMEBUFFER_RENDERBUFFER,
+                    GLS_A(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, z->rb[i])))
+            goto fail;
+        if (gls_one(g, GPU_CMD_GL_FRAMEBUFFER_RENDERBUFFER,
+                    GLS_A(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, z->depth)))
+            goto fail;
+        if (gls_res(g, GPU_CMD_GL_CHECK_FRAMEBUFFER_STATUS, GLS_A(GL_FRAMEBUFFER), NULL, 0, 8)) goto fail;
+        if (gls_ret32(g) != GL_FRAMEBUFFER_COMPLETE) goto fail;
+    }
+    if (gls_one(g, GPU_CMD_GL_VIEWPORT, GLS_A(0, 0, z->w, z->h))) goto fail;
+    if (gls_check(g, "scanout buffers")) goto fail;
+    z->n = GLS_ZC_BUFS;
+    LOG_INFO("present: GPU renders straight into %d scanout buffers %ux%u, no CPU copy", z->n, z->w, z->h);
+    return GLS_OK;
+
+fail:
+    LOG_WARNING("present: scanout buffers unavailable on this renderer, using the CPU copy path");
+    g->err[0] = '\0';
+    gls_zc_free(g, z);
+    gpu_present_zc_reset(pt);
+    return GLS_ERR;
+}
+
+static int gls_zc_bind(struct gls *g, struct gls_zc *z) {
+    return gls_put(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_FRAMEBUFFER, z->fbo[z->cur]), NULL, 0);
+}
+
+static int gls_zc_show(struct gls *g, gpu_present *pt, struct gls_zc *z) {
+    if (gls_put(g, GPU_CMD_GL_FINISH, GLS_A0, NULL, 0)) return GLS_ERR;
+    if (gls_flush(g, GLS_FRAME_TIMEOUT_MS)) return GLS_ERR;
+    if (gpu_present_zc_show(pt, z->slot[z->cur])) {
+        gls_fail(g, "scanout flip");
+        return GLS_ERR;
+    }
+    z->cur = (z->cur + 1) % z->n;
+    return GLS_OK;
 }
 
 static bool gls_abort(void) {
@@ -349,6 +481,7 @@ int gpu_gl_cube_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *f
 
     gpu_present pt;
     int pr = gpu_present_open(&pt, opts, opts->width, opts->height);
+    pt.src_bgra = true;
     if (pr) {
         LOG_WARNING("kmscube(GL): present open failed (%d)", pr);
         gpu_client_close(g.cl);
@@ -374,7 +507,15 @@ int gpu_gl_cube_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *f
     if (!rc && gls_gen(&g, GPU_CMD_GL_GEN_BUFFERS, &vbo)) { rc = GLS_ERR; why = "glGenBuffers"; }
     if (!rc && gls_one(&g, GPU_CMD_GL_BIND_BUFFER, GLS_A(GL_ARRAY_BUFFER, vbo))) { rc = GLS_ERR; why = "bind VBO"; }
     if (!rc && gls_upload(&g, verts, sizeof(verts))) { rc = GLS_ERR; why = "VBO upload"; }
-    if (!rc && gls_setup_fbo(&g, pt.width, pt.height, &fb)) { rc = GLS_ERR; why = "FBO"; }
+    struct gls_zc zc;
+    memset(&zc, 0, sizeof(zc));
+    if (!rc && gls_zc_setup(&g, &pt, &zc) == GLS_OK) {
+        pt.width = zc.w;
+        pt.height = zc.h;
+    } else if (!rc && gls_setup_fbo(&g, pt.width, pt.height, &fb)) {
+        rc = GLS_ERR;
+        why = "FBO";
+    }
     if (!rc) {
         int r = gpu_cmd_begin(g.cl);
         r |= gls_put(&g, GPU_CMD_GL_USE_PROGRAM, GLS_A(prog), NULL, 0);
@@ -401,12 +542,17 @@ int gpu_gl_cube_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *f
         dm_cube_mvp(mvp, (float)((now - t0) / 1000.0), pt.width, pt.height, 0);
 
         if (gpu_cmd_begin(g.cl)) break;
-        int r = gls_put(&g, GPU_CMD_GL_CLEAR, GLS_A(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT), NULL, 0);
+        int r = zc.n ? gls_zc_bind(&g, &zc) : GLS_OK;
+        r |= gls_put(&g, GPU_CMD_GL_CLEAR, GLS_A(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT), NULL, 0);
         r |= gls_put(&g, GPU_CMD_GL_UNIFORM_MATRIX4FV, GLS_A((uint32_t)mvp_loc, 1, 0, 0), mvp, sizeof(mvp));
         r |= gls_put(&g, GPU_CMD_GL_DRAW_ARRAYS, GLS_A(GL_TRIANGLES, 0, DEMO_CUBE_VERTS), NULL, 0);
-        if (r || gls_readback(&g, pt.width, pt.height)) break;
-
-        gpu_present_frame(&pt, (const uint32_t *)mesa_pix_data(), pt.width, pt.height);
+        if (r) break;
+        if (zc.n) {
+            if (gls_zc_show(&g, &pt, &zc)) break;
+        } else {
+            if (gls_readback(&g, pt.width, pt.height)) break;
+            gpu_present_frame(&pt, (const uint32_t *)mesa_pix_data(), pt.width, pt.height);
+        }
         frames++;
     }
     uint64_t elapsed = msnow() - t0;
@@ -415,6 +561,7 @@ int gpu_gl_cube_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *f
         why = "frame";
     }
 
+    gls_zc_free(&g, &zc);
     gls_free_fbo(&g, &fb);
     gls_delete(&g, GPU_CMD_GL_DELETE_BUFFERS, &vbo);
     if (prog) gls_one(&g, GPU_CMD_GL_DELETE_PROGRAM, GLS_A(prog));
@@ -543,6 +690,7 @@ int gpu_glxgears_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *
 
     gpu_present pt;
     int pr = gpu_present_open(&pt, opts, opts->width, opts->height);
+    pt.src_bgra = true;
     if (pr) {
         LOG_WARNING("glxgears(GL): present open failed (%d)", pr);
         gpu_client_close(g.cl);
@@ -594,7 +742,15 @@ int gpu_glxgears_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *
         rc = GLS_ERR;
         why = "VBO upload";
     }
-    if (!rc && gls_setup_fbo(&g, pt.width, pt.height, &fb)) { rc = GLS_ERR; why = "FBO"; }
+    struct gls_zc zc;
+    memset(&zc, 0, sizeof(zc));
+    if (!rc && gls_zc_setup(&g, &pt, &zc) == GLS_OK) {
+        pt.width = zc.w;
+        pt.height = zc.h;
+    } else if (!rc && gls_setup_fbo(&g, pt.width, pt.height, &fb)) {
+        rc = GLS_ERR;
+        why = "FBO";
+    }
 
     float proj[16];
     {
@@ -644,7 +800,8 @@ int gpu_glxgears_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *
         dm_mul(view, view, ry);
 
         if (gpu_cmd_begin(g.cl)) break;
-        int r = gls_put(&g, GPU_CMD_GL_CLEAR, GLS_A(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT), NULL, 0);
+        int r = zc.n ? gls_zc_bind(&g, &zc) : GLS_OK;
+        r |= gls_put(&g, GPU_CMD_GL_CLEAR, GLS_A(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT), NULL, 0);
         for (int gi = 0; gi < 3 && !r; gi++) {
             float mv[16], tr[16], rz[16];
             float deg = gear_def[gi].speed * angle + gear_def[gi].phase;
@@ -658,8 +815,13 @@ int gpu_glxgears_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *
             r |= gls_put(&g, GPU_CMD_GL_DRAW_ARRAYS, GLS_A(GL_TRIANGLES, gear_first[gi], gear_count[gi]),
                          NULL, 0);
         }
-        if (r || gls_readback(&g, pt.width, pt.height)) break;
-        gpu_present_frame(&pt, (const uint32_t *)mesa_pix_data(), pt.width, pt.height);
+        if (r) break;
+        if (zc.n) {
+            if (gls_zc_show(&g, &pt, &zc)) break;
+        } else {
+            if (gls_readback(&g, pt.width, pt.height)) break;
+            gpu_present_frame(&pt, (const uint32_t *)mesa_pix_data(), pt.width, pt.height);
+        }
         frames++;
     }
     uint64_t elapsed = msnow() - t0;
@@ -668,6 +830,7 @@ int gpu_glxgears_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *
         why = "frame";
     }
 
+    gls_zc_free(&g, &zc);
     gls_free_fbo(&g, &fb);
     gls_delete(&g, GPU_CMD_GL_DELETE_BUFFERS, &vbo);
     gls_reset_state(&g);

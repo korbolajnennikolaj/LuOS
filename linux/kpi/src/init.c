@@ -18,6 +18,8 @@ bool lkpi_boot_cpu_has(int bit)
 	return (boot_cpu_data.x86_capability[bit / 32] >> (bit % 32)) & 1;
 }
 
+bool lkpi_has_clflushopt;
+
 static void cpu_data_init(void)
 {
 	unsigned int r[4];
@@ -50,6 +52,7 @@ static void cpu_data_init(void)
 		c->x86_capability[16] = r[2];
 		c->x86_capability[18] = r[3];
 	}
+	lkpi_has_clflushopt = (c->x86_capability[9] >> 23) & 1;
 	luos_cpuid(0x80000000, 0, r);
 	unsigned int max_ext = r[0];
 	if (max_ext >= 0x80000001) {

@@ -31,6 +31,8 @@ static uint32_t auto_mount_reported_devices = 0;
 
 static volatile uint64_t root_fs_last_beat_ms = 0;
 
+static volatile uint64_t rootfs_stamp_seq = 1;
+
 static struct block_device *formatting_dev = NULL;
 
 static bool devices_overlap(struct block_device *a, struct block_device *b) {
@@ -182,6 +184,10 @@ const rootfs_mount_t *rootfs_mount_for_path(const char *abs_path) {
     return best;
 }
 
+uint64_t rootfs_mounts_stamp(void) {
+    return __atomic_load_n(&rootfs_stamp_seq, __ATOMIC_ACQUIRE);
+}
+
 fs_t *rootfs_resolve(const char *abs_path, char *out_rel, size_t out_cap) {
     const rootfs_mount_t *mnt = rootfs_mount_for_path(abs_path);
     if (!mnt) return NULL;
@@ -276,6 +282,8 @@ static int rootfs_mount_device_ex(const char *device_name, const char *mount_poi
         return ROOTFS_ERR_FS;
     }
 
+    fs.gen = fs_new_gen();
+    fs.opens = 0;
     spin_lock(&rootfs_lock);
     mounts[slot].fs = fs;
     strncpy(mounts[slot].path, point, ROOTFS_MOUNT_PATH_MAX - 1);
@@ -284,6 +292,7 @@ static int rootfs_mount_device_ex(const char *device_name, const char *mount_poi
     mounts[slot].device[ROOTFS_DEVICE_NAME_MAX - 1] = '\0';
     mounts[slot].mounted = true;
     mount_pending[slot] = false;
+    rootfs_stamp_seq++;
     spin_unlock(&rootfs_lock);
 
     if (slot == 0) rootfs_set_cwd("/");
@@ -319,9 +328,18 @@ int rootfs_unmount_point(const char *mount_point) {
     mount_pending[slot] = true;
     spin_unlock(&rootfs_lock);
 
-    fs_unmount(&mounts[slot].fs);
+    int ur = fs_unmount(&mounts[slot].fs);
+    if (ur == FS_ERR_BUSY) {
+        spin_lock(&rootfs_lock);
+        mounts[slot].mounted = true;
+        mount_pending[slot] = false;
+        spin_unlock(&rootfs_lock);
+        LOG_WARNING("%s is busy: %d file(s) on it are still open", point, mounts[slot].fs.opens);
+        return ROOTFS_ERR_INUSE;
+    }
 
     spin_lock(&rootfs_lock);
+    rootfs_stamp_seq++;
     mounts[slot].device[0] = '\0';
     mounts[slot].path[0] = '\0';
     mount_pending[slot] = false;
@@ -408,8 +426,16 @@ static void rootfs_drop_lost_mounts(void) {
 
         spin_lock(&rootfs_lock);
         mounts[i].mounted = false;
+        mount_pending[i] = true;
+        spin_unlock(&rootfs_lock);
+
+        fs_invalidate(&mounts[i].fs);
+
+        spin_lock(&rootfs_lock);
         mounts[i].device[0] = '\0';
         mounts[i].path[0] = '\0';
+        mount_pending[i] = false;
+        rootfs_stamp_seq++;
         spin_unlock(&rootfs_lock);
 
         if (i == 0) rootfs_set_cwd("/");

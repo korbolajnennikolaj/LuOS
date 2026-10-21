@@ -3,6 +3,7 @@
 
 #include "drivers/GPU/mesa.h"
 #include "drivers/GPU/mesa_sigs.h"
+#include "drivers/GPU/mesa_vk_pack.h"
 #include "drivers/GPU/mesa_gl_defs.h"
 #include "drivers/GPU/gpu_core.h"
 
@@ -83,6 +84,20 @@ static volatile uint32_t mesa_epoch;
 static char mesa_env[MESA_HOST_ENV_MAX];
 static struct mesa_host_info mesa_info_v;
 static uint32_t mesa_frame_seq;
+static volatile int mesa_host_card;
+static uint64_t mesa_boot_rets[MESA_MAX_CALLS];
+static volatile uint32_t mesa_boot_nrets;
+
+static struct {
+    volatile int busy;
+    volatile int done;
+    volatile uint32_t seq;
+    uint32_t status;
+    uint32_t nrets;
+    uint64_t rets[MESA_MAX_CALLS];
+    uint32_t outs_len;
+    uint8_t outs[MESA_DC_OUTS_MAX];
+} mesa_dcr;
 
 struct mesa_build {
     struct mesa_call calls[MESA_MAX_CALLS];
@@ -191,6 +206,7 @@ static void mesa_frame_publish(struct mesa_frame *f) {
     uint64_t flags = spin_lock_irqsave(&mesa_lock);
     f->ready = true;
     spin_unlock_irqrestore(&mesa_lock, flags);
+    vfs_poll_wake();
 }
 
 static bool mesa_compile_gl(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_rec *rec,
@@ -371,6 +387,15 @@ static bool mesa_vk_walk(struct mesa_build *b, const uint8_t *payload, uint32_t 
         if (!val || val > 0xFFFF) continue;
         mb_fix(b, base + struct_off + f->off, base + (uint32_t)val, MESA_FIX_BLOB);
         int sub = mesa_vk_map_find(payload, payload_len, nmap, 0, (uint32_t)val);
+        if (sub == VKP_STRV) {
+            for (uint32_t at = base + (uint32_t)val; at + 8 <= b->blob_len; at += 8) {
+                uint64_t s = 0;
+                memcpy(&s, b->blob + at, 8);
+                if (!s || s > 0xFFFF) break;
+                mb_fix(b, at, base + (uint32_t)s, MESA_FIX_BLOB);
+            }
+            continue;
+        }
         uint32_t elem = (uint32_t)val;
         while (sub > 0) {
             if (!mesa_vk_walk(b, payload, payload_len, nmap, base, elem,
@@ -790,7 +815,7 @@ static void mesa_host_task(void *arg) {
     const char *argv[2] = {MESA_HOST_BIN, NULL};
     const char *env[12];
     int e = 0;
-    static char env_buf[MESA_HOST_ENV_MAX];
+    static char env_buf[MESA_HOST_ENV_MAX * 2];
     int n = 0;
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "PATH=/usr/bin:/bin");
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "%c", 0);
@@ -798,6 +823,7 @@ static void mesa_host_task(void *arg) {
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "%c", 0);
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "TERM=linux");
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "%c", 0);
+    n += snprintf(env_buf + n, sizeof(env_buf) - n, "MESA_SHADER_CACHE_DISABLE=true");
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "%c", 0);
     if (mesa_prime_resolved == MESA_PRIME_LLVM) {
         n += snprintf(env_buf + n, sizeof(env_buf) - n,
@@ -815,6 +841,7 @@ static void mesa_host_task(void *arg) {
                       ":/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
                       ":/usr/share/vulkan/icd.d/intel_icd.json"
                       ":/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json"
+                      ":/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json"
                       ":/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"
                       ":/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
                       ":/usr/share/vulkan/icd.d/lvp_icd.json");
@@ -837,6 +864,8 @@ static void mesa_host_task(void *arg) {
 
     struct process *p = NULL;
     mesa_host_gen = mesa_prime_gen;
+    mesa_host_card = mesa_prime_resolved;
+    mesa_boot_nrets = 0;
     int pid = proc_spawn(MESA_HOST_BIN, 1, argv, e, env, &p);
     if (pid < 0) {
         LOG_WARNING("mesa: host spawn failed (%d) - GL/Vulkan batches queue up", pid);
@@ -874,8 +903,16 @@ static void mesa_host_task(void *arg) {
             f->ready = false;
         }
         spin_unlock_irqrestore(&mesa_lock, flags);
-        if (fdev != -1 && fslot != 0xFFFFFFFEu)
+        if (fdev != -1 && fslot != 0xFFFFFFFEu && fslot != MESA_DIRECT_SEQ)
             gpu_slot_publish(fdev, fslot, GPU_ERR_NO_TRANSLATOR);
+    }
+    mesa_boot_nrets = 0;
+    if (mesa_dcr.seq) {
+        mesa_dcr.status = 1;
+        mesa_dcr.nrets = 0;
+        mesa_dcr.outs_len = 0;
+        __atomic_store_n(&mesa_dcr.done, 1, __ATOMIC_RELEASE);
+        scheduler_wake_all((void *)&mesa_dcr.done);
     }
 
     if (!booted) {
@@ -1087,8 +1124,16 @@ int mesa_frame_drain(int dev_idx, uint8_t *buf, uint32_t cap, uint32_t *out_len)
     return GPU_OK;
 }
 
+uint8_t *mesa_pix_target(uint32_t pix_seq, uint32_t off, uint32_t len) {
+    if (!mesa_pix || off > MESA_PIX_MAX || len > MESA_PIX_MAX - off) return NULL;
+    if (pix_seq != mesa_pix_seq_v) return NULL;
+    return mesa_pix + off;
+}
+
+void mesa_pix_account(uint32_t len) { mesa_pix_done += len; }
+
 int mesa_pix_write(uint32_t pix_seq, uint32_t off, const void *data, uint32_t len) {
-    if (!mesa_pix || off + len > MESA_PIX_MAX) return GPU_ERR_PARAM;
+    if (!mesa_pix || off > MESA_PIX_MAX || len > MESA_PIX_MAX - off) return GPU_ERR_PARAM;
     if (pix_seq != mesa_pix_seq_v) return GPU_ERR_PARAM;
     memcpy(mesa_pix + off, data, len);
     mesa_pix_done += len;
@@ -1141,6 +1186,9 @@ static void mesa_boot_complete(const struct mesa_done_hdr *h, const uint8_t *dat
         memcpy(renderer_s, outs + off + 256, 128);
         renderer_s[127] = 0;
     }
+    uint32_t keep = rets < MESA_MAX_CALLS ? rets : MESA_MAX_CALLS;
+    memcpy(mesa_boot_rets, p, (size_t)keep * 8);
+    __atomic_store_n(&mesa_boot_nrets, keep, __ATOMIC_RELEASE);
     mesa_info_v.gl_ok = 1;
     mesa_info_v.vk_ok = 1;
     snprintf(mesa_info_v.renderer, sizeof(mesa_info_v.renderer), "EGL %u.%u %s / %s", maj, min,
@@ -1178,6 +1226,24 @@ int mesa_frame_complete(int dev_idx, uint32_t slot_seq, uint32_t seq, const uint
 
     if (slot_seq == 0xFFFFFFFEu) {
         mesa_boot_complete(&h, data, len);
+        mesa_frame_free(f);
+        return GPU_OK;
+    }
+
+    if (slot_seq == MESA_DIRECT_SEQ) {
+        if (h.seq == mesa_dcr.seq && sizeof(struct mesa_done_hdr) + (size_t)h.rets * 8 <= len) {
+            uint32_t n = h.rets < MESA_MAX_CALLS ? h.rets : MESA_MAX_CALLS;
+            const uint8_t *rp = data + sizeof(struct mesa_done_hdr);
+            memcpy(mesa_dcr.rets, rp, (size_t)n * 8);
+            mesa_dcr.nrets = n;
+            uint32_t olen = len - (uint32_t)sizeof(struct mesa_done_hdr) - h.rets * 8;
+            if (olen > MESA_DC_OUTS_MAX) olen = MESA_DC_OUTS_MAX;
+            memcpy(mesa_dcr.outs, rp + (size_t)h.rets * 8, olen);
+            mesa_dcr.outs_len = olen;
+            mesa_dcr.status = h.status;
+            __atomic_store_n(&mesa_dcr.done, 1, __ATOMIC_RELEASE);
+            scheduler_wake_all((void *)&mesa_dcr.done);
+        }
         mesa_frame_free(f);
         return GPU_OK;
     }
@@ -1267,4 +1333,145 @@ int mesa_init(void) {
     LOG_INFO("mesa: kernel-space translator ready (%d GL + %d VK signatures)",
              GPU_CMD_GL_COUNT, GPU_CMD_VK_COUNT);
     return GPU_OK;
+}
+
+struct mesa_dc {
+    struct mesa_build b;
+    struct mesa_outslot slots[MESA_MAX_CALLS];
+    uint16_t pend_outs;
+    uint16_t pend_fix;
+};
+
+struct mesa_dc *mesa_dc_new(void) {
+    struct mesa_dc *d = kmalloc(sizeof(*d));
+    if (!d) return NULL;
+    memset(d, 0, sizeof(*d));
+    d->b.slots = d->slots;
+    return d;
+}
+
+void mesa_dc_free(struct mesa_dc *d) {
+    if (d) kfree(d);
+}
+
+static int mesa_dc_add(struct mesa_dc *d, uint16_t kind, const char *name, uint8_t argc, const uint64_t *args,
+                       uint32_t ptr_mask, uint32_t ret_mask) {
+    if (!d || argc > MESA_CALL_ARGS) return -1;
+    uint32_t name_off = name ? mb_put(&d->b, name, (uint32_t)strlen(name) + 1) : 0;
+    struct mesa_call *c = mb_call(&d->b);
+    if (!c || d->b.overflow) return -1;
+    c->kind = kind;
+    c->name_off = name_off;
+    c->argc = argc;
+    for (int i = 0; i < argc; i++) {
+        c->args[i] = args[i];
+        if ((ptr_mask >> i) & 1) c->fmask |= (uint32_t)MESA_ACLS_PTR << (2 * i);
+    }
+    c->rsv = ret_mask & 0x7FFFFFFFu;
+    c->nout = d->pend_outs;
+    c->nfix = d->pend_fix;
+    d->pend_outs = 0;
+    d->pend_fix = 0;
+    return d->b.calls_n - 1;
+}
+
+int mesa_dc_call(struct mesa_dc *d, const char *name, uint8_t argc, const uint64_t *args, uint32_t ptr_mask,
+                 uint32_t ret_mask) {
+    return mesa_dc_add(d, MESA_CALL_FN, name, argc, args, ptr_mask, ret_mask);
+}
+
+int mesa_dc_fnptr(struct mesa_dc *d, uint8_t argc, const uint64_t *args, uint32_t ptr_mask, uint32_t ret_mask) {
+    if (!argc) return -1;
+    return mesa_dc_add(d, MESA_CALL_FNPTR, NULL, argc, args, ptr_mask, ret_mask);
+}
+
+uint32_t mesa_dc_in(struct mesa_dc *d, const void *data, uint32_t len) {
+    return mb_blob8(&d->b, data, len);
+}
+
+uint32_t mesa_dc_out(struct mesa_dc *d, uint32_t len) {
+    struct mesa_call *save = d->b.cur;
+    d->b.cur = NULL;
+    mb_align(&d->b, 8);
+    uint32_t area = mb_put(&d->b, NULL, len);
+    mb_out(&d->b, area, len, 0xFFFF);
+    d->b.cur = save;
+    d->pend_outs++;
+    return area;
+}
+
+void mesa_dc_fix(struct mesa_dc *d, uint32_t where, uint32_t target) {
+    if (mb_fix(&d->b, where, target, MESA_FIX_BLOB)) d->pend_fix++;
+}
+
+int mesa_dc_run(struct mesa_dc *d, uint64_t *rets, int max_rets, void *outs, uint32_t outs_cap,
+                uint32_t timeout_ms) {
+    if (!d || d->b.overflow || !d->b.calls_n) return GPU_ERR_PARAM;
+    if (!mesa_ready()) return GPU_ERR_NO_TRANSLATOR;
+    while (__atomic_exchange_n(&mesa_dcr.busy, 1, __ATOMIC_ACQ_REL)) scheduler_sleep_ms(1);
+    struct mesa_frame *f = NULL;
+    uint64_t flags = spin_lock_irqsave(&mesa_lock);
+    bool alloc = mesa_frame_alloc(&f);
+    spin_unlock_irqrestore(&mesa_lock, flags);
+    if (!alloc) {
+        __atomic_store_n(&mesa_dcr.busy, 0, __ATOMIC_RELEASE);
+        return GPU_ERR_BUSY;
+    }
+    uint32_t seq = ++mesa_frame_seq;
+    mesa_dcr.status = 0;
+    mesa_dcr.nrets = 0;
+    mesa_dcr.outs_len = 0;
+    __atomic_store_n(&mesa_dcr.done, 0, __ATOMIC_RELEASE);
+    mesa_dcr.seq = seq;
+    if (!mesa_finalize(&d->b, seq, f, MESA_DIRECT_SEQ, -1, 0, 0, d->b.calls_n)) {
+        mesa_frame_free(f);
+        mesa_dcr.seq = 0;
+        __atomic_store_n(&mesa_dcr.busy, 0, __ATOMIC_RELEASE);
+        return GPU_ERR_OVERFLOW;
+    }
+    mesa_frame_publish(f);
+    int w = scheduler_wait((void *)&mesa_dcr.done, &mesa_dcr.done, timeout_ms);
+    int r = GPU_OK;
+    if (w) {
+        r = GPU_ERR_TIMEOUT;
+    } else {
+        if (rets && max_rets > 0) {
+            int n = (int)mesa_dcr.nrets < max_rets ? (int)mesa_dcr.nrets : max_rets;
+            memcpy(rets, mesa_dcr.rets, (size_t)n * 8);
+            if (n < max_rets) memset(rets + n, 0, (size_t)(max_rets - n) * 8);
+        }
+        if (outs && outs_cap) {
+            uint32_t n = mesa_dcr.outs_len < outs_cap ? mesa_dcr.outs_len : outs_cap;
+            memcpy(outs, mesa_dcr.outs, n);
+        }
+        if (mesa_dcr.status) r = GPU_ERR_STATE;
+    }
+    mesa_dcr.seq = 0;
+    __atomic_store_n(&mesa_dcr.busy, 0, __ATOMIC_RELEASE);
+    return r;
+}
+
+bool mesa_card_context(struct mesa_card_ctx *out) {
+    if (!out || !mesa_ready() || mesa_host_card < 1) return false;
+    if (__atomic_load_n(&mesa_boot_nrets, __ATOMIC_ACQUIRE) < 6) return false;
+    out->dev_idx = mesa_host_card - 1;
+    out->drm_fd = (int)mesa_boot_rets[0];
+    out->gbm = mesa_boot_rets[1];
+    out->dpy = mesa_boot_rets[2];
+    out->ctx = mesa_boot_rets[5];
+    if (strstr(mesa_info_v.renderer, "llvmpipe") || strstr(mesa_info_v.renderer, "softpipe")) return false;
+    return out->drm_fd >= 0 && out->gbm && out->dpy && out->ctx;
+}
+
+void *mesa_host_drm_file(int fd) {
+    uint64_t flags = spin_lock_irqsave(&mesa_host_proc_lock);
+    struct process *p = mesa_host_proc;
+    if (p) __atomic_add_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
+    spin_unlock_irqrestore(&mesa_host_proc_lock, flags);
+    if (!p) return NULL;
+    struct ufile *f = fd_get(p, fd);
+    void *lx = f ? vfs_ufile_lx(f) : NULL;
+    if (f) ufile_put(f);
+    proc_put(p);
+    return lx;
 }

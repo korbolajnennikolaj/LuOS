@@ -265,6 +265,25 @@ long lkpi_gpu_gem_vmap(void *handle, unsigned int gem_handle, void **map_token,
         return 0;
 }
 
+long lkpi_gpu_gem_share(void *dst_handle, void *src_file, unsigned int src_gem, unsigned int *dst_gem)
+{
+        struct file *dst = dst_handle, *src = src_file;
+        struct drm_file *pd, *ps;
+        struct drm_gem_object *obj;
+        long ret;
+
+        if (!dst || !src || !dst_gem) return -EINVAL;
+        if (dst->f_op != src->f_op) return -EXDEV;
+        pd = dst->private_data;
+        ps = src->private_data;
+        if (!pd || !ps || !pd->minor || !ps->minor || pd->minor->dev != ps->minor->dev) return -EXDEV;
+        obj = drm_gem_object_lookup(ps, src_gem);
+        if (!obj) return -ENOENT;
+        ret = drm_gem_handle_create(pd, obj, dst_gem);
+        drm_gem_object_put(obj);
+        return ret;
+}
+
 long lkpi_gpu_gem_vunmap(void *map_token)
 {
         struct lkpi_gem_map *m = map_token;

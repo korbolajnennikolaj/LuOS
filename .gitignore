@@ -22,6 +22,8 @@ userspace/tests/lib/
 userspace/vulkan/
 LuOS_gpu_firmware.zip
 userspace/sysroot/firmware/
+userspace/sysroot/vbios/
+*.rom
 
 # tool tarballs
 *.tar.gz

@@ -315,6 +315,14 @@ static int do_enable(struct pci_dev *dev, bool io)
         }
         if (dev->resource[PCI_ROM_RESOURCE].flags) set |= PCI_COMMAND_MEMORY;
         pci_set_command(dev, 0, set);
+        if (!dev->lkpi_intx_irq && dev->pin) {
+                int v = luos_pci_intx_vector(dev->luos_dev);
+                dev->lkpi_intx_irq = v >= 32 ? v : -1;
+        }
+        if (!dev->irq && !dev->lkpi_irq_count && dev->lkpi_intx_irq >= 32) {
+                dev->irq = dev->lkpi_intx_irq;
+                pci_set_command(dev, PCI_COMMAND_INTX_DISABLE, 0);
+        }
         atomic_inc(&dev->enable_cnt);
         return 0;
 }
@@ -456,13 +464,13 @@ static bool rom_valid(void __iomem *rom)
 static int lkpi_flash_vbios_image(const u8 *base, size_t window, size_t off, u16 vendor, u16 device, size_t *img_len)
 {
         const u8 *p = base + off;
-        u16 pcir_off, len_units;
-        u8 hdr;
+        u16 pcir_off, len_units, hdr, list_off;
+        int score;
 
         if (off + 0x200 > window) return 0;
         if (p[0] != 0x55 || p[1] != 0xaa) return 0;
         pcir_off = p[0x18] | (p[0x19] << 8);
-        if (pcir_off < 0x18 || pcir_off > 0x100) return 0;
+        if (pcir_off < 0x1a || pcir_off > 0x1000 || off + pcir_off + 0x18 > window) return 0;
         if (p[pcir_off + 0] != 'P' || p[pcir_off + 1] != 'C' || p[pcir_off + 2] != 'I' || p[pcir_off + 3] != 'R')
                 return 0;
         if ((p[pcir_off + 4] | (p[pcir_off + 5] << 8)) != vendor) return 0;
@@ -470,10 +478,23 @@ static int lkpi_flash_vbios_image(const u8 *base, size_t window, size_t off, u16
         len_units = p[pcir_off + 0x10] | (p[pcir_off + 0x11] << 8);
         if (len_units < 32 || off + (size_t)len_units * 512 > window) return 0;
         hdr = p[0x48] | (p[0x49] << 8);
-        if (hdr < 0x30 || off + hdr + 8 > window) return 0;
+        if (hdr < 0x4a || hdr + 8 > (size_t)len_units * 512) return 0;
         if (memcmp(p + hdr + 4, "ATOM", 4) && memcmp(p + hdr + 4, "MOTA", 4)) return 0;
         *img_len = (size_t)len_units * 512;
-        return (p[pcir_off + 6] | (p[pcir_off + 7] << 8)) == device ? 2 : 1;
+        score = (p[pcir_off + 6] | (p[pcir_off + 7] << 8)) == device ? 2 : 1;
+        list_off = p[pcir_off + 8] | (p[pcir_off + 9] << 8);
+        if (score == 1 && p[pcir_off + 0x0c] >= 3 && list_off) {
+                size_t at = (size_t)pcir_off + list_off;
+                for (int i = 0; i < 64 && off + at + 2 <= window && at + 2 <= *img_len; i++, at += 2) {
+                        u16 id = p[at] | (p[at + 1] << 8);
+                        if (!id) break;
+                        if (id == device) {
+                                score = 2;
+                                break;
+                        }
+                }
+        }
+        return score;
 }
 
 void lkpi_scan_flash_vbios(struct pci_dev *pdev)
@@ -503,6 +524,40 @@ void lkpi_scan_flash_vbios(struct pci_dev *pdev)
                          (unsigned long long)pdev->rom);
 }
 
+static void __iomem *pci_rom_from_file(struct pci_dev *pdev, size_t *size)
+{
+        char names[3][48];
+        snprintf(names[0], sizeof(names[0]), "vbios/%04x_%04x_%04x_%04x.rom", pdev->vendor, pdev->device,
+                 pdev->subsystem_vendor, pdev->subsystem_device);
+        snprintf(names[1], sizeof(names[1]), "vbios/%04x_%04x.rom", pdev->vendor, pdev->device);
+        snprintf(names[2], sizeof(names[2]), "vbios/%s.rom", pci_name(pdev));
+        for (int i = 0; i < 3; i++) {
+                const void *data = NULL;
+                unsigned long len = 0;
+                void *handle = NULL;
+                u8 *copy;
+                if (luos_firmware_get(names[i], &data, &len, &handle)) continue;
+                if (len < 0x200 || ((const u8 *)data)[0] != 0x55 || ((const u8 *)data)[1] != 0xaa) {
+                        luos_firmware_put(handle);
+                        dev_warn(&pdev->dev, "%s is not a PCI option ROM image\n", names[i]);
+                        continue;
+                }
+                copy = kvmalloc(len, GFP_KERNEL);
+                if (!copy) {
+                        luos_firmware_put(handle);
+                        return NULL;
+                }
+                memcpy(copy, data, len);
+                luos_firmware_put(handle);
+                kvfree(pdev->lkpi_rom_copy);
+                pdev->lkpi_rom_copy = copy;
+                *size = len;
+                dev_info(&pdev->dev, "VBIOS image (%lu KiB) loaded from firmware file %s\n", len / 1024, names[i]);
+                return (void __iomem __force *)copy;
+        }
+        return NULL;
+}
+
 void __iomem *pci_map_rom(struct pci_dev *pdev, size_t *size)
 {
         struct resource *res = &pdev->resource[PCI_ROM_RESOURCE];
@@ -527,12 +582,17 @@ void __iomem *pci_map_rom(struct pci_dev *pdev, size_t *size)
                 }
                 if (rom) iounmap(rom);
         }
-        return NULL;
+        return pci_rom_from_file(pdev, size);
 }
 
 void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
 {
         struct resource *res = &pdev->resource[PCI_ROM_RESOURCE];
+        if (rom && (void __force *)rom == pdev->lkpi_rom_copy) {
+                kvfree(pdev->lkpi_rom_copy);
+                pdev->lkpi_rom_copy = NULL;
+                return;
+        }
         iounmap(rom);
         if (resource_size(res) > 1 && res->start) {
                 u32 bar;
@@ -748,7 +808,7 @@ void pci_free_irq_vectors(struct pci_dev *dev)
         dev->lkpi_irq_count = 0;
         dev->msi_enabled = 0;
         dev->msix_enabled = 0;
-        dev->irq = 0;
+        dev->irq = dev->lkpi_intx_irq >= 32 ? dev->lkpi_intx_irq : 0;
 }
 
 static int alloc_vectors(struct pci_dev *dev, int n)
@@ -891,9 +951,9 @@ void lkpi_pci_init(void)
                         r->start = info.rom_base;
                         r->end = info.rom_base + info.rom_size - 1;
                         r->flags = IORESOURCE_MEM | IORESOURCE_READONLY;
-                } else if (pci_is_display(d) && d->vendor == PCI_VENDOR_ID_ATI) {
-                        lkpi_scan_flash_vbios(d);
                 }
+                if (pci_is_display(d) && d->vendor == PCI_VENDOR_ID_ATI)
+                        lkpi_scan_flash_vbios(d);
 
                 device_initialize(&d->dev);
                 d->dev.bus = &pci_bus_type;

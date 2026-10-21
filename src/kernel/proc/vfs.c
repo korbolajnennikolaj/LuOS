@@ -599,6 +599,12 @@ static const struct ufile_ops null_ops = { .read = null_read, .write = null_writ
 static const struct ufile_ops zero_ops = { .read = zero_read, .write = null_write, .poll = dev_poll, .stat = dev_stat };
 static const struct ufile_ops rand_ops = { .read = rand_read, .write = null_write, .poll = dev_poll, .stat = dev_stat };
 
+static volatile int vfs_poll_chan;
+
+void *vfs_poll_channel(void) { return (void *)&vfs_poll_chan; }
+
+void vfs_poll_wake(void) { scheduler_wake_all((void *)&vfs_poll_chan); }
+
 int gpu_dev_default(void);
 
 static int gpu_node_ioctl(struct ufile *f, uint64_t cmd, uint64_t arg) {
@@ -631,19 +637,23 @@ static int gpu_node_ioctl(struct ufile *f, uint64_t cmd, uint64_t arg) {
             return 0;
         }
         case GPU_IOC_PIX: {
-            struct gpu_pix_xfer *x = kmalloc(sizeof(*x));
-            if (!x) return -LX_ENOMEM;
-            if (copy_from_user(x, arg, sizeof(*x))) {
-                kfree(x);
-                return -LX_EFAULT;
-            }
-            if (x->len > MESA_PIX_CHUNK) {
-                kfree(x);
-                return -LX_EINVAL;
-            }
-            int r = mesa_pix_write(x->seq, x->off, x->data, x->len);
-            kfree(x);
-            return r;
+            uint32_t h[4];
+            if (copy_from_user(h, arg, sizeof(h))) return -LX_EFAULT;
+            if (h[2] > MESA_PIX_CHUNK) return -LX_EINVAL;
+            uint8_t *dst = mesa_pix_target(h[0], h[1], h[2]);
+            if (!dst) return GPU_ERR_PARAM;
+            if (h[2] && copy_from_user(dst, arg + sizeof(h), h[2])) return -LX_EFAULT;
+            mesa_pix_account(h[2]);
+            return 0;
+        }
+        case GPU_IOC_PIX_PTR: {
+            struct gpu_pix_ptr x;
+            if (copy_from_user(&x, arg, sizeof(x))) return -LX_EFAULT;
+            uint8_t *dst = mesa_pix_target(x.seq, x.off, x.len);
+            if (!dst) return GPU_ERR_PARAM;
+            if (x.len && copy_from_user(dst, x.ptr, x.len)) return -LX_EFAULT;
+            mesa_pix_account(x.len);
+            return 0;
         }
         case GPU_IOC_HOSTINFO: {
             struct mesa_host_info info;

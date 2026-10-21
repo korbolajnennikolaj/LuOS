@@ -7,6 +7,7 @@
 #include "components/logger.h"
 #include "components/pci.h"
 #include "drivers/Video/limine_video_driver.h"
+#include "components/Interruptions/ioapic.h"
 #include "components/Interruptions/isr.h"
 #include "components/Interruptions/msi.h"
 #include "components/Memory/heap.h"
@@ -478,6 +479,47 @@ void luos_irq_detach(int vector)
     if (vector < 0 || vector > 255) return;
     irq_unregister_ctx_handler((uint8_t)vector);
     luos_irq_slots[vector].fn = NULL;
+}
+
+static int luos_intx_vec[24];
+static uint8_t luos_intx_line[256];
+static uint8_t luos_intx_owned[256];
+static spinlock_t luos_intx_lock = SPINLOCK_INIT;
+
+int luos_pci_intx_vector(void *handle)
+{
+    struct pci_device *d = handle;
+    if (!d || !d->irq_pin) return -1;
+    unsigned int line = d->irq_line;
+    if (line == 0 || line == 1 || line == 2 || line == 4 || line == 8 || line == 12 || line >= 24) return -1;
+    uint64_t flags = spin_lock_irqsave(&luos_intx_lock);
+    int v = luos_intx_vec[line];
+    if (!v) {
+        int cur = ioapic_pin_vector((uint8_t)line);
+        bool owned = cur < 32;
+        v = owned ? irq_alloc_vector() : cur;
+        if (v >= 32) {
+            luos_intx_vec[line] = v;
+            luos_intx_line[v] = (uint8_t)(line + 1);
+            luos_intx_owned[v] = owned;
+        }
+    }
+    spin_unlock_irqrestore(&luos_intx_lock, flags);
+    if (v >= 32) LOG_DEBUG("lkpi: %02x:%02x.%x INT%c# on IRQ line %u, vector 0x%02x", d->bus, d->slot, d->func,
+                           'A' + d->irq_pin - 1, line, (unsigned)v);
+    return v >= 32 ? v : -1;
+}
+
+int luos_intx_route(int vector, int enable)
+{
+    if (vector < 32 || vector > 255 || !luos_intx_line[vector]) return -1;
+    uint8_t line = (uint8_t)(luos_intx_line[vector] - 1);
+    if (enable) {
+        if (ioapic_pin_vector(line) != vector) ioapic_map_pci_irq(line, (uint8_t)vector, apic_get_lapic_id());
+    } else if (luos_intx_owned[vector] && ioapic_pin_vector(line) == vector) {
+        ioapic_mask_irq(line);
+    }
+    return 0;
 }
 
 int luos_irq_route_gsi(int gsi, int vector)

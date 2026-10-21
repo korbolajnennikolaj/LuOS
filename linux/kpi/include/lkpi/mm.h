@@ -285,7 +285,12 @@ void clflush_cache_range(void *addr, unsigned int size);
 static inline bool static_cpu_has_clflush(void) { return true; }
 void wbinvd_on_all_cpus(void);
 static inline void clflush(volatile void *p) { asm volatile("clflush %0" : "+m"(*(volatile char *)p)); }
-static inline void clflushopt(volatile void *p) { asm volatile(".byte 0x66; clflush %0" : "+m"(*(volatile char *)p)); }
+extern bool lkpi_has_clflushopt;
+static inline void clflushopt(volatile void *p)
+{
+	if (lkpi_has_clflushopt) asm volatile(".byte 0x66; clflush %0" : "+m"(*(volatile char *)p));
+	else asm volatile("clflush %0" : "+m"(*(volatile char *)p));
+}
 void kernel_fpu_begin(void);
 void kernel_fpu_end(void);
 #define kernel_fpu_begin_mask(m) kernel_fpu_begin()

@@ -25,6 +25,7 @@
 #define ROOTFS_ERR_NOROOT -5
 #define ROOTFS_ERR_FS -6
 #define ROOTFS_ERR_NOENT -7
+#define ROOTFS_ERR_INUSE -8
 
 typedef struct rootfs_mount {
     char path[ROOTFS_MOUNT_PATH_MAX];
@@ -42,6 +43,7 @@ const rootfs_mount_t *rootfs_mount_at(int index);
 const rootfs_mount_t *rootfs_mount_for_path(const char *abs_path);
 
 fs_t *rootfs_resolve(const char *abs_path, char *out_rel, size_t out_cap);
+uint64_t rootfs_mounts_stamp(void);
 
 const char *rootfs_type_name(enum fs_type type);
 const char *rootfs_root_device(void);

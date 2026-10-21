@@ -11,6 +11,7 @@
 #include <string.h>
 
 #define VKP_MAP_MAX 64
+#define VKP_STRV 0x7FFF
 #define VKP_MAP_AREA (8 + 8 * VKP_MAP_MAX)
 
 struct vkp {
@@ -74,6 +75,17 @@ static inline uint32_t vkp_put(struct vkp *p, const void *data, uint32_t size) {
 
 static inline uint32_t vkp_str(struct vkp *p, const char *s) {
     return vkp_put(p, s, (uint32_t)strlen(s) + 1);
+}
+
+static inline uint32_t vkp_strv(struct vkp *p, const char *const *names, uint32_t n) {
+    uint64_t offs[16];
+    if (n > 15) n = 15;
+    for (uint32_t i = 0; i < n; i++) offs[i] = vkp_str(p, names[i]);
+    offs[n] = 0;
+    uint32_t off = 0;
+    void *arr = vkp_alloc(p, VKP_STRV, (n + 1) * 8, &off);
+    if (arr) memcpy(arr, offs, (n + 1) * 8);
+    return off;
 }
 
 static inline uint32_t vkp_finish(struct vkp *p) {

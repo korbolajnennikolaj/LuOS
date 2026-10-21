@@ -228,6 +228,7 @@ static void isr_dispatch(struct registers *regs)
     irq_ctx_handler_t ctx_handler = __atomic_load_n(&s_ctx_handlers[vec].handler, __ATOMIC_ACQUIRE);
     if (ctx_handler) {
         ctx_handler(s_ctx_handlers[vec].ctx, regs);
+        if (s_irq_handlers[vec]) s_irq_handlers[vec](regs);
         apic_send_eoi();
         return;
     }

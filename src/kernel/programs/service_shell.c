@@ -2436,6 +2436,10 @@ static void cmd_fs_umount(limine_video_driver *video, const char *arg) {
         printf_color(0xFFFF5555, "'%s' still has disks mounted inside it.\n", point);
         return;
     }
+    if (r == ROOTFS_ERR_INUSE) {
+        printf_color(0xFFFF5555, "'%s' is busy: files on it are still open (a running program, playback or a firmware read).\n", point);
+        return;
+    }
     if (r != ROOTFS_OK) {
         printf_color(0xFFFF5555, "umount: failed for '%s' (code %d)\n", point, r);
         return;

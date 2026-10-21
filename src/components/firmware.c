@@ -34,6 +34,7 @@ static struct {
     enum firmware_source_kind kind;
     struct fwzip *zip;
     uint32_t entries;
+    uint64_t stamp;
 } fw_src;
 
 static volatile int fw_src_readers;
@@ -204,27 +205,9 @@ static struct {
 
 static volatile int fw_vol_readers;
 
-static uint64_t fw_mounts_stamp(void) {
-    uint64_t h = 14695981039346656037ULL;
-    int n = rootfs_mount_count();
-    h = (h ^ (uint64_t)(unsigned int)n) * 1099511628211ULL;
-    for (int i = 0; i < n; i++) {
-        const rootfs_mount_t *mnt = rootfs_mount_at(i);
-        if (!mnt || !mnt->mounted) {
-            h = (h ^ 0x5a) * 1099511628211ULL;
-            continue;
-        }
-        for (const char *s = mnt->path; s && *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ULL;
-        h = (h ^ 0x2f) * 1099511628211ULL;
-        for (const char *s = mnt->device; s && *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ULL;
-        h = (h ^ 0x2e) * 1099511628211ULL;
-    }
-    return h;
-}
-
 static const struct fwzip *fw_volume_acquire(int m, const rootfs_mount_t *mnt, char *rel, size_t rel_cap,
                                              char *path, size_t path_cap) {
-    uint64_t stamp = fw_mounts_stamp();
+    uint64_t stamp = rootfs_mounts_stamp();
 
     kmutex_lock(&fw_vol.lock);
     if (fw_vol.stamp != stamp) {
@@ -389,16 +372,36 @@ static int fw_request_builtin(const char *name, const struct firmware_blob **out
     return FIRMWARE_ERR_NOENT;
 }
 
+static void fw_src_revalidate(void) {
+    char path[FIRMWARE_PATH_MAX];
+    uint64_t flags = spin_lock_irqsave(&fw_lock);
+    bool stale = fw_src.kind != FW_SOURCE_NONE && fw_src.stamp != rootfs_mounts_stamp();
+    strncpy(path, fw_src.path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    spin_unlock_irqrestore(&fw_lock, flags);
+    if (!stale) return;
+    LOG_INFO("firmware source '%s': the mounts changed, reopening it", path);
+    if (firmware_set_source(path) != FIRMWARE_OK) {
+        LOG_WARNING("firmware source '%s' is gone after a mount change, falling back to the image and the volumes",
+                    path);
+        firmware_set_source(NULL);
+    }
+}
+
 static int fw_request_source(const char *name, const struct firmware_blob **out) {
     struct {
         enum firmware_source_kind kind;
         char path[FIRMWARE_PATH_MAX];
         struct fwzip *zip;
+        uint64_t stamp;
     } snap;
+
+    fw_src_revalidate();
 
     uint64_t flags = spin_lock_irqsave(&fw_lock);
     snap.kind = fw_src.kind;
     snap.zip = fw_src.zip;
+    snap.stamp = fw_src.stamp;
     strncpy(snap.path, fw_src.path, sizeof(snap.path) - 1);
     snap.path[sizeof(snap.path) - 1] = '\0';
     bool active = snap.kind != FW_SOURCE_NONE;
@@ -409,7 +412,7 @@ static int fw_request_source(const char *name, const struct firmware_blob **out)
     if (active) {
         char rel[FS_MAX_PATH];
         fs_t *fs = rootfs_resolve(snap.path, rel, sizeof(rel));
-        if (!fs) {
+        if (!fs || snap.stamp != rootfs_mounts_stamp()) {
             LOG_WARNING("firmware source '%s' is not on a mounted volume any more", snap.path);
             if (snap.kind == FW_SOURCE_ZIP) {
                 uint64_t fl = spin_lock_irqsave(&fw_lock);
@@ -496,7 +499,13 @@ int firmware_set_source(const char *path) {
     }
 
     char abs[FIRMWARE_PATH_MAX];
-    rootfs_normalize_path(path, abs, sizeof(abs));
+    if (path[0] == '/') {
+        strncpy(abs, path, sizeof(abs) - 1);
+        abs[sizeof(abs) - 1] = '\0';
+    } else {
+        rootfs_normalize_path(path, abs, sizeof(abs));
+    }
+    uint64_t stamp = rootfs_mounts_stamp();
 
     char rel[FS_MAX_PATH];
     fs_t *fs = rootfs_resolve(abs, rel, sizeof(rel));
@@ -537,6 +546,7 @@ int firmware_set_source(const char *path) {
     fw_src.path[sizeof(fw_src.path) - 1] = '\0';
     fw_src.zip = zip;
     fw_src.entries = entries;
+    fw_src.stamp = stamp;
     spin_unlock_irqrestore(&fw_lock, flags);
 
     while (fw_src_readers > 0) scheduler_yield();
