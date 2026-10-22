@@ -132,16 +132,26 @@ static volatile int s_isr_depth[MAX_CORES];
 
 int isr_in_interrupt(void)
 {
-    return s_isr_depth[current_core()] > 0;
+    struct task *t = current_task();
+    return t ? t->isr_depth > 0 : s_isr_depth[current_core()] > 0;
 }
 
 void isr_handler(struct registers *regs, void *fx)
 {
     void *prev_fx = scheduler_set_isr_fx(fx);
-    struct task *entry_task = (regs->cs & 3) == 3 ? current_task() : NULL;
-    s_isr_depth[current_core()]++;
+    struct task *cur = current_task();
+    struct task *entry_task = (regs->cs & 3) == 3 ? cur : NULL;
+    int core = current_core();
+    bool irq = regs->int_no >= 32;
+    if (irq) {
+        if (cur) cur->isr_depth++;
+        else s_isr_depth[core]++;
+    }
     isr_dispatch(regs);
-    s_isr_depth[current_core()]--;
+    if (irq) {
+        if (cur) cur->isr_depth--;
+        else s_isr_depth[core]--;
+    }
     scheduler_set_isr_fx(prev_fx);
     isr_user_return_check(regs, entry_task);
 }

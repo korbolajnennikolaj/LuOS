@@ -210,6 +210,7 @@ typedef struct audio_quirk_match {
     uint32_t usb_id;
     uint16_t rev_min;
     uint16_t rev_max;
+    const uint32_t *codec_list;
 } audio_quirk_match;
 
 typedef struct audio_quirk {
@@ -224,6 +225,7 @@ typedef struct audio_quirk {
     uint32_t fixed_rate;
     uint32_t codec_probe_mask;
     uint16_t delay_ms;
+    uint16_t group;
     uint8_t usb_iface;
     uint8_t usb_alt;
     const struct audio_pin_patch *pins;
@@ -255,6 +257,7 @@ typedef struct audio_quirk_ids {
 
 #define AUDIO_QUIRK_MAX_MATCHES 24
 #define AUDIO_QUIRK_MAX_TABLES 32
+#define AUDIO_QUIRK_MAX_GROUPS 16
 
 typedef struct audio_quirk_set {
     enum audio_quirk_domain domain;

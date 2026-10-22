@@ -199,6 +199,11 @@ bool audio_quirk_matches(const struct audio_quirk_match *m, const struct audio_q
     }
 
     if (!audio_quirk_id_match(m->codec_subsys, ids->codec_subsys)) return false;
+    if (m->codec_list) {
+        const uint32_t *c = m->codec_list;
+        while (*c && *c != ids->codec_id) c++;
+        if (!*c) return false;
+    }
     if (!audio_quirk_id_match(m->usb_id, ids->usb_id)) return false;
 
     if (m->rev_max) {
@@ -218,6 +223,9 @@ void audio_quirk_resolve(enum audio_quirk_domain domain, const struct audio_quir
     out->usb_alt = -1;
     if (!ids) return;
 
+    uint16_t groups[AUDIO_QUIRK_MAX_GROUPS];
+    int group_count = 0;
+
     for (int t = 0; t < quirk_table_count; t++) {
         const struct audio_quirk_table *table = quirk_tables[t];
         if (!table || table->domain != domain) continue;
@@ -225,6 +233,13 @@ void audio_quirk_resolve(enum audio_quirk_domain domain, const struct audio_quir
         for (uint32_t e = 0; e < table->count; e++) {
             const struct audio_quirk *q = &table->entries[e];
             if (!audio_quirk_matches(&q->match, ids)) continue;
+            if (q->group) {
+                bool taken = false;
+                for (int g = 0; g < group_count; g++)
+                    if (groups[g] == q->group) taken = true;
+                if (taken) continue;
+                if (group_count < AUDIO_QUIRK_MAX_GROUPS) groups[group_count++] = q->group;
+            }
 
             out->flags |= q->set;
             out->flags &= ~q->clear;

@@ -291,6 +291,7 @@ struct driver *return_meta_audio_core_driver(void);
 
 int audio_get_device_count(void);
 struct audio_device *audio_get_device(int idx);
+int audio_get_default_capture(void);
 
 int audio_route_add_device(int dev_idx);
 int audio_route_remove_device(int dev_idx);

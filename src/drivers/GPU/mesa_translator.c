@@ -810,6 +810,27 @@ static void mesa_bootstrap_push(void) {
     LOG_INFO("mesa: bootstrap frame queued (%d calls)", (int)f->cmd_count);
 }
 
+#define MESA_ICD(name) "/usr/share/vulkan/icd.d/" name "_icd.x86_64.json:/usr/share/vulkan/icd.d/" name "_icd.json:"
+#define MESA_ICD_LVP "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+
+static const char *mesa_vk_icds(void) {
+    static const struct {
+        const char *driver;
+        const char *icds;
+    } map[] = {
+        {"amdgpu", MESA_ICD("radeon") MESA_ICD_LVP},
+        {"i915", MESA_ICD("intel") MESA_ICD("intel_hasvk") MESA_ICD_LVP},
+        {"xe", MESA_ICD("intel") MESA_ICD_LVP},
+        {"nouveau", MESA_ICD("nouveau") MESA_ICD_LVP},
+        {"virtio_gpu", MESA_ICD("virtio") MESA_ICD_LVP},
+    };
+    struct gpu_device *d = mesa_prime_resolved > 0 ? gpu_get_device(mesa_prime_resolved - 1) : NULL;
+    for (size_t i = 0; d && i < sizeof(map) / sizeof(map[0]); i++)
+        if (strcmp(d->driver, map[i].driver) == 0) return map[i].icds;
+    return MESA_ICD("radeon") MESA_ICD("intel") MESA_ICD("intel_hasvk") MESA_ICD("nouveau") MESA_ICD("virtio")
+        MESA_ICD_LVP;
+}
+
 static void mesa_host_task(void *arg) {
     (void)arg;
     const char *argv[2] = {MESA_HOST_BIN, NULL};
@@ -835,16 +856,7 @@ static void mesa_host_task(void *arg) {
         n += snprintf(env_buf + n, sizeof(env_buf) - n, "GALLIUM_DRIVER=llvmpipe");
         n += snprintf(env_buf + n, sizeof(env_buf) - n, "%c", 0);
     } else {
-        n += snprintf(env_buf + n, sizeof(env_buf) - n,
-                      "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json"
-                      ":/usr/share/vulkan/icd.d/radeon_icd.json"
-                      ":/usr/share/vulkan/icd.d/intel_icd.x86_64.json"
-                      ":/usr/share/vulkan/icd.d/intel_icd.json"
-                      ":/usr/share/vulkan/icd.d/intel_hasvk_icd.x86_64.json"
-                      ":/usr/share/vulkan/icd.d/nouveau_icd.x86_64.json"
-                      ":/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"
-                      ":/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
-                      ":/usr/share/vulkan/icd.d/lvp_icd.json");
+        n += snprintf(env_buf + n, sizeof(env_buf) - n, "VK_DRIVER_FILES=%s", mesa_vk_icds());
         n += snprintf(env_buf + n, sizeof(env_buf) - n, "%c", 0);
     }
     n += snprintf(env_buf + n, sizeof(env_buf) - n, "LIBGL_ALWAYS_SOFTWARE=%d",

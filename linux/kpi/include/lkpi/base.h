@@ -420,11 +420,11 @@ __printf(1, 0) int vprintk(const char *fmt, va_list args);
 #define pr_debug(fmt, ...) no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
 #endif
 #define pr_devel(fmt, ...) no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
-#define pr_info_ratelimited pr_info
-#define pr_err_ratelimited pr_err
-#define pr_warn_ratelimited pr_warn
+#define pr_info_ratelimited(fmt, ...) printk_ratelimited(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_err_ratelimited(fmt, ...) printk_ratelimited(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
+#define pr_warn_ratelimited(fmt, ...) printk_ratelimited(KERN_WARNING pr_fmt(fmt), ##__VA_ARGS__)
 #define pr_debug_ratelimited pr_debug
-#define pr_notice_ratelimited pr_notice
+#define pr_notice_ratelimited(fmt, ...) printk_ratelimited(KERN_NOTICE pr_fmt(fmt), ##__VA_ARGS__)
 #define pr_err_once(fmt, ...) printk_once(KERN_ERR pr_fmt(fmt), ##__VA_ARGS__)
 #define pr_warn_once(fmt, ...) printk_once(KERN_WARNING pr_fmt(fmt), ##__VA_ARGS__)
 #define pr_info_once(fmt, ...) printk_once(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
@@ -435,20 +435,31 @@ __printf(1, 0) int vprintk(const char *fmt, va_list args);
 	bool __ret_print_once = !__print_once; \
 	if (!__print_once) { __print_once = true; printk(fmt, ##__VA_ARGS__); } \
 	unlikely(__ret_print_once); })
-#define printk_ratelimited printk
-#define printk_ratelimit() 1
+#define printk_ratelimited(fmt, ...) ({ \
+	static DEFINE_RATELIMIT_STATE(__rs_printk, DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST); \
+	if (__ratelimit(&__rs_printk)) printk(fmt, ##__VA_ARGS__); })
+#define printk_ratelimit() __ratelimit(&printk_ratelimit_state)
 #define print_hex_dump(level, prefix, type, rowsize, groupsize, buf, len, ascii) do { } while (0)
 #define print_hex_dump_debug(...) do { } while (0)
 #define print_hex_dump_bytes(...) do { } while (0)
 enum { DUMP_PREFIX_NONE, DUMP_PREFIX_ADDRESS, DUMP_PREFIX_OFFSET };
 #define DEFAULT_RATELIMIT_INTERVAL (5 * HZ)
 #define DEFAULT_RATELIMIT_BURST 10
-struct ratelimit_state { int interval; int burst; int printed; int missed; unsigned long begin; };
+struct ratelimit_state { int lock; int interval; int burst; int printed; int missed; unsigned long begin; };
 #define RATELIMIT_STATE_INIT(name, interval_init, burst_init) { .interval = (interval_init), .burst = (burst_init) }
 #define DEFINE_RATELIMIT_STATE(name, interval_init, burst_init) \
 	struct ratelimit_state name = RATELIMIT_STATE_INIT(name, interval_init, burst_init)
-#define __ratelimit(state) (((void)(state)), 1)
-static inline void ratelimit_state_init(struct ratelimit_state *rs, int interval, int burst) { rs->interval = interval; rs->burst = burst; }
+extern struct ratelimit_state printk_ratelimit_state;
+int ___ratelimit(struct ratelimit_state *rs, const char *func);
+#define __ratelimit(state) ___ratelimit(state, __func__)
+static inline void ratelimit_state_init(struct ratelimit_state *rs, int interval, int burst)
+{
+	rs->interval = interval;
+	rs->burst = burst;
+	rs->printed = 0;
+	rs->missed = 0;
+	rs->begin = 0;
+}
 static inline void ratelimit_state_reset_interval(struct ratelimit_state *rs, int interval_init)
 {
 	rs->interval = interval_init;

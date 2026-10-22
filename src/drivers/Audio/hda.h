@@ -269,6 +269,12 @@ typedef struct hda_path {
     uint8_t len;
 } hda_path;
 
+typedef struct hda_input {
+    uint8_t pin;
+    uint8_t adc;
+    struct hda_path path;
+} hda_input;
+
 typedef struct hda_output {
     uint8_t pin;
     uint8_t device;
@@ -335,6 +341,11 @@ typedef struct hda_codec_dev {
     uint8_t in_vol_index;
     struct hda_path in_path;
     uint8_t has_input;
+    struct hda_input in_main;
+    struct hda_input in_jack;
+    uint8_t has_in_jack;
+    int8_t in_jack_on;
+    uint16_t in_fmt_reg;
     struct hda_stream_hw hw[AUDIO_DIR_COUNT];
     uint64_t last_jack_ms;
     int8_t hp_present;

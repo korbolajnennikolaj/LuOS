@@ -1218,6 +1218,15 @@ static int core_set_default_device(int dev_idx) {
     return AUDIO_OK;
 }
 
+int audio_get_default_capture(void) {
+    int d = audio_default_capture;
+    if (d < 0 || !audio_get_device(d)) {
+        d = audio_pick_default(AUDIO_DIR_CAPTURE);
+        if (d >= 0) audio_default_capture = d;
+    }
+    return d;
+}
+
 static int core_get_default_device(void) {
     int d = audio_default_playback;
     if (d >= 0 && !audio_get_device(d)) {

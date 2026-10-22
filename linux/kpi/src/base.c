@@ -421,6 +421,33 @@ int _printk(const char *fmt, ...)
 	return r;
 }
 
+struct ratelimit_state printk_ratelimit_state =
+	RATELIMIT_STATE_INIT(printk_ratelimit_state, DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST);
+
+int ___ratelimit(struct ratelimit_state *rs, const char *func)
+{
+	int ret, missed = 0;
+	if (rs->interval <= 0) return 1;
+	if (__atomic_exchange_n(&rs->lock, 1, __ATOMIC_ACQUIRE)) return 0;
+	unsigned long now = jiffies;
+	if (!rs->begin || time_after_eq(now, rs->begin + rs->interval)) {
+		missed = rs->missed;
+		rs->begin = now;
+		rs->printed = 0;
+		rs->missed = 0;
+	}
+	if (rs->burst > rs->printed) {
+		rs->printed++;
+		ret = 1;
+	} else {
+		rs->missed++;
+		ret = 0;
+	}
+	__atomic_store_n(&rs->lock, 0, __ATOMIC_RELEASE);
+	if (missed) _printk(KERN_WARNING "%s: %d callbacks suppressed\n", func, missed);
+	return ret;
+}
+
 void dump_stack(void)
 {
 	void *ra = __builtin_return_address(0);

@@ -28,7 +28,7 @@ LINUX_EXPORTS = lkpi_init lkpi_status lkpi_gpu_reinit lkpi_gpu_restart lkpi_chrd
 	lkpi_zstd_workspace_size lkpi_zstd_decompress \
 	lkpi_gpu_enumerate lkpi_gpu_driver_list lkpi_gpu_bind_one lkpi_gpu_unbind_one \
 	lkpi_gpu_open_dev lkpi_gpu_close_dev lkpi_gpu_ioctl lkpi_gpu_drm_version lkpi_console_hold_connector lkpi_console_restore \
-	lkpi_gpu_gem_vmap lkpi_gpu_gem_vunmap lkpi_gpu_gem_share \
+	lkpi_gpu_gem_vmap lkpi_gpu_gem_vunmap lkpi_gpu_gem_share lkpi_gpu_take_master \
 	lkpi_backlight_count lkpi_backlight_get lkpi_backlight_set
 
 LINUX_CFLAGS = -std=gnu11 -O2 -m64 -funsigned-char -fno-strict-aliasing -fno-common -fno-delete-null-pointer-checks \

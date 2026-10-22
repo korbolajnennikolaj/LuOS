@@ -57,6 +57,8 @@ struct task {
 
     int err_no;
 
+    volatile int isr_depth;
+
     volatile uint8_t on_rq;
     volatile uint8_t on_cpu;
     uint8_t is_idle;

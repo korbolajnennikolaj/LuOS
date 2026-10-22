@@ -253,8 +253,34 @@ static void vkz_destroy(struct vks *v, uint64_t dev, struct vkzc *z) {
     memset(z, 0, sizeof(*z));
 }
 
-static int vkz_export(struct vks *v, const struct mesa_card_ctx *mc, uint64_t dev, uint64_t mem, uint64_t *getfd,
-                      uint32_t *gem) {
+static int vkz_open_node(int dev_idx) {
+    const struct gpu_device *pd = gpu_get_device(dev_idx);
+    char node[24] = "";
+    if (pd && pd->render[0])
+        snprintf(node, sizeof(node), "/dev/dri/%s", pd->render);
+    else if (pd && pd->card[0])
+        snprintf(node, sizeof(node), "/dev/dri/%s", pd->card);
+    if (!node[0]) return -1;
+    struct mesa_dc *d = mesa_dc_new();
+    if (!d) return -1;
+    uint32_t path_off = mesa_dc_in(d, node, (uint32_t)strlen(node) + 1);
+    mesa_dc_call(d, "open", 2, (uint64_t[]){path_off, 0x80002}, 1u << 0, 0);
+    uint64_t rets[1] = {(uint64_t)-1};
+    int r = mesa_dc_run(d, rets, 1, NULL, 0, VKZ_TIMEOUT_MS);
+    mesa_dc_free(d);
+    return r || (int64_t)rets[0] < 0 ? -1 : (int)rets[0];
+}
+
+static void vkz_close_node(int fd) {
+    if (fd < 0) return;
+    struct mesa_dc *d = mesa_dc_new();
+    if (!d) return;
+    mesa_dc_call(d, "close", 1, (uint64_t[]){(uint64_t)fd}, 0, 0);
+    mesa_dc_run(d, NULL, 0, NULL, 0, VKZ_TIMEOUT_MS);
+    mesa_dc_free(d);
+}
+
+static int vkz_export(struct vks *v, int drm_fd, uint64_t dev, uint64_t mem, uint64_t *getfd, uint32_t *gem) {
     uint64_t rets[2];
     struct mesa_dc *d;
     if (!*getfd) {
@@ -290,7 +316,7 @@ static int vkz_export(struct vks *v, const struct mesa_card_ctx *mc, uint64_t de
     d = mesa_dc_new();
     if (!d) return 1;
     uint32_t h_off = mesa_dc_out(d, 8);
-    mesa_dc_call(d, "drmPrimeFDToHandle", 3, (uint64_t[]){(uint64_t)mc->drm_fd, (uint64_t)fd_out[0], h_off},
+    mesa_dc_call(d, "drmPrimeFDToHandle", 3, (uint64_t[]){(uint64_t)drm_fd, (uint64_t)fd_out[0], h_off},
                  1u << 2, 0);
     mesa_dc_call(d, "close", 1, (uint64_t[]){(uint64_t)fd_out[0]}, 0, 0);
     uint32_t h_out[2] = {0, 0};
@@ -309,6 +335,11 @@ static int vkz_images(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, const struc
     struct vkp pk;
     uint64_t getfd = 0;
     void *host = NULL;
+    int node = vkz_open_node(mc->dev_idx);
+    if (node < 0) {
+        snprintf(v->err, sizeof(v->err), "private DRM node");
+        return 1;
+    }
     z->w = pt->fb_w;
     z->h = pt->fb_h;
     for (int i = 0; i < VKZ_BUFS; i++) {
@@ -406,26 +437,19 @@ static int vkz_images(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, const struc
         if (!z->view[i]) VKZ_FAIL("image view");
 
         uint32_t gem = 0;
-        if (vkz_export(v, mc, dev, z->mem[i], &getfd, &gem)) goto fail;
-        if (!host) host = mesa_host_drm_file(mc->drm_fd);
+        if (vkz_export(v, node, dev, z->mem[i], &getfd, &gem)) goto fail;
+        if (!host) host = mesa_host_drm_file(node);
         if (!host) VKZ_FAIL("renderer DRM file");
         z->slot[i] = gpu_present_zc_add(pt, host, gem, (uint32_t)lay.rowPitch);
-        struct mesa_dc *d = mesa_dc_new();
-        if (d) {
-            uint8_t gc[8] = {0};
-            memcpy(gc, &gem, 4);
-            uint32_t gc_off = mesa_dc_in(d, gc, sizeof(gc));
-            mesa_dc_call(d, "drmIoctl", 3, (uint64_t[]){(uint64_t)mc->drm_fd, 0x40086409u, gc_off}, 1u << 2, 0);
-            mesa_dc_run(d, NULL, 0, NULL, 0, VKZ_TIMEOUT_MS);
-            mesa_dc_free(d);
-        }
         if (z->slot[i] < 0) VKZ_FAIL("KMS framebuffer");
     }
     if (host) lkpi_file_put(host);
+    vkz_close_node(node);
     return 0;
 
 fail:
     if (host) lkpi_file_put(host);
+    vkz_close_node(node);
     return 1;
 }
 
@@ -525,13 +549,9 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
     if (v.cl < 0) return GPU_ERR_BUSY;
 
     gpu_present pt;
-    if (gpu_present_open(&pt, opts, opts->width, opts->height)) {
-        gpu_client_close(v.cl);
-        return GPU_ERR_NOT_STARTED;
-    }
-    pt.src_bgra = true;
+    memset(&pt, 0, sizeof(pt));
     struct mesa_card_ctx mc;
-    bool zc_try = !crc_out && pt.kms && mesa_card_context(&mc) && mc.dev_idx == pt.dev_idx;
+    bool zc_try = !crc_out && mesa_card_context(&mc) && (opts->dev_idx < 0 || opts->dev_idx == mc.dev_idx);
     struct vkzc z;
     memset(&z, 0, sizeof(z));
 
@@ -739,6 +759,16 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         if (vks_one(&v, GPU_CMD_MESA_TRACK_POKE, 3,
                     (uint64_t[]){0, 0, sizeof(verts)}, verts, sizeof(verts), 0))
             rc = 1;
+    }
+
+    if (!rc) {
+        if (gpu_present_open(&pt, opts, opts->width, opts->height)) {
+            vk_destroy(&v, &r);
+            gpu_client_close(v.cl);
+            return GPU_ERR_NOT_STARTED;
+        }
+        pt.src_bgra = true;
+        zc_try = zc_try && pt.kms && mc.dev_idx == pt.dev_idx;
     }
 
     uint32_t saved_w = pt.width, saved_h = pt.height;

@@ -237,9 +237,15 @@ static uint64_t pmm_alloc_run_locked(uint64_t count, uint64_t limit_frame) {
 static uint64_t pmm_alloc_aligned_locked(uint64_t count, uint64_t align, uint64_t limit_frame) {
     uint64_t end = pmm_total < limit_frame ? pmm_total : limit_frame;
     if (align == 0) align = 1;
+    if (count == 1 && align == 1 && end == pmm_total) return pmm_alloc_page_impl();
 
     uint64_t frame = align;
     while (frame + count <= end) {
+        if (pmm_bitmap[frame / BITS_PER_ENTRY] == 0xFFFFFFFFFFFFFFFFULL) {
+            frame = (frame / BITS_PER_ENTRY + 1) * BITS_PER_ENTRY;
+            frame = (frame + align - 1) / align * align;
+            continue;
+        }
         uint64_t run = 0;
         while (run < count && !_bitmap_test(frame + run)) run++;
         if (run == count) {

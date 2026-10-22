@@ -323,6 +323,7 @@ static void audio_shell_record(const char *arg) {
     struct audio_core_driver *core = audio_shell_core();
     if (!core) return;
     int idx = audio_shell_pick_device(devw);
+    if (idx < 0) idx = audio_get_default_capture();
     struct audio_device *d = audio_get_device(idx);
     if (!d || !d->has_direction[AUDIO_DIR_CAPTURE]) {
         printf_color(LIMINE_COLOR_LIGHT_RED, "audio%d cannot record.\n", idx);

@@ -5,6 +5,7 @@
 #include "../../../src/kernel/lkpi/lkpi.h"
 
 #include <drm/drm.h>
+#include <drm/drm_auth.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -282,6 +283,35 @@ long lkpi_gpu_gem_share(void *dst_handle, void *src_file, unsigned int src_gem, 
         ret = drm_gem_handle_create(pd, obj, dst_gem);
         drm_gem_object_put(obj);
         return ret;
+}
+
+long lkpi_gpu_take_master(void *handle)
+{
+        struct file *f = handle;
+        struct drm_file *priv, *it, *holder = NULL;
+        struct drm_device *dev;
+
+        if (!f || !f->private_data) return -EINVAL;
+        priv = f->private_data;
+        if (!priv->minor) return -ENODEV;
+        dev = priv->minor->dev;
+        mutex_lock(&dev->master_mutex);
+        if (!dev->master || drm_is_current_master(priv)) {
+                mutex_unlock(&dev->master_mutex);
+                return 0;
+        }
+        mutex_lock(&dev->filelist_mutex);
+        list_for_each_entry(it, &dev->filelist, lhead) {
+                if (it->is_master && it->master == dev->master) {
+                        holder = it;
+                        break;
+                }
+        }
+        mutex_unlock(&dev->filelist_mutex);
+        if (holder && dev->driver->master_drop) dev->driver->master_drop(dev, holder);
+        drm_master_put(&dev->master);
+        mutex_unlock(&dev->master_mutex);
+        return 1;
 }
 
 long lkpi_gpu_gem_vunmap(void *map_token)

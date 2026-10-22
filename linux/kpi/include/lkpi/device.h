@@ -538,11 +538,15 @@ __printf(3, 4) void _dev_printk(const char *level, const struct device *dev, con
 #define dev_info_once(dev, fmt, ...) dev_info(dev, fmt, ##__VA_ARGS__)
 #define dev_notice_once(dev, fmt, ...) dev_notice(dev, fmt, ##__VA_ARGS__)
 #define dev_dbg_once(dev, fmt, ...) dev_dbg(dev, fmt, ##__VA_ARGS__)
-#define dev_err_ratelimited dev_err
-#define dev_warn_ratelimited dev_warn
-#define dev_info_ratelimited dev_info
+#define dev_level_ratelimited(dev_level, dev, fmt, ...) do { \
+	static DEFINE_RATELIMIT_STATE(__rs_dev, DEFAULT_RATELIMIT_INTERVAL, DEFAULT_RATELIMIT_BURST); \
+	if (__ratelimit(&__rs_dev)) dev_level(dev, fmt, ##__VA_ARGS__); \
+} while (0)
+#define dev_err_ratelimited(dev, fmt, ...) dev_level_ratelimited(dev_err, dev, fmt, ##__VA_ARGS__)
+#define dev_warn_ratelimited(dev, fmt, ...) dev_level_ratelimited(dev_warn, dev, fmt, ##__VA_ARGS__)
+#define dev_info_ratelimited(dev, fmt, ...) dev_level_ratelimited(dev_info, dev, fmt, ##__VA_ARGS__)
 #define dev_dbg_ratelimited dev_dbg
-#define dev_notice_ratelimited dev_notice
+#define dev_notice_ratelimited(dev, fmt, ...) dev_level_ratelimited(dev_notice, dev, fmt, ##__VA_ARGS__)
 #define dev_WARN(dev, format, arg...) WARN(1, "%s: " format, dev_name(dev), ##arg)
 #define dev_WARN_ONCE(dev, condition, format, arg...) WARN_ONCE(condition, "%s: " format, dev_name(dev), ##arg)
 __printf(3, 4) int dev_err_probe(const struct device *dev, int err, const char *fmt, ...);

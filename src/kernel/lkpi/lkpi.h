@@ -62,6 +62,7 @@ long lkpi_gpu_gem_vmap(void *handle, unsigned int gem_handle, void **map_token,
 long lkpi_gpu_gem_vunmap(void *map_token);
 void lkpi_file_put(void *lx);
 long lkpi_gpu_gem_share(void *dst_handle, void *src_file, unsigned int src_gem, unsigned int *dst_gem);
+long lkpi_gpu_take_master(void *handle);
 
 int lkpi_backlight_count(void);
 int lkpi_backlight_get(int idx, char *name, int name_cap, unsigned int *cur, unsigned int *max);

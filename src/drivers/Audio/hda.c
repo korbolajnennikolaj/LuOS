@@ -596,12 +596,28 @@ static void hda_build_outputs(struct hda_codec_dev *cd) {
 
 static int hda_input_rank(const struct hda_widget *w) {
     uint8_t dev = (uint8_t)HDA_CFG_DEVICE(w->config);
-    uint8_t conn = (uint8_t)HDA_CFG_CONN(w->config);
-    if (dev == HDA_DEV_MIC_IN && conn == AUDIO_HDA_PIN_CONN_JACK) return 0;
-    if (dev == HDA_DEV_MIC_IN) return 1;
+    bool jack = HDA_CFG_CONN(w->config) == AUDIO_HDA_PIN_CONN_JACK;
+    if (dev == HDA_DEV_MIC_IN) return jack ? 1 : 0;
     if (dev == HDA_DEV_LINE_IN) return 2;
     if (dev == HDA_DEV_AUX) return 3;
     return 9;
+}
+
+static bool hda_input_switchable(const struct hda_widget *w) {
+    return HDA_CFG_DEVICE(w->config) == HDA_DEV_MIC_IN && HDA_CFG_CONN(w->config) == AUDIO_HDA_PIN_CONN_JACK &&
+           (w->pincap & HDA_PINCAP_PRES_DETECT) && !(HDA_CFG_MISC(w->config) & 0x1);
+}
+
+static bool hda_input_route(struct hda_codec_dev *cd, const struct hda_widget *pin, struct hda_input *out) {
+    for (uint8_t i = 0; i < cd->widget_count; i++) {
+        struct hda_widget *adc = &cd->widgets[i];
+        if (adc->type != HDA_WIDGET_AUDIO_IN || (adc->caps & HDA_WCAP_DIGITAL)) continue;
+        if (!hda_find_path(cd, adc->nid, HDA_TARGET_NID, pin->nid, false, &out->path)) continue;
+        out->pin = pin->nid;
+        out->adc = adc->nid;
+        return true;
+    }
+    return false;
 }
 
 static void hda_build_input(struct hda_codec_dev *cd) {
@@ -615,7 +631,7 @@ static void hda_build_input(struct hda_codec_dev *cd) {
         if (w->type != HDA_WIDGET_PIN || !(w->pincap & HDA_PINCAP_IN)) continue;
         if (w->used & 1) continue;
         if (HDA_CFG_CONN(w->config) == AUDIO_HDA_PIN_CONN_NONE) continue;
-        if (hda_input_rank(w) >= 9 || (w->caps & HDA_WCAP_DIGITAL)) continue;
+        if (hda_input_rank(w) >= 9) continue;
         best[n++] = w;
     }
     for (int i = 1; i < n; i++) {
@@ -628,20 +644,24 @@ static void hda_build_input(struct hda_codec_dev *cd) {
         best[j + 1] = k;
     }
 
-    for (int p = 0; p < n; p++) {
-        for (uint8_t i = 0; i < cd->widget_count; i++) {
-            struct hda_widget *adc = &cd->widgets[i];
-            if (adc->type != HDA_WIDGET_AUDIO_IN || (adc->caps & HDA_WCAP_DIGITAL)) continue;
-            struct hda_path path;
-            if (!hda_find_path(cd, adc->nid, HDA_TARGET_NID, best[p]->nid, false, &path)) continue;
-            hda_claim_path(cd, &path, 2);
-            cd->in_path = path;
-            cd->in_pin = best[p]->nid;
-            cd->adc = adc->nid;
-            cd->has_input = 1;
-            return;
-        }
+    int main_idx = -1;
+    for (int p = 0; p < n && main_idx < 0; p++)
+        if (hda_input_route(cd, best[p], &cd->in_main)) main_idx = p;
+    if (main_idx < 0) return;
+
+    cd->has_in_jack = 0;
+    cd->in_jack_on = -1;
+    if (hda_input_rank(best[main_idx]) == 0) {
+        for (int p = 0; p < n && !cd->has_in_jack; p++)
+            if (p != main_idx && hda_input_switchable(best[p]) && hda_input_route(cd, best[p], &cd->in_jack))
+                cd->has_in_jack = 1;
     }
+    hda_claim_path(cd, &cd->in_main.path, 2);
+    if (cd->has_in_jack) hda_claim_path(cd, &cd->in_jack.path, 2);
+    cd->in_path = cd->in_main.path;
+    cd->in_pin = cd->in_main.pin;
+    cd->adc = cd->in_main.adc;
+    cd->has_input = 1;
 }
 
 static void hda_apply_gpio(struct hda_codec_dev *cd) {
@@ -859,6 +879,7 @@ static void hda_codec_stream_setup(struct hda_codec_dev *cd, uint8_t direction, 
             if (w && (w->caps & HDA_WCAP_DIGITAL)) hda_verb(cd, dac, HDA_VERB_SET_DIGI_CONV_1, 0x01);
         }
     } else if (cd->has_input) {
+        cd->in_fmt_reg = fmt_reg;
         hda_power_up(cd, cd->adc);
         hda_verb(cd, cd->adc, HDA_VERB_SET_CONV_FMT, fmt_reg);
         hda_verb(cd, cd->adc, HDA_VERB_SET_CONV_STREAM, (uint16_t)((tag & 0xF) << 4));
@@ -873,11 +894,14 @@ static void hda_codec_stream_release(struct hda_codec_dev *cd, uint8_t direction
     }
 }
 
+static void hda_select_input(struct hda_codec_dev *cd);
+
 static int hda_dev_open(struct audio_device *adev, uint8_t direction, const struct audio_format *fmt) {
     struct hda_codec_dev *cd = (struct hda_codec_dev *)adev->priv;
     if (direction >= AUDIO_DIR_COUNT || !fmt) return AUDIO_ERR_PARAM;
     if (direction == AUDIO_DIR_PLAYBACK && cd->dac_count == 0) return AUDIO_ERR_UNSUPPORTED;
     if (direction == AUDIO_DIR_CAPTURE && !cd->has_input) return AUDIO_ERR_UNSUPPORTED;
+    if (direction == AUDIO_DIR_CAPTURE) hda_select_input(cd);
 
     struct hda_stream_hw *hw = &cd->hw[direction];
     if (hw->sd < 0) return AUDIO_ERR_BUSY;
@@ -1071,6 +1095,31 @@ static bool hda_jack_present(struct hda_codec_dev *cd, uint8_t nid) {
     return present;
 }
 
+static void hda_select_input(struct hda_codec_dev *cd) {
+    if (!cd->has_input || !cd->has_in_jack) return;
+    bool jack = hda_jack_present(cd, cd->in_jack.pin);
+    if ((int8_t)jack == cd->in_jack_on) return;
+    bool first = cd->in_jack_on < 0;
+    cd->in_jack_on = (int8_t)jack;
+    const struct hda_input *r = jack ? &cd->in_jack : &cd->in_main;
+    uint8_t old_adc = cd->adc;
+    cd->in_pin = r->pin;
+    cd->adc = r->adc;
+    cd->in_path = r->path;
+    hda_configure_input(cd);
+    struct hda_stream_hw *hw = &cd->hw[AUDIO_DIR_CAPTURE];
+    if ((hw->prepared || hw->running) && old_adc != cd->adc) {
+        hda_verb(cd, old_adc, HDA_VERB_SET_CONV_STREAM, 0);
+        hda_power_up(cd, cd->adc);
+        hda_verb(cd, cd->adc, HDA_VERB_SET_CONV_FMT, cd->in_fmt_reg);
+        hda_verb(cd, cd->adc, HDA_VERB_SET_CONV_STREAM, (uint16_t)((hw->tag & 0xF) << 4));
+    }
+    if (!first && cd->in_vol_nid)
+        hda_dev_set_volume(&cd->adev, AUDIO_DIR_CAPTURE, cd->adev.streams[AUDIO_DIR_CAPTURE].volume);
+    LOG_INFO("%s: capture from the %s (pin 0x%02x)", cd->adev.name, jack ? "jack microphone" : "internal microphone",
+             (unsigned)cd->in_pin);
+}
+
 static void hda_automute(struct hda_codec_dev *cd) {
     uint64_t flags = cd->quirks.flags;
     if (cd->all_outputs) return;
@@ -1146,6 +1195,7 @@ static void hda_dev_poll(struct audio_device *adev) {
     if (now - cd->last_jack_ms >= HDA_JACK_POLL_MS) {
         cd->last_jack_ms = now;
         hda_automute(cd);
+        hda_select_input(cd);
     }
 }
 
@@ -1231,6 +1281,11 @@ static void hda_dev_describe(struct audio_device *adev, void (*out)(const char *
         snprintf(line, sizeof(line), "in: pin 0x%02x adc 0x%02x path %s vol 0x%02x", (unsigned)cd->in_pin,
                  (unsigned)cd->adc, tmp, (unsigned)cd->in_vol_nid);
         out(line);
+        if (cd->has_in_jack) {
+            snprintf(line, sizeof(line), "mic switch: internal pin 0x%02x / jack pin 0x%02x, jack %s",
+                     (unsigned)cd->in_main.pin, (unsigned)cd->in_jack.pin, cd->in_jack_on > 0 ? "in use" : "empty");
+            out(line);
+        }
     }
     for (int d = 0; d < AUDIO_DIR_COUNT; d++) {
         struct hda_stream_hw *hw = &cd->hw[d];
@@ -1336,7 +1391,7 @@ static void hda_codec_attach(struct hda_controller *c, uint8_t cad, uint8_t afg,
         .subsys = c->subsys,
         .codec_id = vendor_id,
         .codec_subsys = cd->subsystem,
-        .revision = (uint8_t)(revision >> 8),
+        .revision = (uint16_t)(revision & 0xFFFF),
         .has_revision = 1,
     };
     audio_quirk_resolve(AUDIO_QUIRK_HDA_CODEC, &ids, 0, &cd->quirks);
@@ -1400,7 +1455,10 @@ static void hda_codec_attach(struct hda_controller *c, uint8_t cad, uint8_t afg,
         for (uint8_t i = 0; i < cd->widget_count; i++)
             if (cd->widgets[i].type == HDA_WIDGET_PIN) hda_set_eapd(cd, &cd->widgets[i], true);
     }
-    if (cd->has_input) hda_configure_input(cd);
+    if (cd->has_input) {
+        hda_configure_input(cd);
+        hda_select_input(cd);
+    }
 
     hda_quirk_ctx_init(cd, &ctx, AUDIO_QUIRK_STAGE_CONFIGURED);
     audio_quirk_run_hooks(&cd->quirks, &ctx);

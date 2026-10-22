@@ -562,6 +562,10 @@ static long kms_ioctl(int dev_idx, uint32_t cmd, void *karg, uint32_t size) {
 }
 
 static int kms_set_master(int dev_idx) {
+    int r = (int)kms_ioctl(dev_idx, GPU_DRM_IO(0x1e), NULL, 0);
+    gpu_devctx *ctx = gpu_dev_ctx(dev_idx);
+    if (r != -16 || !ctx || !ctx->lx_card || lkpi_gpu_take_master(ctx->lx_card) <= 0) return r;
+    LOG_INFO("gpu core: DRM master taken back from another client on %s", gpu_devices[dev_idx].card);
     return (int)kms_ioctl(dev_idx, GPU_DRM_IO(0x1e), NULL, 0);
 }
 
