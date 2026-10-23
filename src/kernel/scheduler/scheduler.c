@@ -17,6 +17,7 @@
 
 #include <msr.h>
 
+#include <stdio.h>
 #include <string.h>
 #include <stddef.h>
 
@@ -25,6 +26,7 @@
 #define SCHED_AGING_MS 25
 #define SCHED_BALANCE_MS 20
 #define SCHED_STACK_MAGIC 0x4C754F5353544B21ull
+#define SCHED_STACK_FILL 0x5A
 
 enum sched_reason {
     SCHED_REASON_EXPIRED = 0,
@@ -52,6 +54,12 @@ struct rq {
     uint64_t idle_ticks;
     uint64_t steals;
     uint64_t switches;
+
+    struct task *volatile tick_task;
+    volatile uint64_t tick_rip;
+    volatile uint64_t tick_rsp;
+    volatile uint64_t tick_rflags;
+    volatile int tick_queued;
 } __attribute__((aligned(64)));
 
 static struct rq g_rq[MAX_CORES];
@@ -325,6 +333,7 @@ static struct task *task_alloc(const char *name, int priority, uint32_t stack_si
         t->kstack = kmalloc(stack_size);
         if (!t->kstack) { kfree(t); return NULL; }
         t->stack_size = stack_size;
+        memset(t->kstack, SCHED_STACK_FILL, stack_size);
         task_init_context(t);
     } else {
         t->fx = (uint8_t *)(((uintptr_t)t->fx_raw + 63) & ~(uintptr_t)63);
@@ -786,6 +795,11 @@ void scheduler_tick(struct registers *regs) {
     }
     uint64_t now = g_ticks;
     rq->local_ticks++;
+    rq->tick_task = rq->current;
+    rq->tick_rip = regs->rip;
+    rq->tick_rsp = regs->rsp;
+    rq->tick_rflags = regs->rflags;
+    rq->tick_queued = rq->nr_queued;
 
     wake_expired_sleepers(now);
 
@@ -950,6 +964,82 @@ void scheduler_for_each_task(void (*fn)(struct task *, void *), void *ctx) {
     uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
     for (int i = 0; i < g_task_count; i++) fn(g_tasks[i], ctx);
     spin_unlock_irqrestore(&g_tasks_lock, flags);
+}
+
+extern char __text_start[], __text_end[];
+
+void scheduler_dump_stacks(const char *const *prefixes) {
+    struct task *list[64];
+    int n = 0;
+
+    uint64_t flags = spin_lock_irqsave(&g_tasks_lock);
+    for (int i = 0; i < g_task_count && n < 64; i++) {
+        struct task *t = g_tasks[i];
+        if (t == current_task() || t->state == TASK_ZOMBIE || !t->kstack) continue;
+        for (const char *const *p = prefixes; *p; p++)
+            if (strncmp(t->name, *p, strlen(*p)) == 0) {
+                list[n++] = t;
+                break;
+            }
+    }
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
+
+    uint64_t lo = (uint64_t)__text_start, hi = (uint64_t)__text_end;
+    for (int i = 0; i < n; i++) {
+        struct task *t = list[i];
+        uint64_t top = (uint64_t)t->kstack + t->stack_size;
+        uint64_t rsp = t->regs.rsp;
+        uint64_t untouched = 8;
+        while (untouched < t->stack_size && ((volatile uint8_t *)t->kstack)[untouched] == SCHED_STACK_FILL) untouched++;
+        LOG_WARNING("stack dump '%s' tid %u state %d core %d: rip 0x%llx rsp 0x%llx, stack %llx-%llx, max used %llu of %u",
+                    t->name, t->tid, (int)t->state, t->core, (unsigned long long)t->regs.rip,
+                    (unsigned long long)rsp, (unsigned long long)(uint64_t)t->kstack, (unsigned long long)top,
+                    (unsigned long long)(t->stack_size - untouched), t->stack_size);
+        if (rsp < (uint64_t)t->kstack || rsp >= top) continue;
+        char line[200];
+        int len = 0, shown = 0;
+        for (uint64_t a = rsp & ~7ULL; a < top && shown < 64; a += 8) {
+            uint64_t v = *(volatile uint64_t *)a;
+            if (v < lo || v >= hi) continue;
+            len += snprintf(line + len, sizeof(line) - len, " %llx", (unsigned long long)v);
+            shown++;
+            if (len > 150) {
+                LOG_WARNING("  %s:%s", t->name, line);
+                len = 0;
+            }
+        }
+        if (len) LOG_WARNING("  %s:%s", t->name, line);
+    }
+
+    for (int i = 0; i < n; i++) {
+        struct task *t = list[i];
+        if (t->state != TASK_RUNNING) continue;
+        uint64_t top = (uint64_t)t->kstack + t->stack_size;
+        for (int s = 0; s < 16; s++) {
+            scheduler_sleep_ms(37);
+            uint64_t rip = t->regs.rip, rsp = t->regs.rsp;
+            struct rq *trq = &g_rq[t->core];
+            int live = trq->tick_task == t;
+            if (live) {
+                rip = trq->tick_rip;
+                rsp = trq->tick_rsp;
+            }
+            char line[260];
+            int len = snprintf(line, sizeof(line), "%s IF=%d preempt=%d queued=%d rip %llx |",
+                               live ? "live" : "saved", live ? (int)((trq->tick_rflags >> 9) & 1) : -1,
+                               t->preempt_count, trq->tick_queued, (unsigned long long)rip);
+            int shown = 0;
+            if (rsp >= (uint64_t)t->kstack && rsp < top)
+                for (uint64_t a = rsp & ~7ULL; a < top && shown < 8; a += 8) {
+                    uint64_t v = *(volatile uint64_t *)a;
+                    if (v < lo || v >= hi) continue;
+                    len += snprintf(line + len, sizeof(line) - len, " +%llx:%llx", (unsigned long long)(a - rsp),
+                                    (unsigned long long)v);
+                    shown++;
+                }
+            LOG_WARNING("sample %d '%s': %s", s, t->name, line);
+        }
+    }
 }
 
 int scheduler_wake_matching(int (*pred)(struct task *, void *), void *ctx) {

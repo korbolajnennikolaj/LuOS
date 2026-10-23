@@ -29,6 +29,7 @@
 #define MESA_PIX_CHUNK (28 * 1024)
 #define MESA_PIX_CAP (32 * 1024 * 1024)
 #define MESA_TRACKS 8
+#define MESA_FIX_HEAP 64
 
 /* Unsigned on purpose: with a plain int, (2 << 30) overflows to a negative value that
  * ioctl()'s unsigned long parameter sign-extends to 0xffffffff8xxxxxxx, and every _IOR
@@ -144,8 +145,8 @@ struct gpu_api_info {
     int drm_version[3];
 };
 
-static uint8_t frame_buf[64 * 1024];
-static uint8_t done_buf[64 * 1024];
+static uint8_t frame_buf[64 * 1024] __attribute__((aligned(16)));
+static uint8_t done_buf[64 * 1024] __attribute__((aligned(16)));
 static uint8_t *pix_stage;
 static void *track_tab[MESA_TRACKS];
 
@@ -217,6 +218,8 @@ static fn_t tramp_build(void *fn, const uint64_t *args, int argc, uint32_t fmask
                 movq[4] = (uint8_t)(0xC0 | (fp << 3));
                 p = tramp_emit(p, movq, 5);
                 fp++;
+            } else {
+                stackv[nstack++] = cls == MESA_ACLS_FLT ? (uint64_t)(uint32_t)args[i] : args[i];
             }
         }
     }
@@ -437,8 +440,9 @@ int main(void) {
                 continue;
             }
 
+            uint32_t ret_mask = (c->rsv & 0x80000000u) ? 0 : c->rsv;
             for (int i = 0; i < c->argc; i++) {
-                if ((c->rsv >> i) & 1u) {
+                if ((ret_mask >> i) & 1u) {
                     uint32_t src = (uint32_t)argv[i];
                     if (src < retcount) argv[i] = rets[src];
                 }
@@ -449,7 +453,7 @@ int main(void) {
                 }
             }
 
-            void *fxheap[16];
+            void *fxheap[MESA_FIX_HEAP];
             uint32_t fxheapn = 0;
             for (uint16_t f = 0; f < c->nfix; f++) {
                 struct mesa_fixup *fx = &fix[fixbase + f];
@@ -459,9 +463,13 @@ int main(void) {
                 if (fx->target >> 31) {
                     uint32_t count = fx->target & 0x7FFFFFFFu;
                     if (count > 4096) count = 4096;
+                    if (fxheapn >= MESA_FIX_HEAP) {
+                        fail = 1;
+                        continue;
+                    }
                     uint64_t *arr = malloc((size_t)count * 8 + 8);
                     if (!arr) continue;
-                    if (fxheapn < 16) fxheap[fxheapn++] = arr;
+                    fxheap[fxheapn++] = arr;
                     for (uint32_t k = 0; k < count; k++) {
                         uint32_t off32;
                         memcpy(&off32, blob + fx->where + 4 * k, 4);
@@ -546,11 +554,11 @@ int main(void) {
                             outn, o->off, o->len, (unsigned long long)v8);
                 }
                 if ((size_t)o->len > outcap - outpos) {
-                    dprintf(2, "mesa-trace out overflow (%u + %u > %zu) - result truncated\n",
+                    dprintf(2, "mesa-trace out overflow (%u + %u > %zu) - remaining results dropped\n",
                             (unsigned)outpos, o->len, outcap);
                     fail = 1;
-                    outn++;
-                    continue;
+                    outn = 192;
+                    break;
                 }
                 memcpy(outbuf + outpos, src, o->len);
                 outpos += o->len;

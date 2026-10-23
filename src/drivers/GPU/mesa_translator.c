@@ -31,6 +31,9 @@ struct gpu_ring_slot *gpu_slot_by_seq(int dev_idx, uint32_t seq);
 #define MESA_BLOB_MAX (52 * 1024)
 #define MESA_FIX_MAX 512
 #define MESA_OUT_MAX 192
+#define MESA_OUT_AREA_MAX 4096
+#define MESA_FMASK_ARGS 16
+#define MESA_BLOB_ALIGN 16
 
 struct mesa_outslot {
     uint16_t cmd_index;
@@ -250,7 +253,7 @@ static bool mesa_compile_gl(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
         b->slots[cmd_index].result_off = 0;
         return true;
     }
-    if (!sig->name) return false;
+    if (!sig->name || sig->argc > MESA_FMASK_ARGS) return false;
 
     uint32_t n_extra = sig->argc > 6 ? (uint32_t)sig->argc - 6 : 0;
     uint32_t data_off = 8 * n_extra;
@@ -286,7 +289,7 @@ static bool mesa_compile_gl(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
             if (val == 0xFFFF || val == 0xFFFE) {
                 c->args[i] = val;
             } else {
-                if (i != sig->out_arg && i != sig->out2_arg && payload_len <= data_off)
+                if (i != sig->out_arg && i != sig->out2_arg && val >= payload_len - data_off)
                     return false;
                 if (val > 0xFFFD) return false;
                 c->args[i] = blob_payload + (uint32_t)val;
@@ -315,7 +318,11 @@ static bool mesa_compile_gl(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
             } else {
                 out_len = result_cap > GPU_RESULT_HDR ? result_cap - GPU_RESULT_HDR : 4;
             }
-            if (out_len > 4096) out_len = 4096;
+            if (out_len > MESA_OUT_AREA_MAX) {
+                LOG_WARNING("mesa: %s wants a %u-byte result, the frame carries at most %u", sig->name, out_len,
+                            MESA_OUT_AREA_MAX);
+                return false;
+            }
             mb_align(b, 8);
             uint32_t area = mb_put(b, NULL, out_len);
             c->args[sig->out_arg] = area;
@@ -370,6 +377,7 @@ static bool mesa_vk_walk(struct mesa_build *b, const uint8_t *payload, uint32_t 
                          uint32_t nmap, uint32_t base, uint32_t struct_off, uint16_t id,
                          int depth) {
     if (depth > MESA_VK_DEPTH || id == 0 || id >= VK_S_COUNT) return true;
+    uint32_t data_len = payload_len > 8 + nmap * 8 ? payload_len - (8 + nmap * 8) : 0;
     const struct mesa_vk_struct *st = &mesa_vk_structs[id];
     for (uint16_t i = 0; i < st->nfld; i++) {
         const struct mesa_vk_fld *f = &st->flds[i];
@@ -385,6 +393,7 @@ static bool mesa_vk_walk(struct mesa_build *b, const uint8_t *payload, uint32_t 
         uint64_t val = 0;
         memcpy(&val, b->blob + src, 8);
         if (!val || val > 0xFFFF) continue;
+        if (val >= data_len) return false;
         mb_fix(b, base + struct_off + f->off, base + (uint32_t)val, MESA_FIX_BLOB);
         int sub = mesa_vk_map_find(payload, payload_len, nmap, 0, (uint32_t)val);
         if (sub == VKP_STRV) {
@@ -416,7 +425,7 @@ static bool mesa_vk_walk(struct mesa_build *b, const uint8_t *payload, uint32_t 
 static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_rec *rec,
                             const uint8_t *payload, uint32_t payload_len, uint16_t result_cap) {
     const struct mesa_vk_sig *sig = &mesa_vk_sigs[rec->opcode - GPU_CMD_VK_FIRST];
-    if (!sig->argc) return false;
+    if (!sig->argc || sig->argc > MESA_FMASK_ARGS) return false;
 
 
     uint32_t nmap = 0;
@@ -449,8 +458,10 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
     os->result_off = rec->result_off;
     os->has_ret = sig->has_ret;
     os->nout = 0;
+    int count_area_arg = -1;
+    uint32_t count_area = 0;
 
-    for (int i = 0; i < sig->argc && i < 10; i++) {
+    for (int i = 0; i < sig->argc && i < (int)(sizeof(sig->a) / sizeof(sig->a[0])); i++) {
         const struct mesa_vk_arg *a = &sig->a[i];
         uint64_t val = 0;
         if (i >= (int)rec->argc) {
@@ -459,12 +470,8 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
                    bk == M_VA_POUT_HANDLE || bk == M_VA_PSCALAR_OUT)
                       ? 0
                       : 0xFFFE;
-        } else if (i < 6) {
-            val = rec->args[i];
         } else {
-            uint32_t head_off = 8 * (uint32_t)(i - 6);
-            if (head_off + 8 > payload_len) return false;
-            memcpy(&val, payload + head_off, 8);
+            val = rec->args[i];
         }
         uint8_t base_kind = a->kind & 0xF;
         if (base_kind == M_VA_SCALAR) {
@@ -480,7 +487,7 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
                 c->fmask |= MESA_ACLS_PTR << (2 * i);
             } else {
             if (val > 0xFFFF) return false;
-            if (payload_len <= data_off) return false;
+            if (val >= payload_len - data_off || payload_len <= data_off) return false;
             c->args[i] = vk_data_base + (uint32_t)val;
             c->fmask |= MESA_ACLS_PTR << (2 * i);
             }
@@ -492,15 +499,32 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
                 continue;
             }
             uint32_t out_len = 8;
+            uint32_t elem = 0;
             if (base_kind == M_VA_POUT_STRUCT && a->strct)
-                out_len = mesa_vk_structs[a->strct].size;
+                out_len = elem = mesa_vk_structs[a->strct].size;
             else if (base_kind == M_VA_POUT_HANDLE && a->count_arg != MESA_SIG_NONE) {
-                uint64_t cnt = a->count_arg < 6 ? rec->args[a->count_arg] : 1;
+                uint64_t cnt = a->count_arg < rec->argc ? rec->args[a->count_arg] : 1;
                 out_len = (uint32_t)(cnt ? cnt : 1) * 8;
+            } else if (base_kind == M_VA_POUT_HANDLE) {
+                elem = 8;
             } else if (base_kind == M_VA_PSCALAR_OUT) {
                 out_len = 4;
             }
-            if (out_len > 4096) out_len = 4096;
+            if (elem && a->count_arg == MESA_SIG_NONE && count_area_arg == i - 1) {
+                uint32_t n = 0;
+                memcpy(&n, b->blob + count_area, 4);
+                uint32_t fit = MESA_OUT_AREA_MAX / elem;
+                if (n > fit) {
+                    n = fit;
+                    memcpy(b->blob + count_area, &n, 4);
+                }
+                out_len = elem * (n ? n : 1);
+            }
+            if (out_len > MESA_OUT_AREA_MAX) {
+                LOG_WARNING("mesa: %s wants a %u-byte result, the frame carries at most %u", fn, out_len,
+                            MESA_OUT_AREA_MAX);
+                return false;
+            }
             mb_align(b, 8);
             uint32_t area = mb_put(b, NULL, out_len);
             if (val != 0xFFFF && val != 0xFFFE && payload_len > data_off + (uint32_t)val) {
@@ -510,6 +534,10 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
             }
             c->args[i] = area;
             c->fmask |= MESA_ACLS_PTR << (2 * i);
+            if (base_kind == M_VA_PSCALAR_OUT) {
+                count_area_arg = i;
+                count_area = area;
+            }
             uint16_t track = 0xFFFF;
             if (rec->opcode == GPU_CMD_VK_MAP_MEMORY && i == 5) track = 0;
             uint16_t at = mb_out(b, area, out_len, track);
@@ -527,7 +555,7 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
                 return false;
         } else if (base_kind == M_VA_PSTRUCT_ARR && a->strct) {
             uint32_t count = 1;
-            if (a->count_arg != MESA_SIG_NONE && a->count_arg < 6)
+            if (a->count_arg != MESA_SIG_NONE && a->count_arg < rec->argc)
                 count = (uint32_t)rec->args[a->count_arg];
             if (count > 64) count = 64;
             uint32_t step = mesa_vk_structs[a->strct].size;
@@ -547,9 +575,10 @@ static bool mesa_compile_vk(struct mesa_build *b, uint16_t cmd_index, gpu_cmd_re
 static uint32_t mesa_finalize(struct mesa_build *b, uint32_t seq, struct mesa_frame *f,
                               uint32_t slot_seq, int dev_idx, uint32_t api,
                               uint32_t first_cmd, uint32_t cmd_count) {
-    uint32_t len = sizeof(struct mesa_frame_hdr) + (uint32_t)b->calls_n * sizeof(struct mesa_call) +
-                   (uint32_t)b->fix_n * sizeof(struct mesa_fixup) + (uint32_t)b->out_n * sizeof(struct mesa_out) +
-                   b->blob_len;
+    uint32_t blob_at = sizeof(struct mesa_frame_hdr) + (uint32_t)b->calls_n * sizeof(struct mesa_call) +
+                       (uint32_t)b->fix_n * sizeof(struct mesa_fixup) + (uint32_t)b->out_n * sizeof(struct mesa_out);
+    blob_at = (blob_at + MESA_BLOB_ALIGN - 1) & ~(uint32_t)(MESA_BLOB_ALIGN - 1);
+    uint32_t len = blob_at + b->blob_len;
     if (len > MESA_FRAME_MAX || b->overflow) return 0;
     uint8_t *buf = f->data;
     struct mesa_frame_hdr *hdr = (struct mesa_frame_hdr *)buf;
@@ -566,7 +595,8 @@ static uint32_t mesa_finalize(struct mesa_build *b, uint32_t seq, struct mesa_fr
     hdr->out_off = (uint16_t)off;
     memcpy(buf + off, b->outs, (size_t)b->out_n * sizeof(struct mesa_out));
     off += (uint32_t)b->out_n * sizeof(struct mesa_out);
-    mb_align(b, 8);
+    memset(buf + off, 0, blob_at - off);
+    off = blob_at;
     hdr->blob_off = off;
     if (b->blob_len) memcpy(buf + off, b->blob, b->blob_len);
     hdr->frame_len = len;
@@ -668,6 +698,10 @@ static bool mesa_compile_slot(struct gpu_ring_slot *slot, int dev_idx) {
                 }
                 mesa_frame_free(f);
             }
+        }
+        if (!made) {
+            LOG_WARNING("mesa: batch %u not sent (%s)", slot->seq, alloc ? "frame too large" : "all frames busy");
+            gpu_slot_publish(dev_idx, slot->seq, alloc ? GPU_ERR_OVERFLOW : GPU_ERR_BUSY);
         }
     }
     kfree(b->slots);
@@ -1215,7 +1249,8 @@ int mesa_frame_complete(int dev_idx, uint32_t slot_seq, uint32_t seq, const uint
     if (len < sizeof(struct mesa_done_hdr)) return GPU_ERR_PARAM;
     struct mesa_done_hdr h;
     memcpy(&h, data, sizeof(h));
-    if (h.bytes > 56 * 1024) return GPU_ERR_PARAM;
+    if (h.bytes > 56 * 1024 || h.rets > MESA_MAX_CALLS) return GPU_ERR_PARAM;
+    if (sizeof(h) + (uint64_t)h.rets * 8 > len) return GPU_ERR_PARAM;
 
     uint64_t flags = spin_lock_irqsave(&mesa_lock);
     struct mesa_frame *f = NULL;
@@ -1287,6 +1322,7 @@ int mesa_frame_complete(int dev_idx, uint32_t slot_seq, uint32_t seq, const uint
         if (!o->result_off) continue;
         gpu_cmd_rec *rec =
             (gpu_cmd_rec *)&slot->data[GPU_BATCH_REC_OFF + (size_t)ci * sizeof(gpu_cmd_rec)];
+        if (rec->result_cap < GPU_RESULT_HDR) continue;
         uint8_t *area = &slot->data[GPU_BATCH_RESULT_OFF + rec->result_off];
         uint16_t total = 0;
         for (int k = 0; k < o->nout; k++) {
@@ -1368,7 +1404,7 @@ void mesa_dc_free(struct mesa_dc *d) {
 
 static int mesa_dc_add(struct mesa_dc *d, uint16_t kind, const char *name, uint8_t argc, const uint64_t *args,
                        uint32_t ptr_mask, uint32_t ret_mask) {
-    if (!d || argc > MESA_CALL_ARGS) return -1;
+    if (!d || argc > MESA_FMASK_ARGS) return -1;
     uint32_t name_off = name ? mb_put(&d->b, name, (uint32_t)strlen(name) + 1) : 0;
     struct mesa_call *c = mb_call(&d->b);
     if (!c || d->b.overflow) return -1;

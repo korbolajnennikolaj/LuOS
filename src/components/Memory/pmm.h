@@ -44,6 +44,7 @@ uint64_t pmm_alloc_pages_aligned(uint64_t count, uint64_t align_pages, uint64_t 
 uint64_t pmm_highest_frame(void);
 int pmm_ram_range_count(void);
 int pmm_ram_range(int index, uint64_t *base, uint64_t *length);
+bool pmm_top_usable(uint64_t length, uint64_t *base);
 bool pmm_frame_is_ram(uint64_t frame);
 void pmm_dma32_pool_init(uint64_t pages);
 uint64_t pmm_alloc_dma32_pages(uint64_t count);

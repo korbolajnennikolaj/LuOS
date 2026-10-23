@@ -142,6 +142,7 @@ typedef struct gpu_ring_slot {
     uint64_t complete_ns;
     uint32_t status;
     uint16_t fail_opcode;
+    volatile uint8_t held;
     volatile int32_t done_flag;
     uint8_t data[GPU_BATCH_BYTES];
 } gpu_ring_slot;

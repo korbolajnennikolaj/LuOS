@@ -333,26 +333,21 @@ static int lvk_call(lua_State *L) {
     int top = lua_gettop(L);
     uint64_t args[16] = {0};
     uint8_t payload[512];
-    uint32_t n_extra = 0;
-    int argc = top - 1;
-    if (argc > 16) argc = 16;
+    bool has_data = top >= 2 && lua_type(L, top) == LUA_TSTRING;
+    int argc = top - 1 - (has_data ? 1 : 0);
+    if (argc > 16) luaL_error(L, "%s: at most 16 arguments", full);
     for (int i = 0; i < argc; i++) {
-        uint64_t v = 0;
         int idx = 2 + i;
-        if (lua_isnumber(L, idx)) v = (uint64_t)lua_tointeger(L, idx);
-        if (i < 6)
-            args[i] = v;
-        else
-            memcpy(payload + 8 * (size_t)(i - 6), &v, 8);
+        args[i] = lua_isnumber(L, idx) ? (uint64_t)lua_tointeger(L, idx) : 0xFFFE;
     }
-    uint32_t total = 8 * n_extra;
-    if (top >= 2 && lua_isstring(L, top) && argc <= 10) {
+    uint32_t total = 0;
+    if (has_data) {
         size_t len = 0;
         const char *data = lua_tolstring(L, top, &len);
-        if (total + len < sizeof(payload)) {
-            memcpy(payload + total, data, len);
-            total += (uint32_t)len;
-        }
+        if (8 + len > sizeof(payload)) luaL_error(L, "%s: data too large (%d bytes max)", full, (int)sizeof(payload) - 8);
+        memset(payload, 0, 8);
+        memcpy(payload + 8, data, len);
+        total = 8 + (uint32_t)len;
     }
     int r = gfx_vk_one(op, argc, args, total ? payload : NULL, (uint16_t)total, 64);
     lua_pushinteger(L, r);

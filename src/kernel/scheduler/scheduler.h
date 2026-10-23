@@ -43,6 +43,8 @@ int scheduler_wake_matching(int (*pred)(struct task *, void *), void *ctx);
 
 void scheduler_for_each_task(void (*fn)(struct task *, void *), void *ctx);
 
+void scheduler_dump_stacks(const char *const *prefixes);
+
 void scheduler_block(void *channel);
 void scheduler_wake(void *channel);
 void scheduler_wake_all(void *channel);

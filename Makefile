@@ -560,7 +560,14 @@ run-ata-log: iso-limine $(DISK_IMG)
 	@echo "  QEMU : $(ATA_QEMU_LOG)"
 	@echo "  STDERR: $(ATA_LOG)"
 
-iso-limine: $(KERNEL) $(GPU_FIRMWARE_ZIP)
+LIMINE_CONF = scripts/limine.conf
+ifneq ($(INITRD),)
+LIMINE_INITRD_SED = s|^@INITRD@$$|    MODULE_PATH:boot():/initrd|
+else
+LIMINE_INITRD_SED = /^@INITRD@$$/d
+endif
+
+iso-limine: $(KERNEL) $(GPU_FIRMWARE_ZIP) $(LIMINE_CONF)
 	@echo "[ISO] Building Limine ISO..."
 	@if [ ! -d "$(LIMINE_PATH)" ]; then \
 		echo "[ERR] Limine files not found at $(LIMINE_PATH)!"; \
@@ -577,23 +584,11 @@ iso-limine: $(KERNEL) $(GPU_FIRMWARE_ZIP)
 	@cp $(GPU_FIRMWARE_ZIP) $(ISO_DIR_LIMINE)/lib/firmware.zip
 	@echo "[ISO] $(shell du -h $(GPU_FIRMWARE_ZIP) | cut -f1) ONE /lib/firmware.zip ($(shell unzip -Z1 $(GPU_FIRMWARE_ZIP) | wc -l) entries, $(shell du -sh $(GPU_FIRMWARE_ROOT)/lib/firmware | cut -f1) loose), read on the fly at boot, never unpacked"
 
-	@echo "TIMEOUT:5" > $(ISO_DIR_LIMINE)/limine.conf
-	@echo "" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "/LuOS" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "    PROTOCOL:limine" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "    KERNEL_PATH:boot():/kernel.bin" >> $(ISO_DIR_LIMINE)/limine.conf
-	@if [ -n "$(KERNEL_CMDLINE)" ]; then echo "    CMDLINE:$(KERNEL_CMDLINE)" >> $(ISO_DIR_LIMINE)/limine.conf; fi
 	@if [ -n "$(INITRD)" ]; then \
 		cp "$(INITRD)" $(ISO_DIR_LIMINE)/initrd; \
-		echo "    MODULE_PATH:boot():/initrd" >> $(ISO_DIR_LIMINE)/limine.conf; \
 		echo "[ISO] Added initrd module: $(INITRD)"; \
 	fi
-	@echo "" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "/LuOS (no GPU drivers, firmware framebuffer)" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "    PROTOCOL:limine" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "    KERNEL_PATH:boot():/kernel.bin" >> $(ISO_DIR_LIMINE)/limine.conf
-	@echo "    CMDLINE:nomodeset $(KERNEL_CMDLINE)" >> $(ISO_DIR_LIMINE)/limine.conf
-	@if [ -n "$(INITRD)" ]; then echo "    MODULE_PATH:boot():/initrd" >> $(ISO_DIR_LIMINE)/limine.conf; fi
+	@sed -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' -e '/^    CMDLINE:$$/d' -e '$(LIMINE_INITRD_SED)' $(LIMINE_CONF) > $(ISO_DIR_LIMINE)/limine.conf
 
 	@cp $(LIMINE_PATH)/limine-bios.sys $(ISO_DIR_LIMINE)/
 	@cp $(LIMINE_PATH)/limine-bios-cd.bin $(ISO_DIR_LIMINE)/
@@ -763,6 +758,58 @@ endif
 		-D $(STRESS_DBG_LOG) \
 		2>$(STRESS_LOG)
 	@echo "[STRESS UEFI] Done. Traces -> $(STRESS_LOG) | QEMU log (incl. int/cpu_reset) -> $(STRESS_DBG_LOG)"
+
+help:
+	@echo "LuOS build system"
+	@echo ""
+	@echo "Build:"
+	@echo "  all                  build the kernel ($(KERNEL)) only"
+	@echo "  iso-limine           build the kernel, the GPU firmware zip and the bootable Limine ISO ($(ISO_LIMINE))"
+	@echo "  initfs               build the built-in filesystem image (profile INITFS_PROFILE, firmware INITFS_FIRMWARE)"
+	@echo "  initfs-clean         delete the userspace sysroot build cache (packages, initfs, firmware tree)"
+	@echo "  gpu-firmware         build $(GPU_FIRMWARE_ZIP) (amdgpu, i915, nvidia + AMD VBIOS files from VBIOS_DIR)"
+	@echo "  gpu-firmware-zip     same as gpu-firmware"
+	@echo "  vbios-dump           save this machine's AMD VBIOS into VBIOS_DIR (needs sudo)"
+	@echo "  vbios-list           list the VBIOS images in VBIOS_DIR"
+	@echo "  clean                remove every build output, image, cache and log"
+	@echo ""
+	@echo "Run in QEMU (each target builds the ISO first):"
+	@echo "  run-uefi             UEFI (OVMF), graphics, QEMU monitor, PS/2 input"
+	@echo "  run-uefi-smp         UEFI with 4 cores under TCG, GDB stub for SMP debugging"
+	@echo "  run-bios             BIOS (SeaBIOS), single core, PS/2 input"
+	@echo "  run-bios-2ghz        BIOS, single core, TCG"
+	@echo "  run-xhci-uefi        UEFI + xHCI with USB keyboard, mouse and storage"
+	@echo "  run-xhci-bios        BIOS + xHCI with USB keyboard, mouse and storage"
+	@echo "  run-ehci-bios        BIOS + EHCI with USB keyboard, mouse and storage"
+	@echo "  run-uhci-bios        BIOS + UHCI with USB keyboard, mouse and storage"
+	@echo "  run-ohci-bios        BIOS + OHCI with USB keyboard, mouse and storage"
+	@echo "  run-xhci-log         run-xhci-bios with trace logs"
+	@echo "  run-ehci-log         run-ehci-bios with trace logs"
+	@echo "  run-uhci-log         run-uhci-bios with trace logs"
+	@echo "  run-ohci-log         run-ohci-bios with trace logs"
+	@echo "  run-ahci-log         AHCI (SATA) disk with trace logs"
+	@echo "  run-ata-log          PATA disk with trace logs"
+	@echo "  run-nvme-log         NVMe disk with trace logs (needs QEMU with NVMe emulation)"
+	@echo "  run-audio-hda        Intel HDA (ICH9) + hda-duplex codec"
+	@echo "  run-audio-ac97       Intel 82801AA AC97 (STAC9700 codec)"
+	@echo "  run-audio-usb        USB Audio Class 1 device on xHCI"
+	@echo "  run-audio-all        HDA + AC97 + USB audio together"
+	@echo "  run-stress-log       SMP stress test: AHCI + ATA + all USB controllers at once"
+	@echo ""
+	@echo "Source export:"
+	@echo "  fullsource           gather every .c/.h/.asm file into fullsource.txt"
+	@echo "  unpack               extract the files back from fullsource.txt"
+	@echo ""
+	@echo "Variables (make VAR=value TARGET):"
+	@echo "  KERNEL_CMDLINE       kernel command line of the default boot entry (e.g. gpu.autoinit=1)"
+	@echo "  INITFS_PROFILE       built-in filesystem profile (default: $(INITFS_PROFILE))"
+	@echo "  INITFS_FIRMWARE      firmware groups packed into the built-in filesystem (default: $(INITFS_FIRMWARE))"
+	@echo "  INITRD               extra initrd module for the boot entry"
+	@echo "  VBIOS_DIR            directory with VBIOS images (default: $(VBIOS_DIR))"
+	@echo "  LIMINE_PATH          Limine installation (default: $(LIMINE_PATH))"
+	@echo "  OVMF_PATH            OVMF firmware for the UEFI targets (default: $(OVMF_PATH))"
+	@echo "  AUDIO_BACKEND        QEMU host audio backend for run-audio-* (default: $(AUDIO_BACKEND))"
+	@echo "  SMP_STRESS_CORES     cores for run-stress-log (default: $(SMP_STRESS_CORES))"
 
 clean:
 	@echo "[CLEAN] build outputs, binaries, images and logs..."

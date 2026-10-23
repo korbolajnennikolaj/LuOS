@@ -8,6 +8,9 @@
 #include "drivers/Timer/timer.h"
 #include "drivers/Video/limine_video_driver.h"
 #include "kernel/scheduler/spinlock.h"
+#include "components/Memory/mm.h"
+#include "components/Memory/pmm.h"
+#include "components/Memory/vmm.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -157,6 +160,53 @@ static void logger_stamp(struct system_time *out, uint16_t *out_ms) {
     }
 }
 
+#define LOGPS_MAGIC 0x31535047304f554cULL
+#define LOGPS_HDR 4096
+#define LOGPS_SLOT (LOGPS_HDR + LOGGER_BUFFER_SIZE)
+#define LOGPS_TOTAL (2 * LOGPS_SLOT)
+
+struct logps_hdr {
+    uint64_t magic;
+    uint64_t boot_seq;
+    uint64_t head;
+    uint64_t start;
+    uint64_t size;
+    uint64_t check;
+};
+
+static uint64_t logps_phys;
+static uint8_t *logps_base;
+static struct logps_hdr *logps_cur;
+static char *logps_ring;
+static const struct logps_hdr *logps_prev;
+static const char *logps_prev_ring;
+
+static uint64_t logps_sum(const struct logps_hdr *h) {
+    return h->magic ^ (h->boot_seq * 0x9E3779B97F4A7C15ULL) ^ (h->head + 0x632BE59BD9B4E019ULL) ^
+           (h->start * 31) ^ h->size;
+}
+
+static bool logps_valid(const struct logps_hdr *h) {
+    return h->magic == LOGPS_MAGIC && h->size == LOGGER_BUFFER_SIZE && h->start <= h->head &&
+           h->check == logps_sum(h);
+}
+
+static void logps_mirror(uint64_t at, const char *data, size_t length) {
+    if (!logps_cur) return;
+    size_t offset = (size_t)(at % LOGGER_BUFFER_SIZE);
+    size_t first = LOGGER_BUFFER_SIZE - offset;
+    if (first > length) first = length;
+    memcpy(&logps_ring[offset], data, first);
+    if (length > first) memcpy(logps_ring, data + first, length - first);
+}
+
+static void logps_commit(void) {
+    if (!logps_cur) return;
+    logps_cur->head = logger_buffer_head;
+    logps_cur->start = logger_buffer_start;
+    logps_cur->check = logps_sum(logps_cur);
+}
+
 static void logger_buffer_write(const char *data, size_t length) {
     if (length > LOGGER_BUFFER_SIZE) {
         data += length - LOGGER_BUFFER_SIZE;
@@ -169,6 +219,7 @@ static void logger_buffer_write(const char *data, size_t length) {
 
     memcpy(&logger_buffer[offset], data, first);
     if (length > first) memcpy(logger_buffer, data + first, length - first);
+    logps_mirror(logger_buffer_head, data, length);
 
     uint64_t old_tail = (logger_buffer_head > LOGGER_BUFFER_SIZE) ? logger_buffer_head - LOGGER_BUFFER_SIZE : 0;
     logger_buffer_head += length;
@@ -178,6 +229,7 @@ static void logger_buffer_write(const char *data, size_t length) {
         uint64_t lost_from = (old_tail > logger_buffer_start) ? old_tail : logger_buffer_start;
         logger_dropped += new_tail - lost_from;
     }
+    logps_commit();
 }
 
 static inline char logger_buffer_at(uint64_t position) {
@@ -521,4 +573,67 @@ void logger_console_mirror(const char *s) {
     if (!logger_uart || !logger_uart->is_present || !logger_uart->is_present()) return;
     size_t n = strlen(s);
     if (n) logger_uart->write(s, n);
+}
+
+void logger_pstore_reserve(void) {
+    uint64_t phys = 0;
+    if (!pmm_top_usable(LOGPS_TOTAL, &phys)) return;
+    pmm_reserve_range(phys, LOGPS_TOTAL);
+    logps_phys = phys;
+}
+
+void logger_pstore_start(void) {
+    if (!logps_phys) return;
+    uint8_t *base = (uint8_t *)mm_phys_to_virt(logps_phys);
+    vmm_set_cache_type((uint64_t)base, LOGPS_TOTAL, VMM_CACHE_WT);
+    const struct logps_hdr *a = (const struct logps_hdr *)base;
+    const struct logps_hdr *b = (const struct logps_hdr *)(base + LOGPS_SLOT);
+    bool va = logps_valid(a), vb = logps_valid(b);
+    int prev = -1;
+    if (va && vb) prev = a->boot_seq >= b->boot_seq ? 0 : 1;
+    else if (va) prev = 0;
+    else if (vb) prev = 1;
+    int cur = prev == 0 ? 1 : 0;
+    uint64_t seq = prev >= 0 ? ((const struct logps_hdr *)(base + (size_t)prev * LOGPS_SLOT))->boot_seq + 1 : 1;
+
+    uint64_t flags;
+    bool owned = logger_acquire(&flags);
+    logps_base = base;
+    if (prev >= 0) {
+        logps_prev = (const struct logps_hdr *)(base + (size_t)prev * LOGPS_SLOT);
+        logps_prev_ring = (const char *)logps_prev + LOGPS_HDR;
+    }
+    struct logps_hdr *h = (struct logps_hdr *)(base + (size_t)cur * LOGPS_SLOT);
+    memset(h, 0, sizeof(*h));
+    h->magic = LOGPS_MAGIC;
+    h->boot_seq = seq;
+    h->size = LOGGER_BUFFER_SIZE;
+    logps_ring = (char *)h + LOGPS_HDR;
+    memcpy(logps_ring, logger_buffer, LOGGER_BUFFER_SIZE);
+    logps_cur = h;
+    logps_commit();
+    logger_release(flags, owned);
+
+    LOG_INFO("persistent log: %u KiB at 0x%llx survives a reset button press (boot #%llu)%s",
+             (unsigned)(LOGPS_TOTAL / 1024), (unsigned long long)logps_phys, (unsigned long long)seq,
+             logps_prev ? " - the previous boot's log is kept, save it with 'log-dump prev'" : "");
+}
+
+bool logger_pstore_has_prev(void) { return logps_prev != NULL; }
+
+void logger_pstore_dump_prev(void (*output_function)(const char *message, size_t length)) {
+    if (!logps_prev) return;
+    uint64_t head = logps_prev->head, start = logps_prev->start;
+    uint64_t tail = head > LOGGER_BUFFER_SIZE ? head - LOGGER_BUFFER_SIZE : 0;
+    uint64_t pos = tail > start ? tail : start;
+    if (tail > start) {
+        while (pos < head && logps_prev_ring[pos % LOGGER_BUFFER_SIZE] != '\n') pos++;
+        if (pos < head) pos++;
+    }
+    char chunk[LOGGER_DUMP_CHUNK_SIZE];
+    while (pos < head) {
+        size_t n = 0;
+        while (n < sizeof(chunk) && pos < head) chunk[n++] = logps_prev_ring[pos++ % LOGGER_BUFFER_SIZE];
+        output_function(chunk, n);
+    }
 }

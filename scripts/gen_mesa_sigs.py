@@ -243,9 +243,9 @@ GL_OUT_OVERRIDE = {
     "glGetGraphicsResetStatus": ("ret",), "glRenderMode": ("ret",),
     "glClientWaitSync": ("ret",), "glUnmapBuffer": ("ret",),
     "glGetDebugMessageLog": ("ret",), "glQueryCounter": ("ret",),
-    "glGetQueryObjectiv": ("arg", 1, 4), "glGetQueryObjectuiv": ("arg", 1, 4),
-    "glGetQueryObjecti64v": ("arg", 1, 8), "glGetQueryObjectui64v": ("arg", 1, 8),
-    "glGetSamplerParameterIiv": ("arg", 1, 4), "glGetQueryiv": ("arg", 1, 4),
+    "glGetQueryObjectiv": ("arg", 255, 4), "glGetQueryObjectuiv": ("arg", 255, 4),
+    "glGetQueryObjecti64v": ("arg", 255, 8), "glGetQueryObjectui64v": ("arg", 255, 8),
+    "glGetSamplerParameterIiv": ("arg", 255, 4), "glGetQueryiv": ("arg", 255, 4),
     "glGetShaderPrecisionFormat": ("cap", 0), "glShaderSource": ("srcs",),
     "glGetAttachedShaders": ("arg", 1, 4), "glSpecializeShader": ("ret",),
 }

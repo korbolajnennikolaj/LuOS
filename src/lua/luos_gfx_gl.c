@@ -785,6 +785,8 @@ static int lgl_call(lua_State *L) {
                     args[i] = used - len;
                 } else if (have && lua_isnumber(L, argi)) {
                     args[i] = (uint64_t)lua_tointeger(L, argi);
+                } else if (i == sig->out_arg || i == sig->out2_arg) {
+                    args[i] = 0xFFFF;
                 } else {
                     args[i] = 0xFFFE;
                 }
@@ -800,7 +802,7 @@ static int lgl_call(lua_State *L) {
         } else {
             uint64_t v = 0;
             if (is_ptr)
-                v = 0xFFFE;
+                v = (i == sig->out_arg || i == sig->out2_arg) ? 0xFFFF : 0xFFFE;
             else if (sig->types[i] == M_T_F)
                 v = f32l(have ? (float)lua_tonumber(L, argi) : 0.0f);
             else if (sig->types[i] == M_T_D)

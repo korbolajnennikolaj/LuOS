@@ -78,4 +78,9 @@ void logger_enter_panic_mode(void);
 #define LOG_WARNING(...) logger_printf(LOGGER_LEVEL_WARNING, __func__, __VA_ARGS__)
 #define LOG_ERROR(...) logger_printf(LOGGER_LEVEL_ERROR, __func__, __VA_ARGS__)
 
+void logger_pstore_reserve(void);
+void logger_pstore_start(void);
+bool logger_pstore_has_prev(void);
+void logger_pstore_dump_prev(void (*output_function)(const char *message, size_t length));
+
 #endif

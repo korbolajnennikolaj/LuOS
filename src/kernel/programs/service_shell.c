@@ -2715,16 +2715,42 @@ static int str_ends_with_txt(const char *s) {
            (ext[3] == 't' || ext[3] == 'T');
 }
 
+static void shell_blink_keyboard_leds(int times) {
+    struct keyboard_driver *kbd = get_self_driver(KEYBOARD_DRIVER, VIRTUAL_KEYBOARD);
+    if (!kbd || !kbd->set_leds) return;
+    struct ps2_keyboard_state *st = kbd->get_state ? kbd->get_state() : NULL;
+    bool caps = st ? st->is_caps_lock : false;
+    bool num = st ? st->is_num_lock : false;
+    bool scroll = st ? st->is_scroll_lock : false;
+
+    for (int i = 0; i < times; i++) {
+        kbd->set_leds(true, true, true);
+        scheduler_sleep_ms(150);
+        kbd->set_leds(false, false, false);
+        scheduler_sleep_ms(150);
+    }
+    kbd->set_leds(caps, num, scroll);
+}
+
 static void cmd_log_dump(limine_video_driver *video, const char *arg) {
     (void)video;
     char name[FS_MAX_PATH];
 
     while (arg && *arg == ' ') arg++;
+    bool prev = arg && strncmp(arg, "prev", 4) == 0 && (arg[4] == '\0' || arg[4] == ' ');
+    if (prev) {
+        if (!logger_pstore_has_prev()) {
+            printf_color(0xFFFF5555, "log-dump: no log of a previous boot survived (cold boot, or RAM was cleared)\n");
+            return;
+        }
+        arg += 4;
+        while (*arg == ' ') arg++;
+    }
     if (!arg || arg[0] == '\0') {
         struct rtc_driver *rtc_drv = (struct rtc_driver *)get_self_driver(TIMER_DRIVER, RTC_TIMER);
         struct system_time *t = rtc_drv ? rtc_drv->get_rtc_time() : NULL;
         if (t)
-            snprintf(name, sizeof(name), "luos_log_%04u%02u%02u_%02u%02u%02u.txt",
+            snprintf(name, sizeof(name), prev ? "luos_prevlog_%04u%02u%02u_%02u%02u%02u.txt" : "luos_log_%04u%02u%02u_%02u%02u%02u.txt",
                      (unsigned)t->year, (unsigned)t->month, (unsigned)t->day,
                      (unsigned)t->hours, (unsigned)t->minutes, (unsigned)t->seconds);
         else
@@ -2752,7 +2778,8 @@ static void cmd_log_dump(limine_video_driver *video, const char *arg) {
     g_log_dump_written = 0;
     g_log_dump_error = FS_OK;
 
-    logger_dump_buffer_to_text(log_dump_write);
+    if (prev) logger_pstore_dump_prev(log_dump_write);
+    else logger_dump_buffer_to_text(log_dump_write);
     log_dump_flush();
 
     int close_r = fs_close(&g_log_dump_file);
@@ -2766,6 +2793,7 @@ static void cmd_log_dump(limine_video_driver *video, const char *arg) {
 
     printf_color(0xFF55FF55, "Log saved: %s (%llu bytes)\n", path, (unsigned long long)g_log_dump_written);
     LOG_DEBUG("log dump saved to %s, %llu bytes", path, (unsigned long long)g_log_dump_written);
+    shell_blink_keyboard_leds(3);
 }
 
 static void dmesg_write(const char *message, size_t length) {
@@ -3214,7 +3242,7 @@ static void shell_entry(void *arg) {
             help_row(LIMINE_COLOR_AMBER, "poweroff - shutdown", "reboot - restart system");
             help_row(LIMINE_COLOR_AMBER, "debug - debug menu", "panic [MSG] - kernel panic");
             help_row(LIMINE_COLOR_AMBER, "log - logger status", "dmesg [N] - kernel log");
-            help_row(LIMINE_COLOR_AMBER, "log-dump [FILE] - log to FILE.txt", "log-clear - clear the log");
+            help_row(LIMINE_COLOR_AMBER, "log-dump [prev] [FILE] - log (or last boot) to FILE.txt", "log-clear - clear the log");
             help_row(LIMINE_COLOR_AMBER, "log-level [buffer|uart|video] LEVEL", "");
 
             shell_audio_help();

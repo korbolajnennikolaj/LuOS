@@ -88,7 +88,7 @@ static mp_obj_t mpy_gpu_gl_call(size_t n_args, const mp_obj_t *args) {
         bool is_ptr = sig->types[i] == M_T_P;
         if (i < 6) {
             if (is_ptr) {
-                if (have && mp_obj_is_str(args[idx]) || mp_obj_is_type(args[idx], &mp_type_bytes)) {
+                if (have && (mp_obj_is_str(args[idx]) || mp_obj_is_type(args[idx], &mp_type_bytes))) {
                     mp_buffer_info_t bi;
                     mp_get_buffer_raise(args[idx], &bi, MP_BUFFER_READ);
                     if (data_off + used + bi.len > sizeof(payload))
@@ -96,6 +96,8 @@ static mp_obj_t mpy_gpu_gl_call(size_t n_args, const mp_obj_t *args) {
                     memcpy(payload + data_off + used, bi.buf, bi.len);
                     used += (uint32_t)bi.len;
                     cargs[i] = used - bi.len;
+                } else if (i == sig->out_arg || i == sig->out2_arg) {
+                    cargs[i] = 0xFFFF;
                 } else {
                     cargs[i] = 0xFFFE;
                 }
@@ -112,8 +114,11 @@ static mp_obj_t mpy_gpu_gl_call(size_t n_args, const mp_obj_t *args) {
         } else {
             uint64_t v = 0;
             if (is_ptr)
-                v = 0xFFFE;
-            else if (sig->types[i] == M_T_F || sig->types[i] == M_T_D)
+                v = (i == sig->out_arg || i == sig->out2_arg) ? 0xFFFF : 0xFFFE;
+            else if (sig->types[i] == M_T_D) {
+                double d = have ? mp_obj_get_float(args[idx]) : 0.0;
+                memcpy(&v, &d, 8);
+            } else if (sig->types[i] == M_T_F)
                 v = mpy_f32(have ? mp_obj_get_float(args[idx]) : 0.0f);
             else if (have && mp_obj_is_int(args[idx]))
                 v = (uint64_t)mp_obj_get_int(args[idx]);
@@ -145,28 +150,25 @@ static mp_obj_t mpy_gpu_vk_call(size_t n_args, const mp_obj_t *args) {
 
     uint64_t cargs[16] = {0};
     uint8_t payload[512];
-    uint32_t n_extra = sig->argc > 6 ? (uint32_t)sig->argc - 6 : 0;
-    for (int i = 0; i < sig->argc && i < 10; i++) {
-        uint64_t v = 0;
-        int idx = 1 + i;
-        if (idx < (int)n_args && mp_obj_is_int(args[idx])) v = (uint64_t)mp_obj_get_int(args[idx]);
-        if (i < 6)
-            cargs[i] = v;
-        else
-            memcpy(payload + 8 * (size_t)(i - 6), &v, 8);
+    bool has_data = n_args >= 2 && (mp_obj_is_str(args[n_args - 1]) || mp_obj_is_type(args[n_args - 1], &mp_type_bytes));
+    int argc = (int)n_args - 1 - (has_data ? 1 : 0);
+    if (argc > 16) mp_raise_ValueError(MP_ERROR_TEXT("at most 16 arguments"));
+    for (int i = 0; i < argc; i++) {
+        mp_obj_t a = args[1 + i];
+        cargs[i] = mp_obj_is_int(a) ? (uint64_t)mp_obj_get_int(a) : 0xFFFE;
     }
-    uint32_t total = 8 * n_extra;
-    if ((int)n_args == sig->argc + 2 && mp_obj_is_str(args[n_args - 1]) || mp_obj_is_type(args[n_args - 1], &mp_type_bytes)) {
+    uint32_t total = 0;
+    if (has_data) {
         mp_buffer_info_t bi;
         mp_get_buffer_raise(args[n_args - 1], &bi, MP_BUFFER_READ);
-        if (total + bi.len < sizeof(payload)) {
-            memcpy(payload + total, bi.buf, bi.len);
-            total += (uint32_t)bi.len;
-        }
+        if (8 + bi.len > sizeof(payload)) mp_raise_ValueError(MP_ERROR_TEXT("data too large"));
+        memset(payload, 0, 8);
+        memcpy(payload + 8, bi.buf, bi.len);
+        total = 8 + (uint32_t)bi.len;
     }
     int r = gpu_cmd_begin(mpy_gpu_client);
     if (!r)
-        r = gpu_cmd_vk(mpy_gpu_client, op, (uint8_t)sig->argc, cargs, total ? payload : NULL,
+        r = gpu_cmd_vk(mpy_gpu_client, op, (uint8_t)argc, cargs, total ? payload : NULL,
                        (uint16_t)total, 64);
     return MP_OBJ_NEW_SMALL_INT(r);
 }

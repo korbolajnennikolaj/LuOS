@@ -325,6 +325,9 @@ struct gls_zc {
     uint32_t fbo[GLS_ZC_BUFS];
     int slot[GLS_ZC_BUFS];
     uint32_t depth;
+    bool copy;
+    uint32_t rcolor;
+    uint32_t rfbo;
 };
 
 static void gls_zc_free(struct gls *g, struct gls_zc *z) {
@@ -335,6 +338,8 @@ static void gls_zc_free(struct gls *g, struct gls_zc *z) {
         gls_delete(g, GPU_CMD_GL_DELETE_RENDERBUFFERS, &z->rb[i]);
     }
     gls_delete(g, GPU_CMD_GL_DELETE_RENDERBUFFERS, &z->depth);
+    gls_delete(g, GPU_CMD_GL_DELETE_FRAMEBUFFERS, &z->rfbo);
+    gls_delete(g, GPU_CMD_GL_DELETE_RENDERBUFFERS, &z->rcolor);
     struct mesa_dc *d = mesa_dc_new();
     if (d) {
         int calls = 0;
@@ -356,6 +361,8 @@ static int gls_zc_setup(struct gls *g, gpu_present *pt, struct gls_zc *z) {
     z->w = pt->fb_w;
     z->h = pt->fb_h;
     z->dpy = mc.dpy;
+    const struct gpu_device *zd = gpu_get_device(mc.dev_idx);
+    z->copy = zd && strcmp(zd->driver, "nouveau") == 0;
     struct mesa_dc *d = mesa_dc_new();
     if (!d) return GLS_ERR;
     uint64_t rets[4 * GLS_ZC_BUFS];
@@ -409,6 +416,21 @@ static int gls_zc_setup(struct gls *g, gpu_present *pt, struct gls_zc *z) {
         if (gls_one(g, GPU_CMD_GL_FRAMEBUFFER_RENDERBUFFER,
                     GLS_A(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, z->rb[i])))
             goto fail;
+        if (!z->copy && gls_one(g, GPU_CMD_GL_FRAMEBUFFER_RENDERBUFFER,
+                                GLS_A(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, z->depth)))
+            goto fail;
+        if (gls_res(g, GPU_CMD_GL_CHECK_FRAMEBUFFER_STATUS, GLS_A(GL_FRAMEBUFFER), NULL, 0, 8)) goto fail;
+        if (gls_ret32(g) != GL_FRAMEBUFFER_COMPLETE) goto fail;
+    }
+    if (z->copy) {
+        if (gls_gen(g, GPU_CMD_GL_GEN_RENDERBUFFERS, &z->rcolor)) goto fail;
+        if (gls_one(g, GPU_CMD_GL_BIND_RENDERBUFFER, GLS_A(GL_RENDERBUFFER, z->rcolor))) goto fail;
+        if (gls_one(g, GPU_CMD_GL_RENDERBUFFER_STORAGE, GLS_A(GL_RENDERBUFFER, GL_RGBA8, z->w, z->h))) goto fail;
+        if (gls_gen(g, GPU_CMD_GL_GEN_FRAMEBUFFERS, &z->rfbo)) goto fail;
+        if (gls_one(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_FRAMEBUFFER, z->rfbo))) goto fail;
+        if (gls_one(g, GPU_CMD_GL_FRAMEBUFFER_RENDERBUFFER,
+                    GLS_A(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, z->rcolor)))
+            goto fail;
         if (gls_one(g, GPU_CMD_GL_FRAMEBUFFER_RENDERBUFFER,
                     GLS_A(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, z->depth)))
             goto fail;
@@ -418,7 +440,11 @@ static int gls_zc_setup(struct gls *g, gpu_present *pt, struct gls_zc *z) {
     if (gls_one(g, GPU_CMD_GL_VIEWPORT, GLS_A(0, 0, z->w, z->h))) goto fail;
     if (gls_check(g, "scanout buffers")) goto fail;
     z->n = GLS_ZC_BUFS;
-    LOG_INFO("present: GPU renders straight into %d scanout buffers %ux%u, no CPU copy", z->n, z->w, z->h);
+    if (z->copy)
+        LOG_INFO("present: GPU renders off-screen and blits each frame into %d scanout buffers %ux%u, no CPU copy",
+                 z->n, z->w, z->h);
+    else
+        LOG_INFO("present: GPU renders straight into %d scanout buffers %ux%u, no CPU copy", z->n, z->w, z->h);
     return GLS_OK;
 
 fail:
@@ -430,10 +456,18 @@ fail:
 }
 
 static int gls_zc_bind(struct gls *g, struct gls_zc *z) {
-    return gls_put(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_FRAMEBUFFER, z->fbo[z->cur]), NULL, 0);
+    return gls_put(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_FRAMEBUFFER, z->copy ? z->rfbo : z->fbo[z->cur]), NULL, 0);
 }
 
 static int gls_zc_show(struct gls *g, gpu_present *pt, struct gls_zc *z) {
+    if (z->copy) {
+        if (gls_put(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_READ_FRAMEBUFFER, z->rfbo), NULL, 0)) return GLS_ERR;
+        if (gls_put(g, GPU_CMD_GL_BIND_FRAMEBUFFER, GLS_A(GL_DRAW_FRAMEBUFFER, z->fbo[z->cur]), NULL, 0))
+            return GLS_ERR;
+        uint64_t blit_tail[4] = {z->w, z->h, GL_COLOR_BUFFER_BIT, GL_NEAREST};
+        if (gls_put(g, GPU_CMD_GL_BLIT_FRAMEBUFFER, GLS_A(0, 0, z->w, z->h, 0, 0), blit_tail, sizeof(blit_tail)))
+            return GLS_ERR;
+    }
     if (gls_put(g, GPU_CMD_GL_FINISH, GLS_A0, NULL, 0)) return GLS_ERR;
     if (gls_flush(g, GLS_FRAME_TIMEOUT_MS)) return GLS_ERR;
     if (gpu_present_zc_show(pt, z->slot[z->cur])) {
@@ -561,6 +595,7 @@ int gpu_gl_cube_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *f
         why = "frame";
     }
 
+    gpu_present_zc_reset(&pt);
     gls_zc_free(&g, &zc);
     gls_free_fbo(&g, &fb);
     gls_delete(&g, GPU_CMD_GL_DELETE_BUFFERS, &vbo);
@@ -830,6 +865,7 @@ int gpu_glxgears_run(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *
         why = "frame";
     }
 
+    gpu_present_zc_reset(&pt);
     gls_zc_free(&g, &zc);
     gls_free_fbo(&g, &fb);
     gls_delete(&g, GPU_CMD_GL_DELETE_BUFFERS, &vbo);

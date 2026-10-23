@@ -261,6 +261,19 @@ int gfx_gl_finish(void) {
 int gfx_gl_tex_image_2d(uint32_t target, int level, uint32_t internal, uint32_t w, uint32_t h,
                         uint32_t format, uint32_t type, const uint8_t *data, uint32_t data_len) {
     if (G.cl < 0) return GFX_ERR_STATE;
+    if (data) {
+        uint32_t bpp = 0;
+        if (type == GL_UNSIGNED_BYTE)
+            bpp = format == GL_RGBA || format == GL_BGRA ? 4 : format == GL_RGB || format == GL_BGR ? 3 :
+                  format == GL_RED || format == GL_ALPHA || format == GL_LUMINANCE ? 1 :
+                  format == GL_LUMINANCE_ALPHA || format == GL_RG ? 2 : 0;
+        else if (type == GL_FLOAT)
+            bpp = format == GL_RGBA ? 16 : format == GL_RGB ? 12 : format == GL_RED ? 4 : 0;
+        if (bpp && (uint64_t)w * h * bpp > data_len) {
+            gfx_fail("texture %ux%u needs %llu bytes, got %u", w, h, (unsigned long long)w * h * bpp, data_len);
+            return GFX_ERR_PARAM;
+        }
+    }
     uint8_t payload[GPU_BATCH_PAYLOAD];
     uint32_t n_extra = 3;
     uint32_t data_off = 8 * n_extra;
@@ -323,7 +336,7 @@ uint64_t gfx_gl_create_shader(uint32_t type, const char *src, char *log, int log
             gfx_gl_query(GPU_CMD_GL_GET_SHADERIV, 3, a5, 8, NULL, rbuf, sizeof(rbuf));
             memcpy(&loglen, rbuf, 8);
             if (loglen > 1) {
-                uint64_t a6[6] = {id, 1023, 0xFFFE, 0};
+                uint64_t a6[6] = {id, 1024 - GPU_RESULT_HDR - 8, 0xFFFE, 0};
                 uint16_t llen = 0;
                 uint8_t lbuf[1032];
                 memset(lbuf, 0, sizeof(lbuf));
@@ -399,7 +412,7 @@ uint64_t gfx_gl_create_program(uint64_t vs, uint64_t fs, const char *const *attr
             gfx_gl_query(GPU_CMD_GL_GET_PROGRAMIV, 3, af, 8, NULL, rbuf, sizeof(rbuf));
             memcpy(&loglen, rbuf, 8);
             if (loglen > 1) {
-                uint64_t ag[6] = {prog, 1023, 0xFFFE, 0};
+                uint64_t ag[6] = {prog, 1024 - GPU_RESULT_HDR - 8, 0xFFFE, 0};
                 uint16_t llen = 0;
                 uint8_t lbuf[1032];
                 memset(lbuf, 0, sizeof(lbuf));
@@ -419,14 +432,33 @@ uint64_t gfx_gl_create_program(uint64_t vs, uint64_t fs, const char *const *attr
 
 int gfx_gl_uniform_matrix(uint16_t op, int64_t loc, const float *m, uint32_t count) {
     if (G.cl < 0) return GFX_ERR_STATE;
-    uint64_t args[6] = {(uint64_t)loc, count, 0};
-    return gfx_gl_payload(op, 3, args, m, (uint16_t)(16 * sizeof(float) * count), 0);
+    if (!m || !count || count > GPU_BATCH_PAYLOAD / (16 * sizeof(float))) {
+        gfx_fail("matrix count %u out of range", count);
+        return GFX_ERR_PARAM;
+    }
+    uint16_t len = (uint16_t)(16 * sizeof(float) * count);
+    if (op == GPU_CMD_GL_MULT_MATRIXF || op == GPU_CMD_GL_LOAD_MATRIXF) {
+        uint64_t args[6] = {0};
+        return gfx_gl_payload(op, 1, args, m, len, 0);
+    }
+    uint64_t args[6] = {(uint64_t)loc, count, 0, 0};
+    return gfx_gl_payload(op, 4, args, m, len, 0);
 }
 
 int gfx_gl_uniformv(uint16_t op, int64_t loc, const float *v, uint32_t comps) {
     if (G.cl < 0) return GFX_ERR_STATE;
-    uint64_t args[6] = {(uint64_t)loc, (uint64_t)comps};
-    return gfx_gl_payload(op, 2, args, v, (uint16_t)(comps * sizeof(float)), 0);
+    if (!v || comps < 1 || comps > 4) {
+        gfx_fail("uniform with %u components", comps);
+        return GFX_ERR_PARAM;
+    }
+    if (op == GPU_CMD_GL_UNIFORM1F || op == GPU_CMD_GL_UNIFORM2F || op == GPU_CMD_GL_UNIFORM3F ||
+        op == GPU_CMD_GL_UNIFORM4F) {
+        uint64_t args[6] = {(uint64_t)loc};
+        for (uint32_t i = 0; i < comps; i++) args[1 + i] = gfx_f32(v[i]);
+        return gfx_gl_simple_op(op, (int)(1 + comps), args);
+    }
+    uint64_t args[6] = {(uint64_t)loc, 1, 0};
+    return gfx_gl_payload(op, 3, args, v, (uint16_t)(comps * sizeof(float)), 0);
 }
 
 int gfx_gl_attrib_pointer(uint32_t index, uint32_t size, uint32_t type, uint32_t normalized,
@@ -725,13 +757,18 @@ int gfx_gl_close(void) {
 
 int gfx_gl_read_pixels(int x, int y, int w, int h, uint8_t *out, uint32_t cap) {
     if (G.cl < 0) return GFX_ERR_STATE;
-    uint32_t need = (uint32_t)w * (uint32_t)h * 4;
-    if (!out || cap < need) {
-        gfx_fail("readPixels buffer too small: %u < %u", cap, need);
+    if (w <= 0 || h <= 0) {
+        gfx_fail("readPixels size %dx%d", w, h);
         return GFX_ERR_PARAM;
     }
-    if (need > MESA_PIX_MAX) {
-        gfx_fail("readPixels too large: %u bytes", need);
+    uint64_t need64 = (uint64_t)w * (uint64_t)h * 4;
+    if (need64 > MESA_PIX_MAX) {
+        gfx_fail("readPixels too large: %llu bytes", (unsigned long long)need64);
+        return GFX_ERR_PARAM;
+    }
+    uint32_t need = (uint32_t)need64;
+    if (!out || cap < need) {
+        gfx_fail("readPixels buffer too small: %u < %u", cap, need);
         return GFX_ERR_PARAM;
     }
     uint64_t args[6] = {(uint64_t)(uint32_t)x, (uint64_t)(uint32_t)y, (uint64_t)(uint32_t)w,
@@ -902,8 +939,9 @@ int gfx_vk_destroy_instance(uint64_t inst) {
 }
 
 int gfx_vk_enumerate_physical(uint64_t inst, uint64_t *out, uint32_t max, uint32_t *count) {
-    if (vk_cl < 0 || !count) return GFX_ERR_STATE;
-    uint8_t rbuf[64];
+    if (vk_cl < 0 || !count || (max && !out)) return GFX_ERR_STATE;
+    for (uint32_t i = 0; i < max; i++) out[i] = 0;
+    uint8_t rbuf[4 + 8 * 16 + 16];
     uint64_t a0[6] = {inst, 0, 0xFFFE};
     uint64_t n = gfx_vk_query(GPU_CMD_VK_ENUMERATE_PHYSICAL_DEVICES, 3, a0, NULL, 0, 8, NULL,
                               rbuf, sizeof(rbuf));
@@ -912,18 +950,26 @@ int gfx_vk_enumerate_physical(uint64_t inst, uint64_t *out, uint32_t max, uint32
         *count = 0;
         return GFX_ERR_NONE;
     }
+    uint32_t want = total;
+    if (want > max) want = max;
+    if (want > (sizeof(rbuf) - 4) / 8) want = (uint32_t)((sizeof(rbuf) - 4) / 8);
+    if (!want) {
+        *count = total;
+        return GFX_ERR_NONE;
+    }
     uint8_t pl[16];
     memset(pl, 0, sizeof(pl));
-    memcpy(pl + 8, &total, 4);
+    memcpy(pl + 8, &want, 4);
     uint64_t a1[6] = {inst, 0, 0};
     uint16_t len = 0;
     memset(rbuf, 0, sizeof(rbuf));
-    gfx_vk_query(GPU_CMD_VK_ENUMERATE_PHYSICAL_DEVICES, 3, a1, pl, 12, 16, &len, rbuf,
+    gfx_vk_query(GPU_CMD_VK_ENUMERATE_PHYSICAL_DEVICES, 3, a1, pl, 12, (uint16_t)(4 + 8 * want), &len, rbuf,
                  sizeof(rbuf));
     uint32_t got = 0;
-    if (len >= 12) memcpy(&got, rbuf, 4);
-    if (got > total) got = total;
-    uint32_t store = got < max ? got : max;
+    if (len >= 4) memcpy(&got, rbuf, 4);
+    if (got > want) got = want;
+    if (len < 4 + 8 * got) got = len > 4 ? (uint32_t)((len - 4) / 8) : 0;
+    uint32_t store = got;
     for (uint32_t i = 0; i < store; i++) {
         uint64_t dev = 0;
         memcpy(&dev, rbuf + 4 + (size_t)i * 8, 8);
@@ -960,18 +1006,25 @@ int gfx_vk_queue_family_properties(uint64_t pd, VkQueueFamilyProperties *out, ui
         *count = 0;
         return GFX_ERR_NONE;
     }
+    uint32_t want = total < max ? total : max;
+    if (want > 16) want = 16;
     uint8_t pl[16];
     memset(pl, 0, sizeof(pl));
-    memcpy(pl + 8, &total, 4);
+    memcpy(pl + 8, &want, 4);
     uint64_t a1[6] = {pd, 0, 0};
-    uint8_t pbuf[sizeof(VkQueueFamilyProperties) + 16];
+    uint8_t pbuf[4 + 16 * sizeof(VkQueueFamilyProperties) + 16];
     uint16_t len = 0;
+    memset(pbuf, 0, sizeof(pbuf));
     gfx_vk_query(GPU_CMD_VK_GET_PHYSICAL_DEVICE_QUEUE_FAMILY_PROPERTIES, 3, a1, pl, 12,
-                 (uint16_t)sizeof(VkQueueFamilyProperties), &len, pbuf, sizeof(pbuf));
-    if (len >= 4) memcpy(count, pbuf, 4);
-    else *count = total;
-    if (*count > total) *count = total;
-    memcpy(out, pbuf + 4, sizeof(VkQueueFamilyProperties));
+                 (uint16_t)(4 + want * sizeof(VkQueueFamilyProperties)), &len, pbuf, sizeof(pbuf));
+    uint32_t got = 0;
+    if (len >= 4) memcpy(&got, pbuf, 4);
+    if (got > want) got = want;
+    if (len < 4 + got * sizeof(VkQueueFamilyProperties))
+        got = len > 4 ? (uint32_t)((len - 4) / sizeof(VkQueueFamilyProperties)) : 0;
+    memset(out, 0, (size_t)max * sizeof(VkQueueFamilyProperties));
+    memcpy(out, pbuf + 4, (size_t)got * sizeof(VkQueueFamilyProperties));
+    *count = total;
     return GFX_ERR_NONE;
 }
 

@@ -302,6 +302,21 @@ int pmm_ram_range(int index, uint64_t *base, uint64_t *length) {
     return -1;
 }
 
+bool pmm_top_usable(uint64_t length, uint64_t *base) {
+    struct limine_memmap_response *mm = memmap_req.response;
+    if (!mm || !base || !length) return false;
+    uint64_t best = 0;
+    for (uint64_t i = 0; i < mm->entry_count; i++) {
+        struct limine_memmap_entry *e = mm->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE || e->length < length + PAGE_SIZE) continue;
+        uint64_t at = (e->base + e->length - length) & ~(uint64_t)(PAGE_SIZE - 1);
+        if (at >= e->base && at > best) best = at;
+    }
+    if (!best) return false;
+    *base = best;
+    return true;
+}
+
 bool pmm_frame_is_ram(uint64_t frame) {
     struct limine_memmap_response *mm = memmap_req.response;
     if (!mm) return false;

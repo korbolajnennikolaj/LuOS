@@ -44,7 +44,9 @@ void _start(void){
 
     pat_init();
     pmm_init();
+    logger_pstore_reserve();
     vmm_init();
+    logger_pstore_start();
     pmm_dma32_pool_init(PMM_DMA32_POOL_PAGES);
 
     uint64_t free_pages = pmm_free_page_count();

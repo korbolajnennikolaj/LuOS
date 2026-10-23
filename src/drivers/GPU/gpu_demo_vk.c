@@ -227,6 +227,10 @@ static int vk_make_image(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, uint64_t
 #define VKZ_BUFS 3
 #define VKZ_TIMEOUT_MS 20000
 
+#ifndef VK_QUEUE_FAMILY_IGNORED
+#define VK_QUEUE_FAMILY_IGNORED (~0U)
+#endif
+
 #define VKZ_FAIL(what)                                                        \
     do {                                                                      \
         if (!v->err[0]) snprintf(v->err, sizeof(v->err), "%s", what);         \
@@ -236,6 +240,7 @@ static int vk_make_image(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, uint64_t
 struct vkzc {
     int n;
     int cur;
+    bool copy;
     uint32_t w, h;
     uint64_t pass;
     uint64_t image[VKZ_BUFS], mem[VKZ_BUFS], view[VKZ_BUFS], fb[VKZ_BUFS];
@@ -362,7 +367,7 @@ static int vkz_images(struct vks *v, uint8_t *pkbuf, uint32_t pkcap, const struc
         imci->arrayLayers = 1;
         imci->samples = VK_SAMPLE_COUNT_1_BIT;
         imci->tiling = VK_IMAGE_TILING_LINEAR;
-        imci->usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        imci->usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (z->copy ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0);
         imci->sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imci->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         uint32_t len = vkp_finish(&pk);
@@ -773,6 +778,8 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
 
     uint32_t saved_w = pt.width, saved_h = pt.height;
     if (!rc && zc_try) {
+        const struct gpu_device *zd = gpu_get_device(mc.dev_idx);
+        z.copy = zd && strcmp(zd->driver, "nouveau") == 0;
         if (vkz_images(&v, pkbuf, sizeof(pkbuf), &mc, r.dev, &mprops, &pt, &z)) {
             LOG_WARNING("vkkmv: scanout images unavailable (%s), using the CPU copy path", v.err);
             vkz_destroy(&v, r.dev, &z);
@@ -792,7 +799,11 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
                              VKKMV_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                              VK_IMAGE_ASPECT_DEPTH_BIT, &r.dimage, &r.dmem, &r.dview))
         rc = 1;
-    if (!rc && z.w) {
+    if (!rc && z.w && z.copy) {
+        z.n = VKZ_BUFS;
+        LOG_INFO("present: Vulkan renders off-screen, the GPU copies each frame into %d scanout images %ux%u, "
+                 "no CPU copy", z.n, z.w, z.h);
+    } else if (!rc && z.w) {
         if (vkz_pass_fbs(&v, pkbuf, sizeof(pkbuf), r.dev, r.dview, &z)) {
             LOG_WARNING("vkkmv: scanout framebuffers unavailable (%s), using the CPU copy path", v.err);
             vkz_destroy(&v, r.dev, &z);
@@ -1185,12 +1196,38 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
             copy.imageExtent.height = pt.height;
             copy.imageExtent.depth = 1;
             uint32_t copy_off = vkp_put(&pk, &copy, sizeof(copy));
+            uint32_t zbar_off = 0, zcopy_off = 0;
+            if (z.n && z.copy) {
+                VkImageMemoryBarrier zbar;
+                memset(&zbar, 0, sizeof(zbar));
+                zbar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                zbar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                zbar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                zbar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                zbar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                zbar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                zbar.image = z.image[z.cur];
+                zbar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                zbar.subresourceRange.levelCount = 1;
+                zbar.subresourceRange.layerCount = 1;
+                zbar_off = vkp_put(&pk, &zbar, sizeof(zbar));
+                VkImageCopy zcopy;
+                memset(&zcopy, 0, sizeof(zcopy));
+                zcopy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                zcopy.srcSubresource.layerCount = 1;
+                zcopy.dstSubresource = zcopy.srcSubresource;
+                zcopy.extent.width = pt.width;
+                zcopy.extent.height = pt.height;
+                zcopy.extent.depth = 1;
+                zcopy_off = vkp_put(&pk, &zcopy, sizeof(zcopy));
+            }
             uint32_t rp_off;
             VkRenderPassBeginInfo *rpbi = vkp_alloc(&pk, VK_S_VKRENDERPASSBEGININFO,
                                                     sizeof(VkRenderPassBeginInfo), &rp_off);
             rpbi->sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            rpbi->renderPass = z.n ? z.pass : r.pass;
-            rpbi->framebuffer = z.n ? z.fb[z.cur] : r.fb;
+            bool zdirect = z.n && !z.copy;
+            rpbi->renderPass = zdirect ? z.pass : r.pass;
+            rpbi->framebuffer = zdirect ? z.fb[z.cur] : r.fb;
             rpbi->renderArea.extent.width = pt.width;
             rpbi->renderArea.extent.height = pt.height;
             rpbi->clearValueCount = 2;
@@ -1234,6 +1271,16 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
             gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_END_RENDER_PASS, 1,
                        (uint64_t[]){r.cmdbuf}, NULL, 0, 0);
 
+            if (z.n && z.copy) {
+                gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_PIPELINE_BARRIER, 10,
+                           (uint64_t[]){r.cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                        0, 0xFFFE, 0, 0xFFFE, 1, zbar_off},
+                           pkbuf, plen, 0);
+                gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_COPY_IMAGE, 7,
+                           (uint64_t[]){r.cmdbuf, r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, z.image[z.cur],
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, zcopy_off},
+                           pkbuf, plen, 0);
+            }
             if (!z.n)
                 gpu_cmd_vk(v.cl, GPU_CMD_VK_CMD_COPY_IMAGE_TO_BUFFER, 6,
                        (uint64_t[]){r.cmdbuf, r.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r.cbuf, 1, copy_off}, pkbuf, plen, 0);
@@ -1275,6 +1322,7 @@ int gpu_vk_run_crc(const gpu_cube_opts *opts, uint32_t *frames_out, uint32_t *fp
         LOG_WARNING("vkkmv(Vulkan): frame %u failed: %s", frames, v.err);
         if (!frames) rc = 1;
     }
+    gpu_present_zc_reset(&pt);
     vkz_destroy(&v, r.dev, &z);
     vk_destroy(&v, &r);
     gpu_present_close(&pt);

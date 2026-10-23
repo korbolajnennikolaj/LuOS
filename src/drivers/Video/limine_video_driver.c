@@ -8,6 +8,7 @@
 #include "components/logger.h"
 #include "kernel/limine.h"
 #include "kernel/scheduler/spinlock.h"
+#include "components/Memory/heap.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -29,6 +30,10 @@ extern struct limine_framebuffer_request* get_framebuffer_request();
 static uint8_t scroll_cache_storage[SCROLL_CACHE_MAX_BYTES];
 
 static uint8_t* framebuffer_base = NULL;
+static uint8_t* headless_base = NULL;
+static uint64_t headless_size = 0;
+static bool video_headless = false;
+static bool firmware_released = false;
 static uint64_t phys_width = 0;
 static uint64_t phys_height = 0;
 static uint64_t phys_pitch = 0;
@@ -431,6 +436,7 @@ bool limine_video_attach(void* pixels, uint64_t width, uint64_t height, uint64_t
     if (!pixels || width < FONT_WIDTH || height < FONT_HEIGHT || pitch < width * 4) return false;
     uint64_t flags = spin_lock_irqsave(&video_lock);
     video_retarget((uint8_t*)pixels, width, height, pitch);
+    video_headless = false;
     spin_unlock_irqrestore(&video_lock, flags);
     LOG_INFO("console moved to a %llux%llu framebuffer at 0x%llx", (unsigned long long)width,
              (unsigned long long)height, (unsigned long long)(uintptr_t)pixels);
@@ -439,14 +445,50 @@ bool limine_video_attach(void* pixels, uint64_t width, uint64_t height, uint64_t
 
 void limine_video_detach(void)
 {
+    uint64_t need = phys_height * phys_pitch;
+    if (need && headless_size < need) {
+        uint8_t* buf = kmalloc(need);
+        if (buf) {
+            kfree(headless_base);
+            headless_base = buf;
+            headless_size = need;
+        }
+    }
+
     uint64_t flags = spin_lock_irqsave(&video_lock);
-    if (firmware_base) video_retarget(firmware_base, firmware_width, firmware_height, firmware_pitch);
+    firmware_released = true;
+    bool off_screen = headless_base && headless_size >= phys_height * phys_pitch;
+    if (off_screen) video_retarget(headless_base, phys_width, phys_height, phys_pitch);
+    else if (firmware_base) video_retarget(firmware_base, firmware_width, firmware_height, firmware_pitch);
+    video_headless = off_screen;
     spin_unlock_irqrestore(&video_lock, flags);
+
+    if (off_screen) LOG_INFO("console detached from the display, drawing off-screen until a display driver takes it");
+    else LOG_WARNING("console detached, no memory for an off-screen buffer, back on the firmware framebuffer");
+}
+
+bool limine_video_is_headless(void)
+{
+    return video_headless;
+}
+
+void limine_video_restore_firmware(void)
+{
+    uint64_t flags = spin_lock_irqsave(&video_lock);
+    bool was = video_headless;
+    if (was && firmware_base) {
+        video_retarget(firmware_base, firmware_width, firmware_height, firmware_pitch);
+        video_headless = false;
+        firmware_released = false;
+    }
+    spin_unlock_irqrestore(&video_lock, flags);
+    if (was) LOG_INFO("no display driver took the console over, back on the firmware framebuffer");
 }
 
 void limine_video_panic_takeover(void)
 {
     spin_lock_init(&video_lock);
+    if (firmware_released && !video_headless && framebuffer_base) return;
     if (firmware_base && framebuffer_base != firmware_base)
         video_retarget(firmware_base, firmware_width, firmware_height, firmware_pitch);
 }

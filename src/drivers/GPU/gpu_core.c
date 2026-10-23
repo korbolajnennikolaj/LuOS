@@ -120,6 +120,7 @@ typedef struct gpu_devctx {
     uint32_t dropped;
     uint32_t largest_batch;
     uint32_t last_seq;
+    uint32_t next_seq;
 } gpu_devctx;
 
 static struct gpu_device gpu_devices[GPU_DEVICE_MAX];
@@ -144,6 +145,7 @@ struct gpu_client {
     uint32_t flushed_cmds;
     uint32_t flushed_batches;
     struct gpu_ring_slot *last_slot;
+    bool results_valid;
     uint8_t batch[GPU_BATCH_BYTES];
 };
 
@@ -193,6 +195,7 @@ static void gpu_probe_task(void *arg) {
     case GPU_PROBE_BIND:    result = lkpi_gpu_bind_one(pci_name); break;
     default:                result = lkpi_gpu_unbind_one(pci_name); break;
     }
+    if (limine_video_is_headless()) limine_video_restore_firmware();
     if (my_epoch != __atomic_load_n(&gpu_probe_epoch, __ATOMIC_ACQUIRE)) return;
     j->result = result;
     j->r_unbound = r_unbound;
@@ -235,6 +238,8 @@ static int gpu_probe_run(int mode, const char *pci_name, int timeout_ms) {
     LOG_ERROR("gpu core: the driver probe did not return within %d ms (the driver is stuck on this "
               "hardware); the shell stays alive and the probe task keeps running in the background",
               timeout_ms);
+    static const char *const hung[] = {"gpu-probe", "drm-console", "kworker", "card", "irq/", "lkpi-cpu", NULL};
+    scheduler_dump_stacks(hung);
     return GPU_ERR_TIMEOUT;
 }
 
@@ -248,6 +253,20 @@ static struct gpu_device *core_dev(int dev_idx) {
     if (dev_idx < 0 || dev_idx >= gpu_device_count) return NULL;
     if (!gpu_devices[dev_idx].valid) return NULL;
     return &gpu_devices[dev_idx];
+}
+
+static void *gpu_card_get(int dev_idx) {
+    gpu_devctx *ctx = gpu_dev_ctx(dev_idx);
+    if (!ctx) return NULL;
+    uint64_t flags = spin_lock_irqsave(&gpu_registry_lock);
+    void *h = ctx->lx_card;
+    if (h) lkpi_file_get(h);
+    spin_unlock_irqrestore(&gpu_registry_lock, flags);
+    return h;
+}
+
+static void gpu_card_put(void *h) {
+    if (h) lkpi_file_put(h);
 }
 
 typedef struct gpu_enum_stash {
@@ -265,7 +284,10 @@ static void gpu_reset_ctx(gpu_devctx *ctx, gpu_enum_stash *st, int n) {
     if (ctx->lx_render && st->count < cap) st->handles[st->count++] = ctx->lx_render;
     st->reset[n] = true;
     st->old_devt[n] = ctx->primary_devt;
-    memset(ctx, 0, sizeof(*ctx));
+    ctx->lx_card = NULL;
+    ctx->lx_render = NULL;
+    memset(ctx->pci_name, 0, sizeof(ctx->pci_name));
+    ctx->primary_devt = 0;
 }
 
 
@@ -490,11 +512,17 @@ int gpu_drm_open(int dev_idx, bool render) {
     if (!devt) return GPU_ERR_PARAM;
 
     void **slot = render ? &ctx->lx_render : &ctx->lx_card;
-    if (*slot) return GPU_OK;
+    if (__atomic_load_n(slot, __ATOMIC_ACQUIRE)) return GPU_OK;
 
-    if (lkpi_gpu_open_dev(devt, 2 , slot)) {
-        *slot = NULL;
-        return GPU_ERR_DRM;
+    void *h = NULL;
+    if (lkpi_gpu_open_dev(devt, 2, &h) || !h) return GPU_ERR_DRM;
+    uint64_t flags = spin_lock_irqsave(&gpu_registry_lock);
+    bool raced = *slot != NULL;
+    if (!raced) *slot = h;
+    spin_unlock_irqrestore(&gpu_registry_lock, flags);
+    if (raced) {
+        lkpi_gpu_close_dev(h);
+        return GPU_OK;
     }
     if (!render) kms_drop_master(dev_idx);
     LOG_INFO("gpu core: kernel-side DRM client on %s (%s)%s", d->card, d->driver,
@@ -508,8 +536,10 @@ int gpu_drm_ioctl(int dev_idx, struct gpu_drm_ioctl_args *a) {
     if (!a || !a->karg || !a->size) return GPU_ERR_PARAM;
     if (gpu_drm_open(dev_idx, false)) return GPU_ERR_DRM;
 
-    gpu_devctx *ctx = gpu_dev_ctx(dev_idx);
-    a->ret = lkpi_gpu_ioctl(ctx->lx_card, a->cmd, a->karg);
+    void *h = gpu_card_get(dev_idx);
+    if (!h) return GPU_ERR_DRM;
+    a->ret = lkpi_gpu_ioctl(h, a->cmd, a->karg);
+    gpu_card_put(h);
     return a->ret ? GPU_ERR_DRM : GPU_OK;
 }
 
@@ -533,10 +563,13 @@ int gpu_drm_close(int dev_idx) {
         m->mode_current = -1;
         m->crtc_id = 0;
     }
-    if (ctx->lx_card) lkpi_gpu_close_dev(ctx->lx_card);
-    if (ctx->lx_render) lkpi_gpu_close_dev(ctx->lx_render);
+    uint64_t flags = spin_lock_irqsave(&gpu_registry_lock);
+    void *card = ctx->lx_card, *render = ctx->lx_render;
     ctx->lx_card = NULL;
     ctx->lx_render = NULL;
+    spin_unlock_irqrestore(&gpu_registry_lock, flags);
+    if (card) lkpi_gpu_close_dev(card);
+    if (render) lkpi_gpu_close_dev(render);
     return GPU_OK;
 }
 
@@ -563,8 +596,11 @@ static long kms_ioctl(int dev_idx, uint32_t cmd, void *karg, uint32_t size) {
 
 static int kms_set_master(int dev_idx) {
     int r = (int)kms_ioctl(dev_idx, GPU_DRM_IO(0x1e), NULL, 0);
-    gpu_devctx *ctx = gpu_dev_ctx(dev_idx);
-    if (r != -16 || !ctx || !ctx->lx_card || lkpi_gpu_take_master(ctx->lx_card) <= 0) return r;
+    if (r != -16) return r;
+    void *card = gpu_card_get(dev_idx);
+    long took = card ? lkpi_gpu_take_master(card) : 0;
+    gpu_card_put(card);
+    if (took <= 0) return r;
     LOG_INFO("gpu core: DRM master taken back from another client on %s", gpu_devices[dev_idx].card);
     return (int)kms_ioctl(dev_idx, GPU_DRM_IO(0x1e), NULL, 0);
 }
@@ -636,19 +672,40 @@ static int kms_get_connector(int dev_idx, uint32_t connector_id,
     if (r) return (int)r;
     uint32_t modes_actual = c.count_modes;
     uint32_t enc_actual = c.count_encoders;
-    uint32_t modes_want = modes_actual > (uint32_t)modes_cap ? (uint32_t)modes_cap : modes_actual;
-    uint32_t enc_pass = enc_actual > (uint32_t)enc_cap ? (uint32_t)enc_cap : enc_actual;
+    if (modes_actual > 1024) modes_actual = 1024;
+    if (enc_actual > 64) enc_actual = 64;
+    gpu_drm_modeinfo_uapi *mbuf = modes;
+    uint32_t *ebuf = encoders;
+    if (modes_actual > (uint32_t)modes_cap) mbuf = kmalloc(sizeof(*mbuf) * modes_actual);
+    if (enc_actual > (uint32_t)enc_cap) ebuf = kmalloc(sizeof(*ebuf) * enc_actual);
+    if (!mbuf || !ebuf) {
+        if (mbuf && mbuf != modes) kfree(mbuf);
+        if (ebuf && ebuf != encoders) kfree(ebuf);
+        return GPU_ERR_NOMEM;
+    }
     memset(&c, 0, sizeof(c));
     c.connector_id = connector_id;
-    c.modes_ptr = (uint64_t)(uintptr_t)modes;
-    c.count_modes = modes_want;
-    c.encoders_ptr = (uint64_t)(uintptr_t)encoders;
-    c.count_encoders = enc_pass;
+    c.modes_ptr = (uint64_t)(uintptr_t)mbuf;
+    c.count_modes = modes_actual;
+    c.encoders_ptr = (uint64_t)(uintptr_t)ebuf;
+    c.count_encoders = enc_actual;
     r = kms_ioctl(dev_idx, GPU_DRM_IOC_GETCONNECTOR, &c, sizeof(c));
+    uint32_t mgot = !r && c.count_modes <= modes_actual ? c.count_modes : 0;
+    uint32_t egot = !r && c.count_encoders <= enc_actual ? c.count_encoders : 0;
+    if (mgot > (uint32_t)modes_cap) mgot = (uint32_t)modes_cap;
+    if (egot > (uint32_t)enc_cap) egot = (uint32_t)enc_cap;
+    if (mbuf != modes) {
+        memcpy(modes, mbuf, sizeof(*mbuf) * mgot);
+        kfree(mbuf);
+    }
+    if (ebuf != encoders) {
+        memcpy(encoders, ebuf, sizeof(*ebuf) * egot);
+        kfree(ebuf);
+    }
     if (r) return (int)r;
     *out = c;
-    *modes_got = modes_actual <= (uint32_t)modes_cap ? (int)modes_actual : 0;
-    *enc_got = enc_actual <= (uint32_t)enc_cap ? (int)enc_actual : 0;
+    *modes_got = (int)mgot;
+    *enc_got = (int)egot;
     return GPU_OK;
 }
 
@@ -959,6 +1016,7 @@ static int kms_fb_create(int dev_idx, uint32_t w, uint32_t h, kms_fb *out) {
     if (gpu_drm_open(dev_idx, false)) return GPU_ERR_DRM;
     ctx = gpu_dev_ctx(dev_idx);
     if (!ctx) return GPU_ERR_NODEV;
+    (void)ctx;
     memset(&dumb, 0, sizeof(dumb));
     dumb.width = w;
     dumb.height = h;
@@ -978,7 +1036,10 @@ static int kms_fb_create(int dev_idx, uint32_t w, uint32_t h, kms_fb *out) {
         kms_ioctl(dev_idx, GPU_DRM_IOC_DESTROY_DUMB, &dstr, sizeof(dstr));
         return (int)r;
     }
-    if (lkpi_gpu_gem_vmap(ctx->lx_card, dumb.handle, &token, &kaddr, &size)) {
+    void *card = gpu_card_get(dev_idx);
+    long vr = card ? lkpi_gpu_gem_vmap(card, dumb.handle, &token, &kaddr, &size) : -19;
+    gpu_card_put(card);
+    if (vr) {
         uint32_t fb_id = fb.fb_id;
         kms_ioctl(dev_idx, GPU_DRM_IOC_RMFB, &fb_id, sizeof(fb_id));
         gpu_drm_destroy_dumb_uapi dstr = { .handle = dumb.handle };
@@ -1327,8 +1388,10 @@ int gpu_monitor_clone(int dst_idx, int src_idx) {
     dst->cloned = (uint8_t)(src_idx + 1);
     dst->x = src->x;
     dst->y = src->y;
-    if (dst->pixels && src->enabled && src->pixels && dst->map_size) {
+    if (dst->pixels && src->enabled && src->pixels && dst->map_size && src->mode_current >= 0) {
         uint32_t rows = dst->modes[dst->mode_current].vdisplay;
+        uint32_t src_rows = src->modes[src->mode_current].vdisplay;
+        if (rows > src_rows) rows = src_rows;
         uint32_t dim_k = kms_dim_k(dst->brightness);
         for (uint32_t yy = 0; yy < rows; yy++) {
             uint32_t *drow = (uint32_t *)((uint8_t *)dst->pixels + (size_t)yy * dst->pitch);
@@ -1522,10 +1585,14 @@ static void kms_blit_frame_row(uint32_t *dst, const uint32_t *src, uint32_t px, 
 }
 
 int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t h) {
+    uint32_t src_w = w;
+    if (w > p->width) w = p->width;
+    if (h > p->height) h = p->height;
+    if (!rgba || !w || !h) return GPU_ERR_PARAM;
     if (!p->kms) {
         uint32_t *dst = p->pixels;
         for (uint32_t y = 0; y < h; y++)
-            kms_blit_frame_row(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->src_bgra);
+            kms_blit_frame_row(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * src_w, w, p->src_bgra);
         limine_video_announce_damage();
         return GPU_OK;
     }
@@ -1533,7 +1600,7 @@ int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t
         uint32_t back = p->cur ^ 1;
         uint32_t *bdst = p->pix[back];
         for (uint32_t y = 0; y < h; y++)
-            kms_blit_frame_row(bdst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->src_bgra);
+            kms_blit_frame_row(bdst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * src_w, w, p->src_bgra);
         uint32_t busy = 0;
         gpu_drm_page_flip_uapi flip;
         memset(&flip, 0, sizeof(flip));
@@ -1557,7 +1624,7 @@ int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t
     }
     uint32_t *dst = p->pix[p->cur];
     for (uint32_t y = 0; y < h; y++)
-        kms_blit_frame_row(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * w, w, p->src_bgra);
+        kms_blit_frame_row(dst + (size_t)y * (p->pitch / 4), rgba + (size_t)y * src_w, w, p->src_bgra);
     {
         gpu_drm_fb_dirty_uapi dirty;
         memset(&dirty, 0, sizeof(dirty));
@@ -1570,10 +1637,11 @@ int gpu_present_frame(gpu_present *p, const uint32_t *rgba, uint32_t w, uint32_t
 
 int gpu_present_zc_add(gpu_present *p, void *host_file, uint32_t host_gem, uint32_t pitch) {
     if (!p->kms || p->zc_count >= GPU_ZC_MAX || !host_file || !pitch) return GPU_ERR_PARAM;
-    gpu_devctx *ctx = gpu_dev_ctx(p->dev_idx);
-    if (!ctx || !ctx->lx_card) return GPU_ERR_NODEV;
+    void *card = gpu_card_get(p->dev_idx);
+    if (!card) return GPU_ERR_NODEV;
     unsigned int gem = 0;
-    long r = lkpi_gpu_gem_share(ctx->lx_card, host_file, host_gem, &gem);
+    long r = lkpi_gpu_gem_share(card, host_file, host_gem, &gem);
+    gpu_card_put(card);
     if (r) {
         LOG_WARNING("present: cannot take the renderer's buffer %u (%ld)", host_gem, r);
         return GPU_ERR_DRM;
@@ -1645,7 +1713,26 @@ static void kms_zc_release(gpu_present *p) {
 }
 
 void gpu_present_zc_reset(gpu_present *p) {
-    if (p->kms) kms_zc_release(p);
+    if (!p->kms || !p->zc_count) return;
+    uint32_t own = p->fb_id[p->cur];
+    if (own && p->crtc_id) {
+        gpu_drm_crtc_uapi cur;
+        memset(&cur, 0, sizeof(cur));
+        cur.crtc_id = p->crtc_id;
+        if (!kms_ioctl(p->dev_idx, GPU_DRM_IOC_GETCRTC, &cur, sizeof(cur)) && cur.mode_valid) {
+            gpu_drm_crtc_uapi set;
+            memset(&set, 0, sizeof(set));
+            set.crtc_id = p->crtc_id;
+            set.fb_id = own;
+            set.set_connectors_ptr = (uint64_t)(uintptr_t)&p->connector_id;
+            set.count_connectors = 1;
+            set.mode_valid = 1;
+            set.mode = cur.mode;
+            long r = kms_ioctl(p->dev_idx, GPU_DRM_IOC_SETCRTC, &set, sizeof(set));
+            if (r) LOG_WARNING("present: moving the CRTC off the renderer's buffers failed (%ld)", r);
+        }
+    }
+    kms_zc_release(p);
 }
 
 void gpu_present_close(gpu_present *p) {
@@ -1722,8 +1809,11 @@ static gpu_cmd_rec *rec_of(struct gpu_client *c, uint16_t i) {
     return (gpu_cmd_rec *)rec_at(c, i);
 }
 
-static int result_write(uint8_t *area, uint16_t off, int status, const void *data, uint16_t len) {
-    uint8_t *p = area + off;
+static int result_write(uint8_t *area, const gpu_cmd_rec *rec, int status, const void *data, uint16_t len) {
+    if (!rec->result_off || rec->result_cap < GPU_RESULT_HDR) return GPU_ERR_PARAM;
+    uint16_t room = (uint16_t)(rec->result_cap - GPU_RESULT_HDR);
+    if (len > room) len = room;
+    uint8_t *p = area + rec->result_off;
     p[0] = (uint8_t)(len & 0xff);
     p[1] = (uint8_t)(len >> 8);
     p[2] = (int8_t)status;
@@ -1733,12 +1823,21 @@ static int result_write(uint8_t *area, uint16_t off, int status, const void *dat
 }
 
 
+static int gpu_exec_drm_card(struct gpu_client *c, gpu_cmd_rec *rec, struct gpu_device *d, void *card);
+
 static int gpu_exec_drm_record(struct gpu_client *c, gpu_cmd_rec *rec) {
     struct gpu_device *d = core_dev(c->dev_idx);
     if (!d) return GPU_ERR_NODEV;
     if (!(d->flags & GPU_DEV_FLAG_BOUND)) return GPU_ERR_NO_DRIVER;
     if (gpu_drm_open(c->dev_idx, false)) return GPU_ERR_DRM;
-    gpu_devctx *ctx = gpu_dev_ctx(c->dev_idx);
+    void *card = gpu_card_get(c->dev_idx);
+    if (!card) return GPU_ERR_DRM;
+    int r = gpu_exec_drm_card(c, rec, d, card);
+    gpu_card_put(card);
+    return r;
+}
+
+static int gpu_exec_drm_card(struct gpu_client *c, gpu_cmd_rec *rec, struct gpu_device *d, void *card) {
     uint8_t *results = &c->batch[GPU_BATCH_RESULT_OFF];
     int r = GPU_OK;
 
@@ -1749,54 +1848,54 @@ static int gpu_exec_drm_record(struct gpu_client *c, gpu_cmd_rec *rec) {
         int n = snprintf(text, sizeof(text), "%d.%d.%d %s%s%s", d->drm_major, d->drm_minor, d->drm_patch,
                          d->drm_name, d->drm_desc[0] ? " - " : "", d->drm_desc);
         if (rec->result_off)
-            result_write(results, rec->result_off, 0, text, (uint16_t)(n > 0 ? (n < (int)sizeof(text) ? n : (int)sizeof(text) - 1) : 0));
+            result_write(results, rec, 0, text, (uint16_t)(n > 0 ? (n < (int)sizeof(text) ? n : (int)sizeof(text) - 1) : 0));
         break;
     }
     case GPU_CMD_DRM_GET_CAP: {
         gpu_drm_get_cap_uapi cap = { .capability = rec->args[0], .value = 0 };
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, GPU_DRM_IOWR(0x0c, gpu_drm_get_cap_uapi), &cap);
+        long ret = lkpi_gpu_ioctl(card, GPU_DRM_IOWR(0x0c, gpu_drm_get_cap_uapi), &cap);
         if (rec->result_off) {
             uint64_t v = ret ? (uint64_t)(int64_t)ret : cap.value;
-            result_write(results, rec->result_off, ret ? GPU_ERR_DRM : GPU_OK, &v, sizeof(v));
+            result_write(results, rec, ret ? GPU_ERR_DRM : GPU_OK, &v, sizeof(v));
         }
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
     }
     case GPU_CMD_DRM_SET_CLIENT_CAP: {
         gpu_drm_get_cap_uapi cap = { .capability = rec->args[0], .value = rec->args[1] };
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, GPU_DRM_IOWR(0x0d, gpu_drm_get_cap_uapi), &cap);
+        long ret = lkpi_gpu_ioctl(card, GPU_DRM_IOWR(0x0d, gpu_drm_get_cap_uapi), &cap);
         if (rec->result_off) {
             uint64_t v = (uint64_t)(int64_t)ret;
-            result_write(results, rec->result_off, ret ? GPU_ERR_DRM : GPU_OK, &v, sizeof(v));
+            result_write(results, rec, ret ? GPU_ERR_DRM : GPU_OK, &v, sizeof(v));
         }
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
     }
     case GPU_CMD_DRM_GEM_CLOSE: {
         gpu_drm_gem_close_uapi gc = { .handle = (uint32_t)rec->args[0], .pad = 0 };
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, GPU_DRM_IOW(0x09, gpu_drm_gem_close_uapi), &gc);
+        long ret = lkpi_gpu_ioctl(card, GPU_DRM_IOW(0x09, gpu_drm_gem_close_uapi), &gc);
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
     }
     case GPU_CMD_DRM_GET_MAGIC: {
         gpu_drm_magic_uapi m = { .magic = 0, .pad = 0 };
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, GPU_DRM_IOR(0x02, gpu_drm_magic_uapi), &m);
+        long ret = lkpi_gpu_ioctl(card, GPU_DRM_IOR(0x02, gpu_drm_magic_uapi), &m);
         if (rec->result_off) {
             uint32_t magic = m.magic;
-            result_write(results, rec->result_off, ret ? GPU_ERR_DRM : GPU_OK, &magic, sizeof(magic));
+            result_write(results, rec, ret ? GPU_ERR_DRM : GPU_OK, &magic, sizeof(magic));
         }
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
     }
     case GPU_CMD_DRM_AUTH_MAGIC: {
         gpu_drm_auth_uapi a = { .magic = (uint32_t)rec->args[0], .pad = 0 };
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, GPU_DRM_IOW(0x03, gpu_drm_auth_uapi), &a);
+        long ret = lkpi_gpu_ioctl(card, GPU_DRM_IOW(0x03, gpu_drm_auth_uapi), &a);
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
     }
     case GPU_CMD_DRM_SET_MASTER:
     case GPU_CMD_DRM_DROP_MASTER: {
-        long ret = lkpi_gpu_ioctl(ctx->lx_card,
+        long ret = lkpi_gpu_ioctl(card,
                                   GPU_DRM_IO(rec->opcode == GPU_CMD_DRM_SET_MASTER ? 0x1e : 0x1f), NULL);
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
@@ -1804,10 +1903,10 @@ static int gpu_exec_drm_record(struct gpu_client *c, gpu_cmd_rec *rec) {
     case GPU_CMD_DRM_MODE_GETRESOURCES: {
         gpu_drm_card_res_uapi res;
         memset(&res, 0, sizeof(res));
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, GPU_DRM_IOWR(0xA0, gpu_drm_card_res_uapi), &res);
+        long ret = lkpi_gpu_ioctl(card, GPU_DRM_IOWR(0xA0, gpu_drm_card_res_uapi), &res);
         if (rec->result_off && !ret) {
             uint32_t counts[4] = { res.count_crtcs, res.count_connectors, res.count_encoders, res.count_fbs };
-            result_write(results, rec->result_off, 0, counts, sizeof(counts));
+            result_write(results, rec, 0, counts, sizeof(counts));
         }
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
@@ -1816,12 +1915,13 @@ static int gpu_exec_drm_record(struct gpu_client *c, gpu_cmd_rec *rec) {
         uint32_t cmd = (uint32_t)rec->args[0];
         uint32_t size = (uint32_t)rec->args[1];
         uint8_t *payload = &c->batch[GPU_BATCH_PAYLOAD_OFF + rec->payload_off];
-        if (!size || size > rec->payload_len || !cmd) return GPU_ERR_PARAM;
-        long ret = lkpi_gpu_ioctl(ctx->lx_card, cmd, payload);
+        uint32_t ioc_size = (cmd >> GPU_IOC_SIZESHIFT) & ((1u << GPU_IOC_SIZEBITS) - 1);
+        if (!size || size > rec->payload_len || !cmd || ioc_size > size) return GPU_ERR_PARAM;
+        long ret = lkpi_gpu_ioctl(card, cmd, payload);
         if (rec->result_off) {
             uint16_t room = (uint16_t)(rec->result_cap > GPU_RESULT_HDR ? rec->result_cap - GPU_RESULT_HDR : 0);
             uint16_t len = (uint16_t)(size < room ? size : room);
-            result_write(results, rec->result_off, ret ? GPU_ERR_DRM : GPU_OK, payload, len);
+            result_write(results, rec, ret ? GPU_ERR_DRM : GPU_OK, payload, len);
         }
         r = ret ? GPU_ERR_DRM : GPU_OK;
         break;
@@ -1837,6 +1937,12 @@ static struct gpu_client *client_get(int client_id) {
     if (client_id < 0 || client_id >= GPU_MAX_CLIENTS) return NULL;
     struct gpu_client *c = &gpu_clients[client_id];
     return c->used ? c : NULL;
+}
+
+static void gpu_slot_release(struct gpu_ring_slot *slot, uint32_t seq) {
+    uint64_t flags = spin_lock_irqsave(&gpu_registry_lock);
+    if (slot->seq == seq) slot->held = 0;
+    spin_unlock_irqrestore(&gpu_registry_lock, flags);
 }
 
 struct gpu_ring_slot *gpu_slot_by_seq(int dev_idx, uint32_t seq) {
@@ -1998,8 +2104,6 @@ int gpu_flush(int client_id, uint32_t timeout_ms) {
     if (!c->batch_open) return GPU_ERR_STATE;
 
     gpu_batch_hdr *hdr = (gpu_batch_hdr *)&c->batch[GPU_BATCH_HDR_OFF];
-    c->seq++;
-    hdr->seq = c->seq;
     hdr->cmd_count = c->cmd_count;
     hdr->payload_used = c->payload_used;
     hdr->result_used = c->result_used;
@@ -2020,9 +2124,11 @@ int gpu_flush(int client_id, uint32_t timeout_ms) {
     c->flushed_cmds += c->cmd_count;
     c->flushed_batches++;
     c->batch_open = 0;
+    c->results_valid = false;
 
     if (!has_api_cmds) {
         c->last_slot = NULL;
+        c->results_valid = true;
         return status;
     }
 
@@ -2034,15 +2140,19 @@ int gpu_flush(int client_id, uint32_t timeout_ms) {
     struct gpu_ring_slot *slot = NULL;
     for (int i = 0; i < GPU_RING_SLOTS; i++) {
         struct gpu_ring_slot *s = &ctx->ring[i];
-        if (!s->used || s->complete_ns) { slot = s; break; }
+        if (!s->used || (s->complete_ns && !s->held)) { slot = s; break; }
     }
     if (!slot) {
         ctx->dropped++;
         spin_unlock_irqrestore(&gpu_registry_lock, flags);
         return GPU_ERR_OVERFLOW;
     }
+    if (++ctx->next_seq == 0) ++ctx->next_seq;
+    c->seq = ctx->next_seq;
+    hdr->seq = c->seq;
     memset(slot, 0, sizeof(*slot));
     slot->used = 1;
+    slot->held = timeout_ms ? 1 : 0;
     slot->api = c->api;
     slot->seq = c->seq;
     slot->device = (uint32_t)c->dev_idx;
@@ -2060,6 +2170,7 @@ int gpu_flush(int client_id, uint32_t timeout_ms) {
 
     if (has_api_cmds && c->tr_epoch && c->tr_epoch != mesa_epoch_get()) {
         gpu_slot_publish(c->dev_idx, c->seq, GPU_ERR_NO_TRANSLATOR);
+        gpu_slot_release(slot, c->seq);
         return GPU_ERR_NO_TRANSLATOR;
     }
 
@@ -2067,17 +2178,27 @@ int gpu_flush(int client_id, uint32_t timeout_ms) {
 
     if (!attached && !mesa_ready() && !mesa_failed() && timeout_ms) {
         int ms = mesa_start();
-        if (ms && !mesa_ready()) return GPU_ERR_NO_TRANSLATOR;
+        if (ms && !mesa_ready()) {
+            gpu_slot_release(slot, c->seq);
+            return GPU_ERR_NO_TRANSLATOR;
+        }
     }
     if (!timeout_ms) return GPU_OK;
 
     int w = scheduler_wait((void *)&slot->done_flag, (volatile int *)&slot->done_flag, timeout_ms);
-    if (w == 0) {
-        if (!slot->status) c->tr_epoch = mesa_epoch_get();
-        return slot->status ? (int)slot->status : GPU_OK;
+    int rc = GPU_ERR_TIMEOUT;
+    flags = spin_lock_irqsave(&gpu_registry_lock);
+    if (w == 0 && slot->seq == c->seq && slot->done_flag) {
+        memcpy(&c->batch[GPU_BATCH_RESULT_OFF], &slot->data[GPU_BATCH_RESULT_OFF],
+               GPU_BATCH_TOTAL_OFF - GPU_BATCH_RESULT_OFF);
+        c->results_valid = true;
+        rc = slot->status ? (int)slot->status : GPU_OK;
     }
+    if (slot->seq == c->seq) slot->held = 0;
+    spin_unlock_irqrestore(&gpu_registry_lock, flags);
+    if (rc == GPU_OK) c->tr_epoch = mesa_epoch_get();
     (void)fail_opcode;
-    return GPU_ERR_TIMEOUT;
+    return rc;
 }
 
 int gpu_result(int client_id, uint16_t cmd_index, void *out, uint16_t cap, uint16_t *out_len) {
@@ -2086,19 +2207,14 @@ int gpu_result(int client_id, uint16_t cmd_index, void *out, uint16_t cap, uint1
     if (cmd_index >= c->cmd_count) return GPU_ERR_PARAM;
 
     gpu_cmd_rec *rec = rec_of(c, cmd_index);
-    if (!rec->result_off) return GPU_ERR_PARAM;
+    if (!rec->result_off || rec->result_cap < GPU_RESULT_HDR) return GPU_ERR_PARAM;
+    if (c->batch_open || !c->results_valid) return GPU_ERR_STATE;
 
-    const uint8_t *area = NULL;
-    if (c->last_slot && c->last_slot->seq == c->seq && c->last_slot->done_flag != 0) {
-        area = &c->last_slot->data[GPU_BATCH_RESULT_OFF];
-    } else if (!c->batch_open) {
-        area = &c->batch[GPU_BATCH_RESULT_OFF];
-    } else {
-        return GPU_ERR_STATE;
-    }
-
+    const uint8_t *area = &c->batch[GPU_BATCH_RESULT_OFF];
     uint16_t len = (uint16_t)(area[rec->result_off] | (area[rec->result_off + 1] << 8));
     int8_t status = (int8_t)area[rec->result_off + 2];
+    uint16_t room = (uint16_t)(rec->result_cap - GPU_RESULT_HDR);
+    if (len > room) len = room;
     uint16_t n = len < cap ? len : cap;
     if (n) memcpy(out, area + rec->result_off + GPU_RESULT_HDR, n);
     if (out_len) *out_len = len;

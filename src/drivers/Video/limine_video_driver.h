@@ -52,6 +52,8 @@ typedef struct limine_video_driver {
 struct limine_video_driver* return_limine_video_driver();
 bool limine_video_attach(void* pixels, uint64_t width, uint64_t height, uint64_t pitch);
 void limine_video_detach(void);
+bool limine_video_is_headless(void);
+void limine_video_restore_firmware(void);
 void limine_video_panic_takeover(void);
 bool limine_video_take_damage(uint32_t rect[4]);
 bool limine_video_fb_info(uint8_t** pixels, uint32_t* width, uint32_t* height, uint32_t* pitch);
