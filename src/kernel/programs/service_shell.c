@@ -617,6 +617,150 @@ void help_section(const char *title) {
     printf_color(LIMINE_COLOR_LIGHT_BLUE, "\n-- %s --\n", title);
 }
 
+static void help_grp_general(void) {
+    help_section("General");
+    help_row(LIMINE_COLOR_AMBER, "help [GROUP|all] - command groups", "clear - clear screen");
+    help_row(LIMINE_COLOR_AMBER, "ram - memory/heap info", "time - current time");
+    help_row(LIMINE_COLOR_AMBER, "cpu - CPU information", "pci - PCI devices");
+    help_row(LIMINE_COLOR_AMBER, "usb-list - USB devices", "disks - block devices");
+    help_row(LIMINE_COLOR_AMBER, "partitions - partition tables", "usb-debug on|off - USB MSC trace");
+}
+
+static void help_grp_fs(void) {
+    help_section("Filesystem");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "mount NAME [POINT] - mount disk", "umount [POINT] - unmount");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "mounts - list mount points", "usb-rescan - USB re-enumeration");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "ls [PATH] - list directory", "cd PATH - change directory");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "pwd - print cwd", "mkdir PATH - create directory");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "rmdir PATH - remove empty dir", "rm PATH - delete file");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "cat PATH - print contents", "touch PATH - create empty file");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "stat PATH - name/type/size", "fs-test [DIR] - self-test");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "fs-sum [DIR] - CRC32 of every file", "mkfs TYPE NAME [LABEL] - format");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "mount ramfs POINT - in-memory fs", "  TYPE: fat fat12 fat16 fat32 exfat");
+}
+
+static void help_grp_hw(void) {
+    help_section("Hardware / Input");
+    help_row(LIMINE_COLOR_AMBER, "usb - USB controllers", "usb-ports - root hub ports");
+    help_row(LIMINE_COLOR_AMBER, "kbd-test - keyboard test", "mouse-test - mouse test (5s)");
+    help_row(LIMINE_COLOR_AMBER, "mouse - live cursor/buttons", "hid-test - kbd+mouse test (15s)");
+    help_row(LIMINE_COLOR_AMBER, "hpet - HPET info/self-test", "ps - tasks, MLFQ, load");
+    help_row(LIMINE_COLOR_AMBER, "scheduler-test [cores] [tasks] [iters]", "scheduler-fair - fairness demo");
+    help_row(LIMINE_COLOR_AMBER, "guess-game - guess the number", "");
+}
+
+static void help_grp_gpu(void) {
+    help_section("GPU (real Mesa OpenGL + Vulkan in the kernel)");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-init [PATH] - start GPU stack (fw)", "gpu-reinit [PATH] - restart it");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-devs / gpu-info [N] - cards", "gpu-drivers - DRM drivers");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-prime [llvm|N|auto] - render device", "gpu-mesa - translator + renderer");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "kmscube [SEC DEV MON WxH] - GL cube", "vkkmv [SEC DEV MON WxH] - Vulkan cube");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "glxgears [SEC DEV MON WxH] - GL gears", "gpu-shader [gl|vk] - shader self test");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-test - batch + DRM self test", "gpu-api - command surface");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-intel - old Intel iGPU scan/bind", "gpu-bind/unbind BDF|N - driver");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-mons - monitors", "gpu-mon-on/off/mode/modes/bright");
+    help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-mon-move N X Y - position", "gpu-bright [N VALUE] - backlight");
+}
+
+static void help_grp_script(void) {
+    help_section("Lua / Python (gl.* vk.* gpu.* registered)");
+    help_row(LIMINE_COLOR_CYAN, "lua - Lua REPL", "lua-run CODE - run one line");
+    help_row(LIMINE_COLOR_CYAN, "lua-file F - run a .lua file", "lua-test / lua-kernel-test");
+    help_row(LIMINE_COLOR_LIGHT_MAGENTA, "python (py) - MicroPython REPL", "python-run CODE - run one line");
+    help_row(LIMINE_COLOR_LIGHT_MAGENTA, "python-file F - run a .py file", "python-test / python-kernel-test");
+    help_row(LIMINE_COLOR_CYAN, "run FILE - run .lua or .py by ext", "lua-io-test - io.read() test");
+}
+
+static void help_grp_timers(void) {
+    help_section("Timers / Misc");
+    help_row(LIMINE_COLOR_AMBER, "sleep N - sleep ms (APIC)", "sleepRTC N - sleep seconds");
+    struct hpet_driver* hpet = get_self_driver(TIMER_DRIVER, HPET_TIMER);
+    if (g_bind_tsc)
+        help_row(LIMINE_COLOR_AMBER, "sleepTSC N - sleep ms (TSC)", "");
+    if (g_bind_pit)
+        help_row(LIMINE_COLOR_AMBER, "sleepPIT N - sleep ms (PIT)", "");
+    if (hpet && hpet->is_hpet_available())
+        help_row(LIMINE_COLOR_AMBER, "sleepHPET N - sleep ms (HPET)", "");
+    help_row(LIMINE_COLOR_AMBER, "allocate N - leak test", "math-test - math diagnostics");
+    help_row(LIMINE_COLOR_AMBER, "libc-test - libc diagnostics", "fastfetch - system info");
+    help_row(LIMINE_COLOR_AMBER, "repeat N TEXT - repeat TEXT N times", "");
+}
+
+static void help_grp_games(void) {
+    help_section("Games");
+    help_row(LIMINE_COLOR_AMBER, "snake-game - snake", "bird-game - flappy bird");
+    help_row(LIMINE_COLOR_AMBER, "race-game - race game", "rps-game - rock-paper-scissors");
+    help_row(LIMINE_COLOR_AMBER, "pong-game - ping pong", "arco-game - arkanoid");
+    help_row(LIMINE_COLOR_AMBER, "tetris-game - tetris", "2048-game - 2048");
+    help_row(LIMINE_COLOR_AMBER, "3d-cube [W H] - wireframe shapes", "");
+}
+
+static void help_grp_debug(void) {
+    help_section("Power / Debug");
+    help_row(LIMINE_COLOR_AMBER, "poweroff - shutdown", "reboot - restart system");
+    help_row(LIMINE_COLOR_AMBER, "debug - debug menu", "panic [MSG] - kernel panic");
+    help_row(LIMINE_COLOR_AMBER, "log - logger status", "dmesg [N] - kernel log");
+    help_row(LIMINE_COLOR_AMBER, "log-dump [prev] [FILE] - log (or last boot) to FILE.txt", "log-clear - clear the log");
+    help_row(LIMINE_COLOR_AMBER, "log-level [buffer|uart|video] LEVEL", "");
+}
+
+static void help_grp_services(void) {
+    help_section("Services");
+    help_row(LIMINE_COLOR_CYAN, "services - service table", "service-start NAME - start");
+    help_row(LIMINE_COLOR_CYAN, "service-stop NAME - stop", "service-restart NAME - restart");
+}
+
+struct help_group {
+    const char *name;
+    const char *desc;
+    void (*show)(void);
+};
+
+static const struct help_group help_groups[] = {
+    { "general", "general commands", help_grp_general },
+    { "fs", "files, mounts, mkfs", help_grp_fs },
+    { "hw", "USB, input, HPET, scheduler", help_grp_hw },
+    { "gpu", "GPU stack, demos, monitors", help_grp_gpu },
+    { "script", "Lua and MicroPython", help_grp_script },
+    { "timers", "sleep, tests, misc", help_grp_timers },
+    { "games", "games and demos", help_grp_games },
+    { "debug", "power, panic, logger", help_grp_debug },
+    { "audio", "audio devices and player", shell_audio_help },
+    { "gpu-hw", "GPU groundwork, firmware, MMIO", shell_hw_help },
+    { "proc", "Linux ELF user programs", shell_proc_help },
+    { "services", "service manager", help_grp_services },
+};
+
+#define HELP_GROUP_COUNT (sizeof(help_groups) / sizeof(help_groups[0]))
+
+/* help        -> list of groups
+ * help GROUP  -> commands of that group
+ * help all    -> every group */
+static void cmd_help(const char *arg) {
+    while (*arg == ' ') arg++;
+    if (!*arg) {
+        help_section("Command groups (help GROUP)");
+        for (size_t i = 0; i < HELP_GROUP_COUNT; i++) {
+            printf_color(LIMINE_COLOR_AMBER, "  %-10s", help_groups[i].name);
+            printf_color(LIMINE_COLOR_LIGHT_GRAY, "%s\n", help_groups[i].desc);
+        }
+        printf_color(LIMINE_COLOR_AMBER, "  %-10s", "all");
+        printf_color(LIMINE_COLOR_LIGHT_GRAY, "every command\n");
+        return;
+    }
+    if (str_cmp(arg, "all") == 0) {
+        for (size_t i = 0; i < HELP_GROUP_COUNT; i++) help_groups[i].show();
+        return;
+    }
+    for (size_t i = 0; i < HELP_GROUP_COUNT; i++) {
+        if (str_cmp(arg, help_groups[i].name) == 0) {
+            help_groups[i].show();
+            return;
+        }
+    }
+    printf_color(LIMINE_COLOR_LIGHT_RED, "help: unknown group '%s' (type 'help' for the list)\n", arg);
+}
+
 static void luos_register_kernel_lib(lua_State *L) {
     lua_newtable(L);
 
@@ -3174,85 +3318,8 @@ static void shell_entry(void *arg) {
     while (!service_stop_requested(svc->id)) {
         kbd->input("luos # ", cmd_buffer, sizeof(cmd_buffer), LIMINE_COLOR_LIGHT_CYAN, shell_term_print);
 
-        if (str_cmp(cmd_buffer, "help") == 0) {
-            help_section("General");
-            help_row(LIMINE_COLOR_AMBER, "help", "clear - clear screen");
-            help_row(LIMINE_COLOR_AMBER, "ram - memory/heap info", "time - current time");
-            help_row(LIMINE_COLOR_AMBER, "cpu - CPU information", "pci - PCI devices");
-            help_row(LIMINE_COLOR_AMBER, "usb-list - USB devices", "disks - block devices");
-            help_row(LIMINE_COLOR_AMBER, "partitions - partition tables", "usb-debug on|off - USB MSC trace");
-
-            help_section("Filesystem");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "mount NAME [POINT] - mount disk", "umount [POINT] - unmount");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "mounts - list mount points", "usb-rescan - USB re-enumeration");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "ls [PATH] - list directory", "cd PATH - change directory");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "pwd - print cwd", "mkdir PATH - create directory");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "rmdir PATH - remove empty dir", "rm PATH - delete file");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "cat PATH - print contents", "touch PATH - create empty file");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "stat PATH - name/type/size", "fs-test [DIR] - self-test");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "fs-sum [DIR] - CRC32 of every file", "mkfs TYPE NAME [LABEL] - format");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "mount ramfs POINT - in-memory fs", "  TYPE: fat fat12 fat16 fat32 exfat");
-
-            help_section("Hardware / Input");
-            help_row(LIMINE_COLOR_AMBER, "usb - USB controllers", "usb-ports - root hub ports");
-            help_row(LIMINE_COLOR_AMBER, "kbd-test - keyboard test", "mouse-test - mouse test (5s)");
-            help_row(LIMINE_COLOR_AMBER, "mouse - live cursor/buttons", "hid-test - kbd+mouse test (15s)");
-            help_row(LIMINE_COLOR_AMBER, "hpet - HPET info/self-test", "ps - tasks, MLFQ, load");
-            help_row(LIMINE_COLOR_AMBER, "scheduler-test [cores] [tasks] [iters]", "scheduler-fair - fairness demo");
-            help_row(LIMINE_COLOR_AMBER, "guess-game - guess the number", "");
-
-            help_section("GPU (real Mesa OpenGL + Vulkan in the kernel)");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-init [PATH] - start GPU stack (fw)", "gpu-reinit [PATH] - restart it");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-devs / gpu-info [N] - cards", "gpu-drivers - DRM drivers");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-prime [llvm|N|auto] - render device", "gpu-mesa - translator + renderer");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "kmscube [SEC DEV MON WxH] - GL cube", "vkkmv [SEC DEV MON WxH] - Vulkan cube");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "glxgears [SEC DEV MON WxH] - GL gears", "gpu-shader [gl|vk] - shader self test");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-test - batch + DRM self test", "gpu-api - command surface");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-intel - old Intel iGPU scan/bind", "gpu-bind/unbind BDF|N - driver");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-mons - monitors", "gpu-mon-on/off/mode/modes/bright");
-            help_row(LIMINE_COLOR_LIGHT_GREEN, "gpu-mon-move N X Y - position", "gpu-bright [N VALUE] - backlight");
-
-            help_section("Lua / Python (gl.* vk.* gpu.* registered)");
-            help_row(LIMINE_COLOR_CYAN, "lua - Lua REPL", "lua-run CODE - run one line");
-            help_row(LIMINE_COLOR_CYAN, "lua-file F - run a .lua file", "lua-test / lua-kernel-test");
-            help_row(LIMINE_COLOR_LIGHT_MAGENTA, "python (py) - MicroPython REPL", "python-run CODE - run one line");
-            help_row(LIMINE_COLOR_LIGHT_MAGENTA, "python-file F - run a .py file", "python-test / python-kernel-test");
-            help_row(LIMINE_COLOR_CYAN, "run FILE - run .lua or .py by ext", "lua-io-test - io.read() test");
-
-            help_section("Timers / Misc");
-            help_row(LIMINE_COLOR_AMBER, "sleep N - sleep ms (APIC)", "sleepRTC N - sleep seconds");
-            if (tsc)
-                help_row(LIMINE_COLOR_AMBER, "sleepTSC N - sleep ms (TSC)", "");
-            if (pit)
-                help_row(LIMINE_COLOR_AMBER, "sleepPIT N - sleep ms (PIT)", "");
-            if (hpet && hpet->is_hpet_available())
-                help_row(LIMINE_COLOR_AMBER, "sleepHPET N - sleep ms (HPET)", "");
-            help_row(LIMINE_COLOR_AMBER, "allocate N - leak test", "math-test - math diagnostics");
-            help_row(LIMINE_COLOR_AMBER, "libc-test - libc diagnostics", "fastfetch - system info");
-            help_row(LIMINE_COLOR_AMBER, "repeat N TEXT - repeat TEXT N times", "");
-
-            help_section("Games");
-            help_row(LIMINE_COLOR_AMBER, "snake-game - snake", "bird-game - flappy bird");
-            help_row(LIMINE_COLOR_AMBER, "race-game - race game", "rps-game - rock-paper-scissors");
-            help_row(LIMINE_COLOR_AMBER, "pong-game - ping pong", "arco-game - arkanoid");
-            help_row(LIMINE_COLOR_AMBER, "tetris-game - tetris", "2048-game - 2048");
-            help_row(LIMINE_COLOR_AMBER, "3d-cube [W H] - wireframe shapes", "");
-
-            help_section("Power / Debug");
-            help_row(LIMINE_COLOR_AMBER, "poweroff - shutdown", "reboot - restart system");
-            help_row(LIMINE_COLOR_AMBER, "debug - debug menu", "panic [MSG] - kernel panic");
-            help_row(LIMINE_COLOR_AMBER, "log - logger status", "dmesg [N] - kernel log");
-            help_row(LIMINE_COLOR_AMBER, "log-dump [prev] [FILE] - log (or last boot) to FILE.txt", "log-clear - clear the log");
-            help_row(LIMINE_COLOR_AMBER, "log-level [buffer|uart|video] LEVEL", "");
-
-            shell_audio_help();
-            shell_hw_help();
-            shell_proc_help();
-
-            help_section("Services");
-            help_row(LIMINE_COLOR_CYAN, "services - service table", "service-start NAME - start");
-            help_row(LIMINE_COLOR_CYAN, "service-stop NAME - stop", "service-restart NAME - restart");
-        }
+        if (str_cmp(cmd_buffer, "help") == 0) { cmd_help(""); }
+        else if (str_starts_with(cmd_buffer, "help ")) { cmd_help(cmd_buffer + 5); }
         else if (str_cmp(cmd_buffer, "clear") == 0) {
             video->clear(LIMINE_COLOR_BLACK);
         }

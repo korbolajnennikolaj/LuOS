@@ -224,7 +224,7 @@ scripts/          # linker script and build helpers
 | Plan | Description |
 |---|---|
 | Network stack | Basic networking support |
-| Audio stack | Interrupt-driven streams, HDA multichannel/HDMI, USB MIDI and implicit feedback, a UVC driver for the video half of webcams, filling the quirk tables from FreeBSD |
+| Core kernel idea | Implement the main userspace with an RMI connector |
 | OHCI hardware testing | Buy a real OHCI device and test the driver against real hardware, not just emulation |
 
 ## License
